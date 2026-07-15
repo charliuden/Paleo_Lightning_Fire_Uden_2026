@@ -3,6 +3,7 @@
 Uden, Beckage, Clemins 2026
 
 Code for final chapter of my dissertation. 
+Model drivers and selected compiled models are located on Zenodo: https://zenodo.org/uploads/21381555
 
 Pipeline: 
 
