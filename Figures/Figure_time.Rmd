@@ -36,7 +36,7 @@ current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
 #get path to this project
 base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
 #open 
-config_file_path <- file.path(base_path, "paleo_config.properties")
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
 
 # Extract individual file locations from config
 drivers_root <- config[["drivers_root"]]

@@ -37,7 +37,7 @@ current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
 #get path to this project
 base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
 #open 
-config_file_path <- file.path(base_path, "paleo_config.properties")
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
 
 # Extract values from config
 drivers_root <- config[["drivers_root"]]
@@ -54,7 +54,7 @@ proximity_data_root <- config[["proximity_data_root"]]
 ```
 
 ```{r}
-# ============================================================================
+
 # Two input dataframes:
 #
 #   df      -- Monte Carlo ensemble output (timeseries_by_run_year.csv)
@@ -65,13 +65,13 @@ proximity_data_root <- config[["proximity_data_root"]]
 #              No bootstrap/quantile approximation needed since these are
 #              actual repeated realizations.
 #
-#   df_obs  -- observed truth, gridcell-month resolution
+#   df_obs  -- observed, gridcell-month resolution
 #              (predictions_2002_2011.csv), columns include: lat, lon, year,
 #              month, r_strike_obs, n_strikes_obs, fire_count,
 #              burned_area_km2_total. Single fixed dataset, no run
 #              replication -- aggregated to yearly series via
 #              build_observed_timeseries() below for overlay on the ensemble.
-# ============================================================================
+
 
 df <- read.csv(file.path(predictions_root, "parameter_uncertainty/timeseries_by_run_year.csv"))
 
@@ -176,6 +176,25 @@ p5 <- plot_ensemble_series(df, "burned_area", "mean", "Mean Burned Area (km2)", 
 p6 <- plot_ensemble_series(df, "burned_area", "sum", "Total Burned Area (km2)", "(f)",
                             observed_df = obs_burned_sum)
 
-p1 / p2 / p3 / p4 / p5 / p6
+combined_plot <- p1 / p2 / p3 / p4 / p5 / p6
+
+combined_plot
+```
+
+
+
+
+```{r}
+
+ggsave(
+  filename = file.path(figure_root, "Figure_time_param_uncertainty.png"),
+  plot = combined_plot,
+  width = 8,
+  height = 14,     
+  units = "in",
+  dpi = 300
+)
 
 ```
+
+
