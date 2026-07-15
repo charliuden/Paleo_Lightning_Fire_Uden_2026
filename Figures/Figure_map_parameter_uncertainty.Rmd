@@ -1,0 +1,53 @@
+---
+title: "Figure_map_parameter_uncertainty"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(purrr)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract individual file locations from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```

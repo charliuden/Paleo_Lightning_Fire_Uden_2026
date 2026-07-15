@@ -1,0 +1,530 @@
+---
+title: "Figure_time"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(purrr)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract individual file locations from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+```{r}
+df <- read.csv(file.path(predictions_root, "predictions_2002_2011.csv"))
+```
+
+
+
+```{r}
+
+# Position dodge setting (controls how far points are separated horizontally)
+pd <- position_dodge(width = 0.4)
+
+
+####################
+#Lightning strike RATE
+####################
+# Reshape to long format
+  
+df_long <- df %>%
+  dplyr::select(year, r_strike, r_strike_obs) %>%
+  #dplyr::filter(r_strike_obs > 0) %>%
+  rename(observed=r_strike_obs, predicted=r_strike) %>%
+  pivot_longer(cols = c("observed","predicted"),
+               names_to = "lightning", values_to = "strike_rate")
+
+df_summary <- df_long %>%
+  group_by(year, lightning) %>%
+  summarise(
+    mean_strike_rate = mean(strike_rate, na.rm = TRUE),
+    ci_low   = quantile(strike_rate, 0.025, na.rm = TRUE),
+    ci_high  = quantile(strike_rate, 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+# Compute 10-year observed mean 
+obs_mean <- df_summary %>%
+  filter(lightning == "observed") %>%
+  summarise(mean_obs = mean(mean_strike_rate, na.rm = TRUE)) %>%
+  pull(mean_obs)
+
+obs_mean
+
+# Plot
+p1 <- ggplot(df_summary, aes(x = as.factor(year), y = mean_strike_rate, color = lightning, shape = lightning)) +
+  geom_point(size = 3, position = pd) +
+  geom_errorbar(aes(ymin = ci_low,
+                    ymax = ci_high),
+                width = 0.2, position = pd) +
+  geom_hline(yintercept = obs_mean, linetype = "dotted", color = "black") +
+  scale_color_manual(values = c(
+    "predicted" = "red",
+    "observed" = "gold")) +
+  scale_shape_manual(values = c(
+    "predicted" = 7,  # x
+    "observed" = 16  # solid circle
+  )) +
+  labs(x = "Year", y = "Strikes/km2/month",
+       title = "(a)") +
+  theme_minimal() + theme(legend.title = element_blank()) + labs(x = NULL)
+
+####################
+#Lightning strike COUNT
+####################
+# Reshape to long format
+  
+df_long <- df %>%
+  dplyr::select(year, n_strikes_obs, n_strikes) %>%
+  #dplyr::filter(n_strikes_obs > 0) %>%
+  rename(observed=n_strikes_obs, predicted=n_strikes) %>%
+  pivot_longer(cols = c("observed","predicted"),
+               names_to = "lightning", values_to = "strike_count")
+
+df_summary <- df_long %>%
+  group_by(year, lightning) %>%
+  summarise(
+    mean_strike_count = mean(strike_count, na.rm = TRUE),
+    ci_low   = quantile(strike_count, 0.025, na.rm = TRUE),
+    ci_high  = quantile(strike_count, 0.975, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+# Compute 10-year observed mean 
+obs_mean <- df_summary %>%
+  filter(lightning == "observed") %>%
+  summarise(mean_obs = mean(mean_strike_count, na.rm = TRUE)) %>%
+  pull(mean_obs)
+
+obs_mean
+
+# Plot
+p2 <- ggplot(df_summary, aes(x = as.factor(year), y = mean_strike_count, color = lightning, shape = lightning)) +
+  geom_point(size = 3, position = pd) +
+  geom_errorbar(aes(ymin = ci_low,
+                    ymax = ci_high),
+                width = 0.2, position = pd) +
+  geom_hline(yintercept = obs_mean, linetype = "dotted", color = "black") +
+  scale_color_manual(values = c(
+    "predicted" = "red",
+    "observed" = "gold")) +
+  scale_shape_manual(values = c(
+    "predicted" = 7,  # x
+    "observed" = 16  # solid circle
+  )) +
+  labs(x = "Year", y = "Strike Count",
+       title = "(b)") +
+  theme_minimal() + theme(legend.title = element_blank()) + labs(x = NULL)
+
+####################
+#Ignition Efficiency
+####################
+
+df_long <- df %>%
+  dplyr::select(year, fire_count, n_strikes_obs, p_ignite, p_ignite_rate_cal) %>%
+  filter(n_strikes_obs > 0) %>%
+  dplyr::mutate(p_ignite_obs = fire_count / n_strikes_obs) %>%
+  dplyr::mutate(p_ignite = p_ignite) %>%
+  dplyr::mutate(p_ignite_rate_cal = p_ignite_rate_cal) %>%
+  rename(observed=p_ignite_obs, predicted=p_ignite, predicted_rate_calibrated=p_ignite_rate_cal) %>%
+  pivot_longer(cols = c("observed","predicted", "predicted_rate_calibrated"),
+               names_to = "fire", values_to = "outcome")
+
+df_summary <- df_long %>%
+  group_by(year, fire) %>%
+  summarise(mean_prob_freq = mean(outcome, na.rm = TRUE),
+                ci_low   = quantile(outcome, 0.025, na.rm = TRUE),
+                ci_high  = quantile(outcome, 0.975, na.rm = TRUE),
+            .groups = "drop")
+
+df_summary
+
+# Compute 10-year observed mean 
+obs_mean <- df_summary %>%
+  filter(fire == "observed") %>%
+  summarise(mean_obs = mean(mean_prob_freq, na.rm = TRUE)) %>%
+  pull(mean_obs)
+
+obs_mean
+
+# Plot
+p3 <- ggplot(df_summary, aes(x = as.factor(year), y = mean_prob_freq, color = fire, shape = fire)) +
+  geom_point(size = 3, position = pd) +
+  geom_errorbar(aes(ymin = ci_low,
+                    ymax = ci_high),
+                width = 0.2) +
+  geom_hline(yintercept = obs_mean, linetype = "dotted", color = "black") +
+  scale_color_manual(values = c(
+    "predicted" = "red",
+    "observed" = "gold",
+    "predicted_rate_calibrated" = "green"),
+    labels = c("predicted" = "Predicted: p_ignite/gridcell", 
+               "predicted_rate_calibrated" = "Predicted: p_ignite/strike", 
+               "observed" = "Observed: fires/strikes/month")) +
+  scale_shape_manual(values = c(
+    "predicted" = 7,  # x
+    "observed" = 16,  # solid circle
+    "predicted_rate_calibrated" = 3
+  ),
+    labels = c("predicted" = "Predicted: p_ignite/gridcell", 
+               "predicted_rate_calibrated" = "Predicted: p_ignite/strike", 
+               "observed" = "Observed: fires/strikes/month")) +
+  labs(x = "Year", y = "Lightning-caused Ignition Probability/Rate",
+       title = "(c)") +
+  theme_minimal() + theme(legend.title = element_blank()) + labs(x = NULL)
+
+#no rate calibration comparison
+
+df <- df %>%
+  mutate(p_ignite_rate_obs = fire_count/n_strikes_obs)
+
+
+df_long <- df %>%
+  dplyr::select(year, p_ignite_rate_obs, p_ignite_rate_cal, n_strikes_obs) %>%
+  filter(n_strikes_obs > 0) %>%
+  rename(observed=p_ignite_rate_obs, predicted=p_ignite_rate_cal) %>%
+  pivot_longer(cols = c("observed","predicted"),
+               names_to = "fire", values_to = "outcome")
+
+
+df_summary <- df_long %>%
+  group_by(year, fire) %>%
+  summarise(mean_prob_freq = mean(outcome, na.rm = TRUE),
+                ci_low   = quantile(outcome, 0.025, na.rm = TRUE),
+                ci_high  = quantile(outcome, 0.975, na.rm = TRUE),
+            .groups = "drop")
+
+df_summary
+
+# Compute 10-year observed mean 
+obs_mean <- df_summary %>%
+  filter(fire == "observed") %>%
+  summarise(mean_obs = mean(mean_prob_freq, na.rm = TRUE)) %>%
+  pull(mean_obs)
+
+obs_mean
+
+
+# Plot 
+p3 <- ggplot(df_summary, aes(x = as.factor(year), y = mean_prob_freq, color = fire, shape = fire)) +
+  geom_point(size = 3, position = pd) +
+  geom_errorbar(aes(ymin = ci_low,
+                    ymax = ci_high),
+                width = 0.2, position = pd) +
+  geom_hline(yintercept = obs_mean, linetype = "dotted", color = "black") +
+  scale_color_manual(values = c(
+    "predicted" = "red",
+    "observed" = "gold"),
+    labels = c("predicted" = "Predicted: p_ignite/strike", 
+               "observed" = "Observed: fires/strikes/month")) +
+  scale_shape_manual(
+    values = c(
+    "predicted" = 7,  # x
+    "observed" = 16  # solid circle
+  ),
+    labels = c("predicted" = "Predicted: p_ignite/strike", 
+               "observed" = "Observed: fires/strikes/month")) +
+  labs(x = "Year", y = "Probability/Rate", title = "(c)") +
+  theme_minimal() + theme(legend.title = element_blank()) + labs(x = NULL) 
+
+#Fix for error bars:
+
+set.seed(123)  # reproducible bootstrap for 'observed'
+
+df_long <- df %>%
+  dplyr::select(year, fire_count, n_strikes_obs, p_ignite_rate_cal) %>%
+  filter(n_strikes_obs > 0) %>%
+  dplyr::mutate(p_ignite_obs = fire_count / n_strikes_obs) %>%
+  dplyr::mutate(p_ignite = p_ignite_rate_cal) %>%
+  rename(observed = p_ignite_obs, predicted = p_ignite_rate_cal) %>%
+  pivot_longer(cols = c("observed", "predicted"),
+               names_to = "fire", values_to = "outcome")
+
+# Bootstrap CI helper for the mean (used for 'observed')
+boot_mean_ci <- function(x, n_boot = 2000, probs = c(0.025, 0.975)) {
+  x <- x[!is.na(x)]
+  if (length(x) < 2) {
+    return(c(mean = mean(x), ci_low = NA_real_, ci_high = NA_real_))
+  }
+  means <- replicate(n_boot, mean(sample(x, replace = TRUE)))
+  qs <- quantile(means, probs, na.rm = TRUE)
+  c(mean = mean(x), ci_low = unname(qs[1]), ci_high = unname(qs[2]))
+}
+
+# Empirical quantile helper (used for 'predicted')
+quantile_ci <- function(x, probs = c(0.025, 0.975)) {
+  x <- x[!is.na(x)]
+  if (length(x) < 2) {
+    return(c(mean = mean(x), ci_low = NA_real_, ci_high = NA_real_))
+  }
+  qs <- quantile(x, probs, na.rm = TRUE)
+  c(mean = mean(x), ci_low = unname(qs[1]), ci_high = unname(qs[2]))
+}
+
+# df_summary_p_ignite <- df_long %>%
+#   group_by(year, fire) %>%
+#   summarise(
+#     boot = list(
+#       if (first(fire) == "observed") {
+#         boot_mean_ci(outcome)
+#       } else {
+#         quantile_ci(outcome)
+#       }
+#     ),
+#     .groups = "drop"
+#   ) %>%
+#   mutate(
+#     mean_prob_freq = map_dbl(boot, "mean"),
+#     ci_low         = map_dbl(boot, "ci_low"),
+#     ci_high        = map_dbl(boot, "ci_high")
+#   ) %>%
+#   dplyr::select(-boot)
+
+df_summary_p_ignite
+
+# Compute 10-year observed mean
+obs_mean <- df_summary_p_ignite %>%
+  filter(fire == "observed") %>%
+  summarise(mean_obs = mean(mean_prob_freq, na.rm = TRUE)) %>%
+  pull(mean_obs)
+obs_mean
+
+# Plot
+pd <- position_dodge(width = 0.4)
+
+p3 <- ggplot(df_summary_p_ignite, aes(x = as.factor(year), y = mean_prob_freq, color = fire, shape = fire)) +
+  geom_point(size = 3, position = pd) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                width = 0.2, position = pd) +
+  geom_hline(yintercept = obs_mean, linetype = "dotted", color = "black") +
+  scale_color_manual(values = c(
+    "predicted" = "red",
+    "observed"  = "gold"),
+    labels = c("predicted" = "Predicted: p_ignite/strike",
+               "observed"  = "Observed: fires/strikes/month")) +
+  scale_shape_manual(values = c(
+    "predicted" = 7,
+    "observed"  = 16),
+    labels = c("predicted" = "Predicted: p_ignite/strike",
+               "observed"  = "Observed: fires/strikes/month")) +
+  labs(x = "Year", y = "Probability/Rate", title = "(c)",
+       caption = "Observed CIs: bootstrap 95% CI of mean fires/strikes \nPredicted CIs: empirical 2.5–97.5% quantiles of p_ignite") +
+  theme_minimal() + theme(legend.title = element_blank()) + labs(x = NULL) +
+  theme(plot.caption = element_text(hjust = 0, size = 8, face = "italic"))
+
+p3
+
+
+#NOTE
+#observed: mean fires/strikes per gridcell-month. bootstrap CI of the mean. this is a confidence interval on a summary statistic ie. if you resampled this year's data repeatedly, 95% of the resulting sample means would fall in this range. It describes sampling uncertainty in the estimate of the mean, not the spread of the underlying observations.
+#predicted: mean p_ignite, calibrated. Bars represent empirical quantile, 2.5–97.5%. this is a prediction interval over individual values. ie. 95% of the individual p_ignite_rate_cal values across grid-cells/strike-groups in this year fall in this range. It describes the heterogeneity of the model's output within a year.
+
+#so, observed intervals are how much the sample mean would change if you resample observations within each year, while predicted intervals show the range of predictions across gridcell-months within each year. I use different methods to show the range in observed versus predicted spread because the observed data is so zero inflated. Calculating quantiles for observed fire count/strike count would yield values too small to be visible on the plot. 
+
+#Also, observed's CI is comparably-sized or even narrower than predicted's in most years, even though observed's underlying data is far noisier. This does not mean that the observed rate is "more certain" than the predicted rate, it's that we're comparing a CI on a mean (which tightens as the average over many strike-groups) against a spread of individual values (which doesn't shrink with sample size at all).
+
+##########
+#Fire count
+##########
+# Reshape to long format
+df_long <- df %>%
+  dplyr::select(year, fire_count_pred, fire_count) %>%
+  rename(observed=fire_count, predicted=fire_count_pred) %>%
+  pivot_longer(cols = c("observed","predicted"),
+               names_to = "fire", values_to = "count")
+
+df_summary <- df_long %>%
+  group_by(year, fire) %>%
+  summarise(total_count = sum(count, na.rm = TRUE),
+            .groups = "drop")
+
+df_summary
+
+# Compute 10-year observed mean count
+obs_mean_count <- df_summary %>%
+  filter(fire == "observed") %>%
+  summarise(mean_obs = mean(total_count, na.rm = TRUE)) %>%
+  pull(mean_obs)
+
+obs_mean_count
+
+# Plot
+p4 <- ggplot(df_summary, aes(x = as.factor(year), y = total_count, color = fire, shape = fire)) +
+  geom_point(size = 3, position = pd) +
+  geom_hline(yintercept = obs_mean_count, linetype = "dotted", color = "black") +
+  scale_color_manual(
+    values = c(
+    "predicted" = "red",
+    "observed" = "gold"),
+    labels = c("predicted" = "Predicted",
+               "observed"  = "Observed")) +
+  scale_shape_manual(values = c(
+    "predicted" = 7,  # x
+    "observed" = 16  # solid circle
+  ),labels = c("predicted" = "Predicted",
+               "observed"  = "Observed")) +
+  labs(x = "Year", y = "Fire Count",
+       title = "(d)") +
+  theme_minimal() + theme(legend.title = element_blank()) + labs(x = NULL)
+
+
+##########
+# Total Burned Area 
+##########
+
+#MEAN 
+
+# Reshape to long format
+df_long <- df %>%
+  dplyr::select(year, burned_area_km2_total, total_burned_area) %>%
+  rename(observed=burned_area_km2_total, predicted=total_burned_area) %>%
+  pivot_longer(cols = c("observed","predicted"),
+               names_to = "burned_area", values_to = "area_km")
+
+df_long$area_km <- as.numeric(df_long$area_km)
+#Summarize mean and sd for each year/model
+df_summary_mean_area <- df_long %>%
+  group_by(year, burned_area) %>%
+  summarise(
+    boot = list(boot_mean_ci(area_km)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_area = map_dbl(boot, "mean"),
+    ci_low    = map_dbl(boot, "ci_low"),
+    ci_high   = map_dbl(boot, "ci_high")
+  ) %>%
+  dplyr::select(-boot)
+
+
+df_summary_mean_area
+
+#10 year mean annual total
+obs_mean_area <- df_summary_mean_area %>%
+  filter(burned_area == "observed") %>%
+  summarise(mean_obs = mean(mean_area, na.rm = TRUE)) %>%
+  pull(mean_obs)
+
+p5 <- ggplot(df_summary_mean_area, aes(x = as.factor(year), y = mean_area, color = burned_area, shape = burned_area)) +
+  geom_point(size = 3, position = pd) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high),
+                width = 0.2, position = pd) +
+  geom_hline(yintercept = obs_mean_area, linetype = "dotted", color = "black") +
+  scale_color_manual(values = c(
+    "predicted" = "red",
+    "observed" = "gold"),
+    labels = c("predicted" = "Predicted",
+               "observed"  = "Observed")) +
+  scale_shape_manual(values = c(
+    "predicted" = 7,  # x
+    "observed" = 16  # solid circle
+  ),
+  labels = c("predicted" = "Predicted",
+               "observed"  = "Observed")) +
+  labs(x = "Year", y = "Mean burned Area (km2)",
+       title = "(e)", caption = "CIs: bootstrap 95% CI of mean burned area") +
+  theme_minimal() + theme(legend.title = element_blank()) + labs(x = NULL)
+
+#SUM
+
+# Reshape to long format
+df_long <- df %>%
+  #filter(burned_area_km2_total < 1000) %>%
+  dplyr::select(year, burned_area_km2_total, total_burned_area) %>%
+  rename(observed=burned_area_km2_total, predicted=total_burned_area) %>%
+  pivot_longer(cols = c("observed","predicted"),
+               names_to = "burned_area", values_to = "area_km")
+
+df_long$area_km <- as.numeric(df_long$area_km)
+# Summarize mean and sd for each year/model
+df_summary <- df_long %>%
+  group_by(year, burned_area) %>%
+  summarise(sum_area = sum(area_km, na.rm = TRUE),
+            .groups = "drop")
+
+df_summary
+
+#10 year mean annual total
+obs_mean_total_area <- df_summary %>%
+  filter(burned_area == "observed") %>%
+  summarise(mean_obs = mean(sum_area, na.rm = TRUE)) %>%
+  pull(mean_obs)
+
+p6 <- ggplot(df_summary, aes(x = as.factor(year), y = sum_area, color = burned_area, shape = burned_area)) +
+  geom_point(size = 3, position = pd) +
+  geom_hline(yintercept = obs_mean_total_area, linetype = "dotted", color = "black") +
+  scale_color_manual(values = c(
+    "predicted" = "red",
+    "observed" = "gold"),
+    labels = c("predicted" = "Predicted",
+               "observed"  = "Observed")) +
+  scale_shape_manual(values = c(
+    "predicted" = 7,  # x
+    "observed" = 16  # solid circle
+  ),
+  labels = c("predicted" = "Predicted",
+               "observed"  = "Observed")) +
+  labs(x = "Year", y = "Total burned Area (km2)",
+       title = "(f)") +
+  theme_minimal() + theme(legend.title = element_blank()) + labs(x = NULL)
+
+
+p1 / p2 / p3 / p4 / p5 / p6 
+
+combined_plot <- p1 / p2 / p3 / p4 / p5 / p6 
+```
+
+```{r}
+
+ggsave(
+  filename = file.path(figure_root, "Figure_time.png"),
+  plot = combined_plot,
+  width = 8,
+  height = 14,     
+  units = "in",
+  dpi = 300
+)
+
+```

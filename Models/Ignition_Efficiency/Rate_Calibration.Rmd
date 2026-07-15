@@ -1,0 +1,512 @@
+---
+title: "Rate_Calibration"
+output: html_document
+---
+
+```{r, echo=FALSE, include=FALSE}
+library(rstan)
+library(dplyr)
+library(stats)
+library(caret)
+library(tidyr)
+library(patchwork)
+library(ggplot2)
+library(gridExtra)
+library(terra)
+library(lubridate)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(glmnet)
+library(pROC)
+library(PRROC)
+```
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+
+```
+
+
+Read in drivers
+```{r}
+df <- read.csv(file.path(drivers_root, "lightning_fires_burned_area_jja_2002_2011.csv"))
+df <- df[,2:29]
+
+#Random forest results indicate that U (% open land), C (% conifer cover), and sd (snow depth) should be excluded
+df <- df[,c("lat","lon","year","month","rh","tair","precip","wind","precip_1m","precip_2m","precip_3m","precip_5y","tair_1m","tair_2m","tair_3m","tair_5y","B","strike_count","fire_count")]
+head(df)
+```
+
+Split into training and testing data
+```{r, echo=FALSE}
+## 80% of the sample size
+sample_size <- floor(0.8 * nrow(df))
+
+## set the seed to make partition reproducible
+set.seed(123)
+train_index <- sample(seq_len(nrow(df)), size = sample_size)
+
+train <- df[train_index, ]
+test <- df[-train_index, ]
+```
+
+```{r}
+# ── Save scaling parameters ───────────────────────────────────────────────────
+predictors_ignition <- c("rh", "tair", "precip", "wind",
+                          "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                          "tair_1m", "tair_2m", "tair_3m", "tair_5y", "B")
+
+mu_rh        <- mean(train$rh);        sigma_rh        <- sd(train$rh)
+mu_tair      <- mean(train$tair);      sigma_tair      <- sd(train$tair)
+mu_precip    <- mean(train$precip);    sigma_precip    <- sd(train$precip)
+mu_wind      <- mean(train$wind);      sigma_wind      <- sd(train$wind)
+mu_precip_1m <- mean(train$precip_1m); sigma_precip_1m <- sd(train$precip_1m)
+mu_precip_2m <- mean(train$precip_2m); sigma_precip_2m <- sd(train$precip_2m)
+mu_precip_3m <- mean(train$precip_3m); sigma_precip_3m <- sd(train$precip_3m)
+mu_precip_5y <- mean(train$precip_5y); sigma_precip_5y <- sd(train$precip_5y)
+mu_tair_1m   <- mean(train$tair_1m);   sigma_tair_1m   <- sd(train$tair_1m)
+mu_tair_2m   <- mean(train$tair_2m);   sigma_tair_2m   <- sd(train$tair_2m)
+mu_tair_3m   <- mean(train$tair_3m);   sigma_tair_3m   <- sd(train$tair_3m)
+mu_tair_5y   <- mean(train$tair_5y);   sigma_tair_5y   <- sd(train$tair_5y)
+mu_B         <- mean(train$B);         sigma_B         <- sd(train$B)
+
+# Store and save
+mean_sd_ignition <- data.frame(
+  var   = predictors_ignition,
+  mu    = c(mu_rh, mu_tair, mu_precip, mu_wind,
+            mu_precip_1m, mu_precip_2m, mu_precip_3m, mu_precip_5y,
+            mu_tair_1m, mu_tair_2m, mu_tair_3m, mu_tair_5y, mu_B),
+  sigma = c(sigma_rh, sigma_tair, sigma_precip, sigma_wind,
+            sigma_precip_1m, sigma_precip_2m, sigma_precip_3m, sigma_precip_5y,
+            sigma_tair_1m, sigma_tair_2m, sigma_tair_3m, sigma_tair_5y, sigma_B)
+)
+
+write.csv(mean_sd_ignition,
+          file.path(mu_sigma_root, "mu_sigma_ignition_predictors.csv"),
+          row.names = FALSE)
+
+# ── Standardize train ─────────────────────────────────────────────────────────
+train <- train %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_1m   = (tair_1m   - mu_tair_1m)   / sigma_tair_1m,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_3m   = (tair_3m   - mu_tair_3m)   / sigma_tair_3m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B
+  )
+
+train <- train[, c("lat", "lon", "year", "month",
+                   "strike_count", "fire_count",
+                   "rh", "tair", "precip", "wind",
+                   "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                   "tair_1m", "tair_2m", "tair_3m", "tair_5y", "B")]
+
+# ── Standardize test ──────────────────────────────────────────────────────────
+# Use training means and sds 
+test <- test %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_1m   = (tair_1m   - mu_tair_1m)   / sigma_tair_1m,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_3m   = (tair_3m   - mu_tair_3m)   / sigma_tair_3m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B
+  )
+
+test <- test[, c("lat", "lon", "year", "month",
+                 "strike_count", "fire_count",
+                 "rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                 "tair_1m", "tair_2m", "tair_3m", "tair_5y", "B")]
+
+head(train)
+
+```
+
+##########################################
+##### IGNITION EFFICINCY (p_ignite) #####
+##########################################
+
+Y ~ Binomial(n, p_ignite) --> technically, this is applied in the next step, to estimate fire count.
+
+logit(p_ignite) = alpha + X * beta
+
+alpha ~ normal(mu_alpha, sigma_alpha)
+beta  ~ normal(0, sigma_beta)
+
+p_ignite_corrected = plogis(qlogis(pie) + cal_shift)
+
+p_ignite: probability of 1 strike resulting in an ignition in a given gridcell and month. 
+X: average precipitation rate, temperature, relative humidity, cumulative precipitation for the previous 1, 2, 3 months, and 5 years, mean temperature for the previous 1, 2, 3 months, and 5 years, and % broadleaf cover. 
+
+
+```{r}
+
+#Bayes recalibrated
+#Load calibrated Bayesian model
+ignition_bayes_obj <- readRDS(file.path(rds_root, 
+                                         "Ignition_Efficiency/m2_bayes_calibrated.rds"))
+
+ignition_bayes_fit <- ignition_bayes_obj$fit        # stanfit object
+cal_shift_bayes    <- ignition_bayes_obj$cal_shift  # intercept shift
+coef_means         <- ignition_bayes_obj$coef_means # posterior mean alpha and beta
+
+cat("Bayesian calibration shift:", round(cal_shift_bayes, 3), "\n")
+
+# ── Build predictor matrix from standardised data
+predictors_m2 <- c("rh", "tair", "precip",
+                    "precip_1m", "precip_2m", "precip_3m",
+                    "precip_5y", "tair_1m", "tair_2m",
+                    "tair_3m", "tair_5y", "B")
+
+X_new <- model.matrix(
+  as.formula(paste("~", paste(predictors_m2, collapse = " + "), "- 1")),
+  data = train
+)
+
+#generate predictions using posterior mean
+alpha_mean <- coef_means$alpha
+beta_means <- coef_means$beta
+
+eps <- 1e-8
+
+linpred <- as.numeric(alpha_mean + X_new %*% beta_means)
+
+train <- train |>
+  mutate(
+    #inverse_logit of linear predictor, linpred
+    p_ignite_bayes     = plogis(linpred),
+    #add calibration shift 
+    p_ignite_bayes_cal = plogis(pmin(pmax(linpred + cal_shift_bayes,     #pmin and pmax make sure arguments in plogis from reaching infinity
+                                           log(eps / (1 - eps))),
+                                      log((1 - eps) / eps)))
+  )
+
+# Note: adding cal_shift directly to the linear predictor (before plogis)
+# is equivalent to plogis(qlogis(p) + cal_shift) but avoids the
+# double transformation and is numerically more stable
+
+#verify
+cat("Raw Bayes p_ignite summary:\n")
+print(summary(train$p_ignite_bayes))
+
+cat("Calibrated Bayes p_ignite summary:\n")
+print(summary(train$p_ignite_bayes_cal))
+
+```
+
+##### RATE CALIBRATION SHIFT FOR P_IGNITE ##### 
+
+Ignition efficiency model not capture the observed fire/strike rate. 
+
+
+This is due to a combination of model type and data structure.
+
+What the model was trained to predict
+The binomial logistic regression was trained on gridcell-month outcomes — cbind(fire_count, strike_count - fire_count) — where the outcome is whether each strike results in a fire. The model maximises the binomial likelihood across all gridcell-months simultaneously.
+However, the vast majority of gridcell-months have fire_count = 0 even when strike_count > 0. The model sees thousands of zero-fire months and adjusts its intercept downward to fit them. But "zero fires in a gridcell-month with 50 strikes" doesn't mean each individual strike had zero probability of igniting — it means the probability was low enough that none of 50 independent trials succeeded. The model conflates these two things.
+
+Rare event bias in logistic regression
+When events are rare (ie. lightning-caused fires are extremely rare at the gridcell-month level (prevalence ~0.004)) maximum likelihood estimation of the intercept in logistic regression is biased downward. The intercept gets pulled toward negative infinity to fit the overwhelming proportion of zeros.
+
+The binary calibration only partially fixes it
+The binary calibration corrects the model to match the observed gridcell-month fire rate — the fraction of gridcell-months with at least one fire. But this is still not the same as the per-strike ignition rate.
+Consider a gridcell-month with 100 strikes and 1 fire:
+* Binary outcome: 1 (fire occurred) — contributes to binary calibration target
+* Per-strike rate: 1/100 = 0.01 — this is what you need for p_fire = 1-(1-p)^n
+The binary calibration makes the model predict the right fraction of fire-months, but p_ignite ends up being the gridcell-month fire probability, not the per-strike probability. When you then raise it to the power of hundreds of strikes, you get enormous fire probabilities.
+
+The rate calibration fixes the scale
+The rate calibration specifically targets sum(fire_count) / sum(strike_count) — the true per-strike ignition rate — and estimates the additional shift needed to align p_ignite with this quantity. This is the number that belongs in 1 - (1-p)^n_strikes.
+
+In summary, as a flow:
+
+Model training:
+  Binomial GLM learns P(fire | gridcell-month climate)
+  → Rare event bias pulls intercept too low
+  → Binary calibration corrects to P(fire-month | climate)
+  → But P(fire-month) ≠ P(fire | single strike)
+  → Rate calibration corrects to P(fire | single strike)
+  → Now correctly used in 1-(1-p)^n_strikes
+The need for two calibration steps reflects the fact that the model was specified at the gridcell-month level for practical reasons (that's the resolution of your climate data) but needs to produce predictions at the per-strike level for the fire probability formula. These are fundamentally different quantities that happen to be related through the binomial formula, and the two calibration steps bridge that gap.
+
+so the model is trained to predict the probability of a fire given x strikes. but not the probability of a fire for each strike? the rate caliibration 
+
+
+```{r}
+#Estimate rate calibration shift from train data
+#wses gridcell-months with strikes > 0
+#weights by strike_count so high-strike months have more influence
+
+train <- train |>
+  filter(strike_count > 0) |>   #the lightning model takes care of 0 stirke counts, so dont need the P_ignite model to worry about zeros.
+  mutate(
+    obs_rate    = fire_count / strike_count,
+    eps         = 1e-8,
+    logit_p_cal = qlogis(pmin(pmax(p_ignite_bayes_cal, eps), 1 - eps))
+  )
+
+rate_cal_model <- glm(
+  obs_rate ~ offset(logit_p_cal),
+  data    = train,
+  family  = binomial(),
+  weights = strike_count
+)
+
+rate_cal_shift <- coef(rate_cal_model)[1]
+cat("Rate calibration shift:", round(rate_cal_shift, 3), "\n")
+# Expect a negative value — shifts predictions down toward true per-strike rate
+
+#apply combined shift to all predictions
+eps <- 1e-8
+
+train <- train |>
+  mutate(
+    p_ignite_rate_cal = plogis(
+      qlogis(pmin(pmax(p_ignite_bayes_cal, eps), 1 - eps)) + rate_cal_shift
+    )
+  )
+
+# verify annual rates now match observed 
+train |>
+  filter(strike_count > 0) |>
+  group_by(year) |>
+  summarise(
+    obs_rate           = sum(fire_count) / sum(strike_count),
+    pred_binary_cal    = mean(p_ignite_bayes_cal),
+    pred_rate_cal      = mean(p_ignite_rate_cal),
+    .groups            = "drop"
+  )
+
+#check expected fire count
+cat("Expected fires (binary cal):  ",
+    sum(test$strike_count * test$p_ignite_bayes_cal, na.rm = TRUE), "\n")
+cat("Expected fires (rate cal):    ",
+    sum(test$strike_count * test$p_ignite_rate_cal,  na.rm = TRUE), "\n")
+cat("Observed fires:               ",
+    sum(test$lightning_ignition), "\n")
+
+#save shift for paleo application
+saveRDS(list(
+  cal_shift_bayes = cal_shift_bayes,   # binary calibration shift
+  rate_cal_shift  = rate_cal_shift,    # rate calibration shift
+  combined_shift  = cal_shift_bayes + rate_cal_shift
+), file.path(rds_root, "Ignition_Efficiency/calibration_shifts.rds"))
+
+```
+
+
+### Apply full ignition model to test set
+
+
+```{r}
+
+############################
+# Intercept calibration
+############################
+
+X_new <- model.matrix(
+  as.formula(paste("~", paste(predictors_m2, collapse = " + "), "- 1")),
+  data = test
+)
+
+#generate predictions using posterior mean
+alpha_mean <- coef_means$alpha
+beta_means <- coef_means$beta
+
+eps <- 1e-8
+
+linpred <- as.numeric(alpha_mean + X_new %*% beta_means)
+
+test <- test |>
+  mutate(
+    #inverse_logit of linear predictor, linpred
+    p_ignite_bayes     = plogis(linpred),
+    #add calibration shift 
+    p_ignite_bayes_cal = plogis(pmin(pmax(linpred + cal_shift_bayes,     #pmin and pmax make sure arguments in plogis from reaching infinity
+                                           log(eps / (1 - eps))),
+                                      log((1 - eps) / eps)))
+  )
+
+# Note: adding cal_shift directly to the linear predictor (before plogis)
+# is equivalent to plogis(qlogis(p) + cal_shift) but avoids the
+# double transformation and is numerically more stable
+
+#verify
+cat("Raw Bayes p_ignite summary:\n")
+print(summary(test$p_ignite_bayes))
+
+cat("Calibrated Bayes p_ignite summary:\n")
+print(summary(test$p_ignite_bayes_cal))
+
+############################
+# Rate Calibration Shift
+############################
+
+
+test <- test |>
+  mutate(
+    p_ignite_rate_cal = plogis(
+      qlogis(pmin(pmax(p_ignite_bayes_cal, eps), 1 - eps)) + rate_cal_shift
+    )
+  )
+
+# verify annual rates now match observed 
+test |>
+  filter(strike_count > 0) |>
+  group_by(year) |>
+  summarise(
+    obs_rate           = sum(fire_count) / sum(strike_count),
+    pred_binary_cal    = mean(p_ignite_bayes_cal),
+    pred_rate_cal      = mean(p_ignite_rate_cal),
+    .groups            = "drop"
+  )
+
+
+
+
+
+```
+
+Performance
+
+
+```{r}
+# Annual aggregation
+test |>
+  filter(strike_count > 0) |>
+  group_by(year) |>
+  summarise(
+    obs_rate  = sum(fire_count) / sum(strike_count),
+    pred_rate = mean(p_ignite_rate_cal),
+    .groups   = "drop"
+  ) |>
+  summarise(
+    mean_obs_rate = mean(obs_rate),
+    mean_pred_rate = mean(pred_rate), 
+    spearman = cor(obs_rate, pred_rate, method = "spearman"),
+    ratio    = sum(pred_rate) / sum(obs_rate)
+  )
+
+# Annual gridcell aggregation
+test |>
+  filter(strike_count > 0) |>
+  group_by(year, lat, lon) |>
+  summarise(
+    obs_rate  = sum(fire_count) / sum(strike_count),
+    pred_rate = mean(p_ignite_rate_cal),
+    .groups   = "drop"
+  ) |>
+  summarise(
+    mean_obs_rate = mean(obs_rate),
+    mean_pred_rate = mean(pred_rate), 
+    spearman = cor(obs_rate, pred_rate, method = "spearman"),
+    ratio    = sum(pred_rate) / sum(obs_rate)
+  )
+# Monthly gridcell aggregation
+
+test |>
+  filter(strike_count > 0) |>
+  group_by(year, lat, lon, month) |>
+  summarise(
+    obs_rate  = sum(fire_count) / sum(strike_count),
+    pred_rate = mean(p_ignite_rate_cal),
+    .groups   = "drop"
+  ) |>
+  summarise(
+    mean_obs_rate = mean(obs_rate),
+    mean_pred_rate = mean(pred_rate), 
+    spearman = cor(obs_rate, pred_rate, method = "spearman"),
+    ratio    = sum(pred_rate) / sum(obs_rate)
+  )
+```
+
+
+Ignition efficiency: rate calibrated (per-strike ignition probability)
+
+Observed vs predicted per-strike ignition rate: sum(fire_count) / sum(strike_count) vs mean(p_ignite_rate_cal) aggregated by year, directly measures whether the calibrated probability matches the true per-strike ignition rate that enters the fire probability formula
+
+- Expected vs observed fire count ratio — sum(n_strikes × p_ignite_rate_cal) vs observed fire count, evaluates whether the calibrated probability produces the right aggregate number of fires when multiplied by strike counts across all gridcell-months. 1 is perfect. 
+- Spearman correlation between observed and predicted ignition rate — computed at the annual or spatial level (not gridcell-month, where noise is too high), assesses whether the model correctly ranks years or regions by ignition efficiency. 1 = perfect, 0.7 - 0.9, strong correlation
+
+These differ from the binary fire count metrics because the rate-calibrated model is no longer evaluated as a 0/1 classifier — it's evaluated as a rate predictor. ROC AUC and PR AUC are not appropriate here since you're no longer predicting a binary outcome but a continuous per-strike probability that feeds into the count simulation.
+
+The aggregation level matters — gridcell-month observed rates (fire_count / strike_count) are too noisy for meaningful correlation since most are exactly 0 or 1. Annual or multi-year spatial aggregation gives stable estimates
+
+```{r}
+plot_df <- test |>
+  filter(strike_count > 0) |>
+  group_by(year, lat, lon, month) |>
+  summarise(
+    obs_rate  = sum(fire_count) / sum(strike_count),
+    pred_rate = mean(p_ignite_rate_cal),
+    .groups   = "drop"
+  ) 
+
+ggplot(plot_df, aes(x=pred_rate, y=obs_rate)) + geom_point()
+
+plot_df <- test |>
+  filter(strike_count > 0) |>
+  group_by(year) |>
+  summarise(
+    obs_rate  = sum(fire_count) / sum(strike_count),
+    pred_rate = mean(p_ignite_rate_cal),
+    .groups   = "drop"
+  ) 
+
+df_long <- plot_df %>% 
+  pivot_longer(
+    cols = c(obs_rate, pred_rate),  # Columns to transform (can also use: c(Year2024, Year2025) or 2:3)
+    names_to = "outcome",           # Name of the new category column
+    values_to = "rate"          # Name of the new metrics column
+  )
+
+ggplot(df_long, aes(x=year, y=rate, color=outcome)) + geom_point()
+
+```

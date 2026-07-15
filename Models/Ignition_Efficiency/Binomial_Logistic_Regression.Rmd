@@ -1,0 +1,905 @@
+---
+title: "Ignition Efficiency Model"
+author: "Charlotte Uden"
+date: "2026-06-03"
+output: html_document
+---
+
+```{r, echo=FALSE, include=FALSE}
+library(rstan)
+library(dplyr)
+library(stats)
+library(caret)
+library(tidyr)
+library(patchwork)
+library(ggplot2)
+library(gridExtra)
+library(terra)
+library(lubridate)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(glmnet)
+library(pROC)
+library(PRROC)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+```
+
+
+Read in drivers
+```{r}
+df <- read.csv(file.path(drivers_root, "lightning_fires_burned_area_jja_2002_2011.csv"))
+df <- df[,2:29]
+
+#Random forest results indicate that U (% open land), C (% conifer cover), and sd (snow depth) should be excluded
+df <- df[,c("lat","lon","year","month","rh","tair","precip","wind","precip_1m","precip_2m","precip_3m","precip_5y","tair_1m","tair_2m","tair_3m","tair_5y","B","strike_count","fire_count")]
+head(df)
+```
+
+
+
+Split into training and testing data
+```{r, echo=FALSE}
+## 80% of the sample size
+sample_size <- floor(0.8 * nrow(df))
+
+## set the seed to make partition reproducible
+set.seed(123)
+train_index <- sample(seq_len(nrow(df)), size = sample_size)
+
+train <- df[train_index, ]
+test <- df[-train_index, ]
+```
+
+```{r}
+# ── Save scaling parameters ───────────────────────────────────────────────────
+predictors_ignition <- c("rh", "tair", "precip", "wind",
+                          "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                          "tair_1m", "tair_2m", "tair_3m", "tair_5y", "B")
+
+mu_rh        <- mean(train$rh);        sigma_rh        <- sd(train$rh)
+mu_tair      <- mean(train$tair);      sigma_tair      <- sd(train$tair)
+mu_precip    <- mean(train$precip);    sigma_precip    <- sd(train$precip)
+mu_wind      <- mean(train$wind);      sigma_wind      <- sd(train$wind)
+mu_precip_1m <- mean(train$precip_1m); sigma_precip_1m <- sd(train$precip_1m)
+mu_precip_2m <- mean(train$precip_2m); sigma_precip_2m <- sd(train$precip_2m)
+mu_precip_3m <- mean(train$precip_3m); sigma_precip_3m <- sd(train$precip_3m)
+mu_precip_5y <- mean(train$precip_5y); sigma_precip_5y <- sd(train$precip_5y)
+mu_tair_1m   <- mean(train$tair_1m);   sigma_tair_1m   <- sd(train$tair_1m)
+mu_tair_2m   <- mean(train$tair_2m);   sigma_tair_2m   <- sd(train$tair_2m)
+mu_tair_3m   <- mean(train$tair_3m);   sigma_tair_3m   <- sd(train$tair_3m)
+mu_tair_5y   <- mean(train$tair_5y);   sigma_tair_5y   <- sd(train$tair_5y)
+mu_B         <- mean(train$B);         sigma_B         <- sd(train$B)
+
+# Store and save
+mean_sd_ignition <- data.frame(
+  var   = predictors_ignition,
+  mu    = c(mu_rh, mu_tair, mu_precip, mu_wind,
+            mu_precip_1m, mu_precip_2m, mu_precip_3m, mu_precip_5y,
+            mu_tair_1m, mu_tair_2m, mu_tair_3m, mu_tair_5y, mu_B),
+  sigma = c(sigma_rh, sigma_tair, sigma_precip, sigma_wind,
+            sigma_precip_1m, sigma_precip_2m, sigma_precip_3m, sigma_precip_5y,
+            sigma_tair_1m, sigma_tair_2m, sigma_tair_3m, sigma_tair_5y, sigma_B)
+)
+
+write.csv(mean_sd_ignition,
+          file.path(mu_sigma_root, "mu_sigma_ignition_predictors.csv"),
+          row.names = FALSE)
+
+# ── Standardize train ─────────────────────────────────────────────────────────
+train <- train %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_1m   = (tair_1m   - mu_tair_1m)   / sigma_tair_1m,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_3m   = (tair_3m   - mu_tair_3m)   / sigma_tair_3m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B
+  )
+
+train <- train[, c("lat", "lon", "year", "month",
+                   "strike_count", "fire_count",
+                   "rh", "tair", "precip", "wind",
+                   "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                   "tair_1m", "tair_2m", "tair_3m", "tair_5y", "B")]
+
+# ── Standardize test ──────────────────────────────────────────────────────────
+# Use training means and sds 
+test <- test %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_1m   = (tair_1m   - mu_tair_1m)   / sigma_tair_1m,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_3m   = (tair_3m   - mu_tair_3m)   / sigma_tair_3m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B
+  )
+
+test <- test[, c("lat", "lon", "year", "month",
+                 "strike_count", "fire_count",
+                 "rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                 "tair_1m", "tair_2m", "tair_3m", "tair_5y", "B")]
+
+head(train)
+
+```
+
+```{r}
+
+# ── Predictors ────────────────────────────────────────────────────────────────
+predictors_ignition <- c("rh", "tair", "precip", "wind",
+                          "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                          "tair_1m", "tair_2m", "tair_3m", "tair_5y", "B")
+
+# ── Filter to gridcell-months with at least one strike ────────────────────────
+# Rows with strike_count == 0 have no denominator for the binomial
+train_strikes <- train |> filter(strike_count > 0)
+test_strikes  <- test  |> filter(strike_count > 0)
+
+cat("Training rows with strikes:", nrow(train_strikes), "\n")
+cat("Test rows with strikes:    ", nrow(test_strikes),  "\n")
+cat("Training fire prevalence:  ",
+    round(sum(train_strikes$fire_count) / sum(train_strikes$strike_count), 6), "\n")
+```
+
+# ── Model 1: Standard binomial GLM ────────────────────────────────────────────
+```{r}
+formula_ignition <- as.formula(
+  paste("cbind(fire_count, strike_count - fire_count) ~",
+        paste(predictors_ignition, collapse = " + "))
+)
+
+I1_glm <- glm(formula_ignition,
+               data   = train_strikes,
+               family = binomial(link = "logit"))
+
+summary(I1_glm)
+```
+
+# ── Model 2: Ridge-penalized logistic regression (glmnet) ─────────────────────
+# Following Hessilt et al. (2022) and Uden et al. (2026)
+```{r}
+
+# Build model matrices
+X_train <- model.matrix(
+  as.formula(paste("~", paste(predictors_ignition, collapse = " + "), "- 1")),
+  data = train_strikes
+)
+
+X_test <- model.matrix(
+  as.formula(paste("~", paste(predictors_ignition, collapse = " + "), "- 1")),
+  data = test_strikes
+)
+
+# Two-column response: cbind(successes, failures)
+Y_train <- cbind(train_strikes$fire_count,
+                 train_strikes$strike_count - train_strikes$fire_count)
+
+# 5-fold cross-validation to select lambda (ridge: alpha = 0)
+set.seed(123)
+cv_ridge <- cv.glmnet(
+  x        = X_train,
+  y        = Y_train,
+  family   = "binomial",
+  alpha    = 0,        # ridge penalty
+  nfolds   = 5,
+  type.measure = "deviance"
+)
+
+plot(cv_ridge)
+cat("Optimal lambda (min deviance):", cv_ridge$lambda.min, "\n")
+cat("Optimal lambda (1se rule):    ", cv_ridge$lambda.1se, "\n")
+
+# Fit final ridge model with optimal lambda
+I1_ridge <- glmnet(
+  x      = X_train,
+  y      = Y_train,
+  family = "binomial",
+  alpha  = 0,
+  lambda = cv_ridge$lambda.min
+)
+
+# Coefficients
+coef(I1_ridge)
+```
+
+# ── Predictions on test set ───────────────────────────────────────────────────
+```{r}
+# GLM predictions
+test_strikes$pignite_glm <- predict(I1_glm,
+                                     newdata = test_strikes,
+                                     type    = "response")
+
+# Ridge predictions
+test_strikes$pignite_ridge <- as.numeric(
+  predict(I1_ridge,
+          newx = X_test,
+          type = "response")
+)
+```
+
+# ── Evaluation ────────────────────────────────────────────────────────────────
+```{r}
+# Create binary outcome for ROC: 1 if any fire occurred in gridcell-month
+test_strikes <- test_strikes |>
+  mutate(fire_binary = as.integer(fire_count > 0))
+
+# ROC AUC
+roc_glm   <- roc(test_strikes$fire_binary, test_strikes$pignite_glm,   quiet = TRUE)
+roc_ridge <- roc(test_strikes$fire_binary, test_strikes$pignite_ridge,  quiet = TRUE)
+
+cat("\nROC AUC — GLM:  ", round(auc(roc_glm),   4), "\n")
+cat("ROC AUC — Ridge:", round(auc(roc_ridge),  4), "\n")
+
+# Brier score (mean squared error of probability predictions)
+brier_glm   <- mean((test_strikes$pignite_glm   - test_strikes$fire_binary)^2)
+brier_ridge <- mean((test_strikes$pignite_ridge  - test_strikes$fire_binary)^2)
+
+cat("Brier score — GLM:  ", round(brier_glm,   4), "\n")
+cat("Brier score — Ridge:", round(brier_ridge,  4), "\n")
+
+# Calibration: plot predicted probability vs observed frequency
+# Bin predictions into deciles
+calibration_plot <- function(preds, obs, model_name) {
+  df_cal <- data.frame(pred = preds, obs = obs) |>
+    mutate(bin = ntile(pred, 10)) |>
+    group_by(bin) |>
+    summarise(mean_pred = mean(pred),
+              mean_obs  = mean(obs),
+              .groups   = "drop")
+
+  ggplot(df_cal, aes(x = mean_pred, y = mean_obs)) +
+    geom_abline(intercept = 0, slope = 1,
+                linetype = "dashed", color = "grey50") +
+    geom_point(size = 3) +
+    labs(title = paste("Calibration —", model_name),
+         x = "Mean predicted probability",
+         y = "Observed frequency") +
+    theme_bw()
+}
+
+calibration_plot(test_strikes$pignite_glm,   test_strikes$fire_binary, "GLM")
+calibration_plot(test_strikes$pignite_ridge,  test_strikes$fire_binary, "Ridge")
+
+# ── PR AUC ────────────────────────────────────────────────────────────────────
+
+pr_glm <- pr.curve(
+  scores.class0 = test_strikes$pignite_glm[test_strikes$fire_binary == 1],
+  scores.class1 = test_strikes$pignite_glm[test_strikes$fire_binary == 0],
+  curve         = TRUE
+)
+
+pr_ridge <- pr.curve(
+  scores.class0 = test_strikes$pignite_ridge[test_strikes$fire_binary == 1],
+  scores.class1 = test_strikes$pignite_ridge[test_strikes$fire_binary == 0],
+  curve         = TRUE
+)
+
+cat("PR AUC — GLM:  ", round(pr_glm$auc.integral,   4), "\n")
+cat("PR AUC — Ridge:", round(pr_ridge$auc.integral,  4), "\n")
+
+# Baseline PR AUC = event prevalence (no-skill classifier)
+baseline_pr <- mean(test_strikes$fire_binary)
+cat("Baseline PR AUC (event prevalence):", round(baseline_pr, 6), "\n")
+cat("Baseline:", mean(test_strikes$fire_binary), "\n")
+# ── Calibration slope and intercept ──────────────────────────────────────────
+# Following your published paper: logit(obs) ~ a + b * logit(pred)
+# Intercept (a): 0 = no bias, positive = underprediction, negative = overprediction
+# Slope (b):     1 = perfect, <1 = overconfident, >1 = underconfident
+
+calibration_stats <- function(preds, obs, model_name) {
+
+  # Clip predictions away from 0 and 1 to avoid infinite logits
+  preds_clipped <- pmin(pmax(preds, 1e-6), 1 - 1e-6)
+
+  logit_pred <- log(preds_clipped / (1 - preds_clipped))
+
+  cal_model <- glm(obs ~ logit_pred,
+                   family = binomial(link = "logit"))
+
+  intercept <- coef(cal_model)[1]
+  slope     <- coef(cal_model)[2]
+  ci        <- confint(cal_model)
+
+  cat(sprintf("\nCalibration — %s:\n", model_name))
+  cat(sprintf("  Intercept: %6.3f  (95%% CI: %6.3f, %6.3f)\n",
+              intercept, ci[1, 1], ci[1, 2]))
+  cat(sprintf("  Slope:     %6.3f  (95%% CI: %6.3f, %6.3f)\n",
+              slope, ci[2, 1], ci[2, 2]))
+
+  data.frame(
+    model     = model_name,
+    intercept = intercept,
+    int_low   = ci[1, 1],
+    int_high  = ci[1, 2],
+    slope     = slope,
+    slope_low = ci[2, 1],
+    slope_high= ci[2, 2]
+  )
+}
+
+cal_glm   <- calibration_stats(test_strikes$pignite_glm,
+                                test_strikes$fire_binary,
+                                "GLM")
+
+cal_ridge <- calibration_stats(test_strikes$pignite_ridge,
+                                test_strikes$fire_binary,
+                                "Ridge")
+
+cal_results <- bind_rows(cal_glm, cal_ridge)
+print(cal_results)
+
+# ── Summary table of all metrics ──────────────────────────────────────────────
+metrics_ignition <- data.frame(
+  model      = c("GLM", "Ridge"),
+  roc_auc    = c(round(auc(roc_glm),  4), round(auc(roc_ridge),  4)),
+  pr_auc     = c(round(pr_glm$auc.integral,  4), round(pr_ridge$auc.integral, 4)),
+  brier      = c(round(brier_glm,  4), round(brier_ridge,  4)),
+  int        = round(cal_results$intercept, 3),
+  int_low    = round(cal_results$int_low,   3),
+  int_high   = round(cal_results$int_high,  3),
+  slope      = round(cal_results$slope,     3),
+  slope_low  = round(cal_results$slope_low, 3),
+  slope_high = round(cal_results$slope_high,3)
+)
+
+print(metrics_ignition)
+
+```
+
+# ── Bayesian Binomial Logistic Regression ──────────────────────────────────────────────────────────
+
+```{r}
+# Use parallel chains and pre-compiled Stan model
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+# ── Build model matrices ───────────────────────────────────────────────────────
+predictors_ignition <- c("rh", "tair", "precip", "wind",
+                          "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                          "tair_1m", "tair_2m", "tair_3m", "tair_5y", "B")
+
+X_train_bayes <- as.matrix(train_strikes[, predictors_ignition])
+X_test_bayes  <- as.matrix(test_strikes[,  predictors_ignition])
+
+# ── Stan data list ─────────────────────────────────────────────────────────────
+stan_data <- list(
+  N         = nrow(train_strikes),
+  K         = length(predictors_ignition),
+  X         = X_train_bayes,
+  n_trials  = train_strikes$strike_count,
+  n_success = train_strikes$fire_count,
+  sigma_beta0 = 1.0,   # prior sd for intercept — matches published paper
+  sigma_beta  = 1.0    # prior sd for coefficients
+)
+```
+
+# ── Compile and fit ────────────────────────────────────────────────────────────
+```{r}
+cat("Compiling Stan model...\n")
+stan_model_compiled <- stan_model("/raid/cuden/Paleo_Lightning_Fire/Models/Ignition_Efficiency/binomial_logistic.stan")
+
+cat("Fitting Bayesian binomial logistic regression...\n")
+I1_bayes <- sampling(
+  object  = stan_model_compiled,
+  data    = stan_data,
+  chains  = 4,
+  iter    = 2000,      # 1000 warmup + 1000 sampling per chain = 4000 draws
+  warmup  = 1000,
+  seed    = 123,
+  control = list(adapt_delta = 0.95)  # increase if divergent transitions occur
+)
+```
+
+# ── Check convergence ──────────────────────────────────────────────────────────
+```{r}
+print(I1_bayes, pars = c("beta0", "beta"), probs = c(0.025, 0.5, 0.975))
+
+# R-hat values — all should be < 1.01
+rhat_vals <- summary(I1_bayes)$summary[, "Rhat"]
+cat("Max R-hat:", round(max(rhat_vals, na.rm = TRUE), 4), "\n")
+cat("Any R-hat > 1.01:", any(rhat_vals > 1.01, na.rm = TRUE), "\n")
+
+# Trace plots for coefficients
+traceplot(I1_bayes, pars = c("beta0", "beta"))
+```
+
+# ── Posterior predictions on test set ─────────────────────────────────────────
+```{r}
+# Extract posterior draws of coefficients
+posterior <- extract(I1_bayes)
+
+# Compute predicted probability for each test observation
+# using posterior mean of beta0 and beta
+beta0_mean <- mean(posterior$beta0)
+beta_mean  <- colMeans(posterior$beta)
+
+logit_pred_test <- beta0_mean + X_test_bayes %*% beta_mean
+test_strikes$pignite_bayes <- as.numeric(1 / (1 + exp(-logit_pred_test)))
+
+# Also compute posterior uncertainty (sd across draws)
+# This gives a credible interval width per gridcell-month
+n_draws <- length(posterior$beta0)
+pred_draws <- matrix(NA, nrow = nrow(test_strikes), ncol = n_draws)
+
+for (d in seq_len(n_draws)) {
+  eta <- posterior$beta0[d] + X_test_bayes %*% posterior$beta[d, ]
+  pred_draws[, d] <- 1 / (1 + exp(-eta))
+}
+
+test_strikes$pignite_bayes_sd  <- apply(pred_draws, 1, sd)
+test_strikes$pignite_bayes_low <- apply(pred_draws, 1, quantile, 0.025)
+test_strikes$pignite_bayes_high<- apply(pred_draws, 1, quantile, 0.975)
+
+cat("Posterior mean predictions summary:\n")
+print(summary(test_strikes$pignite_bayes))
+```
+
+# ── Evaluation metrics ─────────────────────────────────────────────────────────
+```{r}
+# ROC AUC
+roc_bayes <- roc(test_strikes$fire_binary,
+                  test_strikes$pignite_bayes,
+                  quiet = TRUE)
+cat("ROC AUC — Bayes:", round(auc(roc_bayes), 4), "\n")
+
+# PR AUC
+pr_bayes <- pr.curve(
+  scores.class0 = test_strikes$pignite_bayes[test_strikes$fire_binary == 1],
+  scores.class1 = test_strikes$pignite_bayes[test_strikes$fire_binary == 0],
+  curve         = TRUE
+)
+cat("PR AUC — Bayes:", round(pr_bayes$auc.integral, 4), "\n")
+
+# Brier score
+brier_bayes <- mean((test_strikes$pignite_bayes - test_strikes$fire_binary)^2)
+cat("Brier score — Bayes:", round(brier_bayes, 4), "\n")
+
+# Calibration slope and intercept
+cal_bayes <- calibration_stats(test_strikes$pignite_bayes,
+                                test_strikes$fire_binary,
+                                "Bayes")
+```
+
+# ── Add Bayes row to metrics_ignition ─────────────────────────────────────────
+```{r}
+metrics_ignition_updated <- bind_rows(
+  metrics_ignition,
+  data.frame(
+    model      = "Bayes",
+    roc_auc    = round(auc(roc_bayes),            4),
+    pr_auc     = round(pr_bayes$auc.integral,      4),
+    brier      = round(brier_bayes,                4),
+    int        = round(cal_bayes$intercept,        3),
+    int_low    = round(cal_bayes$int_low,          3),
+    int_high   = round(cal_bayes$int_high,         3),
+    slope      = round(cal_bayes$slope,            3),
+    slope_low  = round(cal_bayes$slope_low,        3),
+    slope_high = round(cal_bayes$slope_high,       3)
+  )
+)
+
+print(metrics_ignition_updated)
+
+# Save Stan model fit object for later use
+saveRDS(I1_bayes,
+        file.path(rds_root, "binomial_logisitc_regression_stanfit.rds"))
+
+# ── Coefficient plot ───────────────────────────────────────────────────────────
+# Extract posterior summaries for each coefficient
+coef_summary <- as.data.frame(
+  summary(I1_bayes,
+          pars  = "beta",
+          probs = c(0.025, 0.25, 0.75, 0.975))$summary
+)
+coef_summary$variable <- predictors_ignition
+
+ggplot(coef_summary,
+       aes(x = mean, y = reorder(variable, mean))) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = `2.5%`, xmax = `97.5%`),
+                 height = 0.2, alpha = 0.5) +
+  geom_errorbarh(aes(xmin = `25%`,  xmax = `75%`),
+                 height = 0, linewidth = 1.2) +
+  geom_point(size = 3, shape = 21, fill = "white") +
+  labs(title = "Posterior coefficients — Bayesian ignition model",
+       x     = "Coefficient (posterior mean ± 95% CI)",
+       y     = NULL) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+
+
+```
+
+Next, we'll try the Bayesian Logistic Regression:
+
+
+```{r}
+
+fit_bayes_logit_ridge <- function(data,
+                                  predictors,
+                                  response = "caused_fire",
+                                  train_frac = 0.8,
+                                  seed = 123,
+                                  iter = 2000,
+                                  chains = 4,
+                                  sigma_beta = 1,
+                                  sigma_alpha = 5,
+                                  compiled_model = NULL,
+                                  boot = TRUE,
+                                  n_boot = 1000) {
+  #-------------------------------
+  # 0. Stan model code (inline)
+  #-------------------------------
+  stan_code <- "
+  data {
+    int<lower=1> N;
+    int<lower=1> K;
+    matrix[N, K] X;
+    int<lower=0, upper=1> y[N];
+    real<lower=0> sigma_beta;
+    real<lower=0> sigma_alpha;
+  }
+  parameters {
+    real alpha;
+    vector[K] beta;
+  }
+  model {
+    alpha ~ normal(0, sigma_alpha);
+    beta  ~ normal(0, sigma_beta);
+    y ~ bernoulli_logit(alpha + X * beta);
+  }
+  generated quantities {
+    vector[N] log_lik;
+    for (n in 1:N) {
+      log_lik[n] = bernoulli_logit_lpmf(y[n] | alpha + X[n] * beta);
+    }
+  }"
+  
+  # ---- helper: PR-AUC (average precision style) ---------------------------
+  pr_auc_ap <- function(y_true, p_hat) {
+    o <- order(p_hat, decreasing = TRUE)
+    y <- y_true[o]
+    tp <- cumsum(y == 1)
+    fp <- cumsum(y == 0)
+    total_pos <- sum(y == 1)
+    if (total_pos == 0) return(NA_real_)
+    recall <- tp / total_pos
+    precision <- tp / (tp + fp)
+    recall_prev <- c(0, recall[-length(recall)])
+    sum((recall - recall_prev) * precision)
+  }
+  
+  # ---- helper: calibration intercept & slope ------------------------------
+  calibration_stats <- function(y_true, p_hat) {
+    eps <- 1e-6
+    p_clipped <- pmin(pmax(p_hat, eps), 1 - eps)
+    logit_p <- qlogis(p_clipped)
+    cal_fit <- glm(y_true ~ logit_p, family = binomial())
+    coefs <- coef(cal_fit)
+    list(
+      intercept = unname(coefs[1]),
+      slope     = unname(coefs["logit_p"])
+    )
+  }
+  
+  #-------------------------------
+  # 1. Train/test split
+  #-------------------------------
+  set.seed(seed)
+  n <- nrow(data)
+  train_size <- floor(train_frac * n)
+  train_index <- sample(seq_len(n), size = train_size)
+  
+  train <- data[train_index, , drop = FALSE]
+  test  <- data[-train_index, , drop = FALSE]
+  
+  #-------------------------------
+  # 2. Standardization (training-based)
+  #-------------------------------
+  scale_list <- lapply(train[, predictors, drop = FALSE],
+                       function(x) c(mean = mean(x), sd = sd(x)))
+  scale_values <- do.call(rbind, scale_list)
+  
+  standardize_df <- function(df) {
+    out <- df
+    for (p in predictors) {
+      m <- scale_values[p, "mean"]
+      s <- scale_values[p, "sd"]
+      out[[p]] <- (out[[p]] - m) / s
+    }
+    out
+  }
+  
+  train_std <- standardize_df(train)
+  test_std  <- standardize_df(test)
+  
+  #-------------------------------
+  # 3. Model matrices
+  #-------------------------------
+  formula_str <- paste(response, "~", paste(predictors, collapse = " + "))
+  formula_obj <- as.formula(formula_str)
+  
+  X_train <- model.matrix(formula_obj, data = train_std)[, -1, drop = FALSE]
+  y_train <- train_std[[response]]
+  
+  X_test  <- model.matrix(formula_obj, data = test_std)[, -1, drop = FALSE]
+  y_test  <- test_std[[response]]
+  
+  N <- nrow(X_train)
+  K <- ncol(X_train)
+  
+  stan_data <- list(
+    N = N,
+    K = K,
+    X = X_train,
+    y = y_train,
+    sigma_beta = sigma_beta,
+    sigma_alpha = sigma_alpha
+  )
+  
+  #-------------------------------
+  # 4. Compile Stan model (once per session)
+  #-------------------------------
+  if (is.null(compiled_model)) {
+    sm <- rstan::stan_model(model_code = stan_code)
+  } else {
+    sm <- compiled_model
+  }
+  
+  #-------------------------------
+  # 5. Sample from posterior
+  #-------------------------------
+  fit <- rstan::sampling(
+    sm,
+    data = stan_data,
+    iter = iter,
+    chains = chains,
+    seed = seed,
+    refresh = 0
+  )
+  
+  #-------------------------------
+  # 6. Posterior summaries (alpha, beta)
+  #-------------------------------
+  summ <- rstan::summary(fit, pars = c("alpha", "beta"))$summary
+  alpha_mean <- summ["alpha", "mean"]
+  beta_means <- summ[grep("^beta\\[", rownames(summ)), "mean"]
+  names(beta_means) <- colnames(X_train)
+  
+  #-------------------------------
+  # 7. Test-set predictions (using posterior means)
+  #-------------------------------
+  linpred_test <- as.vector(alpha_mean + X_test %*% beta_means)
+  prob_test <- plogis(linpred_test)
+  class_test <- ifelse(prob_test >= 0.5, 1L, 0L)
+  
+  #-------------------------------
+  # 8. Point-estimate performance metrics
+  #-------------------------------
+  roc_obj <- roc(response = y_test, predictor = prob_test)
+  auc_val <- as.numeric(auc(roc_obj))
+  
+  accuracy <- mean(class_test == y_test)
+  brier <- mean((prob_test - y_test)^2)
+  pr_auc_val <- pr_auc_ap(y_test, prob_test)
+  cal <- calibration_stats(y_test, prob_test)
+  
+  #-------------------------------
+  # 9. Bootstrap CIs (optional)
+  #-------------------------------
+  AUC_CI <- PR_AUC_CI <- ACC_CI <- Brier_CI <- 
+    calib_int_CI <- calib_slope_CI <- c(NA_real_, NA_real_)
+  
+  if (boot) {
+    n_test <- length(y_test)
+    AUC_boot   <- numeric(n_boot)
+    PR_boot    <- numeric(n_boot)
+    ACC_boot   <- numeric(n_boot)
+    Brier_boot <- numeric(n_boot)
+    INT_boot   <- numeric(n_boot)
+    SLOPE_boot <- numeric(n_boot)
+    
+    for (b in seq_len(n_boot)) {
+      idx <- sample.int(n_test, n_test, replace = TRUE)
+      y_b <- y_test[idx]
+      p_b <- prob_test[idx]
+      c_b <- ifelse(p_b >= 0.5, 1L, 0L)
+      
+      # AUC
+      if (length(unique(y_b)) == 2) {
+        AUC_boot[b] <- tryCatch(
+          as.numeric(auc(roc(response = y_b, predictor = p_b))),
+          error = function(e) NA_real_
+        )
+      } else {
+        AUC_boot[b] <- NA_real_
+      }
+      
+      # PR-AUC
+      PR_boot[b] <- pr_auc_ap(y_b, p_b)
+      
+      # Accuracy
+      ACC_boot[b] <- mean(c_b == y_b)
+      
+      # Brier
+      Brier_boot[b] <- mean((p_b - y_b)^2)
+      
+      # Calibration
+      cal_b <- tryCatch(
+        calibration_stats(y_b, p_b),
+        error = function(e) list(intercept = NA_real_, slope = NA_real_)
+      )
+      INT_boot[b]   <- cal_b$intercept
+      SLOPE_boot[b] <- cal_b$slope
+    }
+    
+    qfun <- function(x) quantile(x[is.finite(x) & !is.na(x)], probs = c(0.025, 0.975))
+    
+    if (any(is.finite(AUC_boot)))       AUC_CI         <- qfun(AUC_boot)
+    if (any(is.finite(PR_boot)))        PR_AUC_CI      <- qfun(PR_boot)
+    if (any(is.finite(ACC_boot)))       ACC_CI         <- qfun(ACC_boot)
+    if (any(is.finite(Brier_boot)))     Brier_CI       <- qfun(Brier_boot)
+    if (any(is.finite(INT_boot)))       calib_int_CI   <- qfun(INT_boot)
+    if (any(is.finite(SLOPE_boot)))     calib_slope_CI <- qfun(SLOPE_boot)
+  }
+  
+  #-------------------------------
+  # 10. Return everything
+  #-------------------------------
+  list(
+    call = match.call(),
+    formula = formula_obj,
+    predictors = predictors,
+    stan_fit = fit,
+    scale_values = scale_values,
+    posterior_summary = summ,
+    coef_means = list(
+      alpha = alpha_mean,
+      beta = beta_means
+    ),
+    predictions = data.frame(
+      row_id = rownames(test),
+      observed = y_test,
+      predicted_prob = prob_test,
+      predicted_class = class_test
+    ),
+    performance = list(
+      AUC = auc_val,
+      AUC_CI = AUC_CI,
+      PR_AUC = pr_auc_val,
+      PR_AUC_CI = PR_AUC_CI,
+      accuracy = accuracy,
+      accuracy_CI = ACC_CI,
+      Brier = brier,
+      Brier_CI = Brier_CI,
+      calib_intercept = cal$intercept,
+      calib_intercept_CI = calib_int_CI,
+      calib_slope = cal$slope,
+      calib_slope_CI = calib_slope_CI
+    ),
+    train_index = train_index,
+    compiled_model = sm
+  )
+}
+
+```
+
+Function to check if model is saved
+```{r}
+run_or_load_model <- function(path, fit_expr, verbose = TRUE) {
+  # path: where to save the fitted model (.rds)
+  # fit_expr: expression that returns the fitted object (e.g., your fit_bayes_logit_ridge call)
+  
+  if (file.exists(path)) {
+    if (verbose) message("Loading saved model from: ", path)
+    fit <- readRDS(path)
+  } else {
+    if (verbose) message("Fitting model (cache not found): ", path)
+    fit <- eval.parent(substitute(fit_expr))
+    
+    # Ensure directory exists
+    dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+    
+    if (verbose) message("Saving fitted model to: ", path)
+    saveRDS(fit, path)
+  }
+  
+  fit
+}
+```
+
+
+Fit model
+```{r}
+predictors_BLR.1  <- c("temperature", "precipitation", "wind", "relative_humidity")#, 
+                   #"FFMC", "DMC", "DC", 
+                   #"C", "B", "U")
+model_path <- file.path(rds_root, "logistic_regression.rds")
+
+BLR.1 <- run_or_load_model(
+  path = model_path,
+  fit_bayes_logit_ridge(
+  data       = df,              
+  predictors = predictors_m1.1,
+  response   = "caused_fire",
+  sigma_beta = 1,               # prior SD for coefficients (ridge strength)
+  sigma_alpha = 5,              # vague prior for intercept
+  iter       = 2000,
+  chains     = 4
+))
+
+```
+
+
+
+
+
+# ── Save predictions ──────────────────────────────────────────────────────────
+```{r}
+# write.csv(metrics_ignition,
+#           file.path(predictions_root, "ignition_model_metrics.csv"),
+#           row.names = FALSE)
+# # ── Save updated metrics and predictions ───────────────────────────────────────
+# write.csv(metrics_ignition_updated,
+#           file.path(predictions_root, "ignition_model_metrics.csv"),
+#           row.names = FALSE)
+# 
+# write.csv(test_strikes,
+#           file.path(predictions_root, "ignition_predictions.csv"),
+#           row.names = FALSE)
+```
+
+```{r}
+
+
+```

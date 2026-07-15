@@ -1,0 +1,167 @@
+---
+title: "Burned Area Random Forest"
+output: html_document
+---
+
+```{r}
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+```
+
+```{r}
+df <- read.csv(file.path(drivers_root, "lightning_fires_burned_area_jja_2002_2011.csv"))
+#df <- df[,2:29]
+head(df)
+
+#Filter for total burned areas associated with single lightning-caused ignition. This makes sure that we arent predicting burned area from multiple ignition sources. 
+df <- filter(df, single_lightning_ignition == 1 & total_ignition_count == 1)
+
+df <- df %>% mutate(
+  road_proximity_binary = if_else(dist_road >= 30, 0L, 1L),
+  urban_proximity_binary = if_else(dist_urban >= 40, 0L, 1L),
+  river_proximity_binary = if_else(dist_river >= 30, 0L, 1L)
+)
+```
+
+outcomes: burned_area_km2_total
+predictors: rh, tair, precip, wind, sd (snow depth), precip_1m, precip_2m, precip_3m, precip_5y, tair_1m, tair_2m, tair_3m, tair_5y, C, B, U
+
+----------------------------------------------
+Run random forest 
+----------------------------------------------
+
+```{r}
+
+# ── Define predictor set ───────────────────────────────────────────────────────
+# Adjust column names to match your actual df
+predictors <- c("precip", "tair", "wind", "rh",
+                "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                "tair_1m", "tair_2m", "tair_3m", "tair_5y",
+                "C", "B", "U", "sd", 
+                "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary")
+
+# ── Random forest 1: Lightning strike count (rstrike) ─────────────────────────
+df_burned_area <- df[, c("burned_area_km2_total", predictors)]
+df_burned_area <- na.omit(df_burned_area)
+
+# Correlation check on a sample
+df_sample <- df_burned_area %>% sample_frac(0.1)
+plot(df_sample)
+
+# Tune mtry
+mtry_burned_area <- tuneRF(
+  df_burned_area[, predictors],
+  df_burned_area$burned_area_km2_total,
+  ntreeTry   = 500,
+  stepFactor = 1.5,
+  improve    = 0.01,
+  trace      = TRUE,
+  plot       = TRUE
+)
+best_m_burned_area <- mtry_burned_area[mtry_burned_area[, 2] == min(mtry_burned_area[, 2]), 1]
+cat("Best mtry for burned area:", best_m_burned_area, "\n")
+
+# Fit final model
+rf_burned_area <- randomForest(
+  burned_area_km2_total ~ .,
+  data       = df_burned_area,
+  mtry       = best_m_burned_area,
+  ntree      = 500,
+  importance = TRUE
+)
+print(rf_burned_area)
+importance(rf_burned_area)
+varImpPlot(rf_burned_area, main = "Variable Importance — Burned Area")
+
+```
+
+
+```{r}
+rf_results <- importance(rf_burned_area)
+rf_results <- data.frame(Variable = rownames(rf_results),
+                     IncMSE = rf_results[, "%IncMSE"],
+                     IncNodePurity = rf_results[, "IncNodePurity"])
+# Export
+write.csv(rf_results, (file.path(table_root, "burned_area_random_forest.csv")), row.names = FALSE)
+```
+
+Summary of results:
+Strong preidctors:
+- Relative humidity dominates both metrics (%IncMSE=12.0, IncNodePurity=35.5)
+- Temperature an mean 2 month temperature are also both strong. 
+- Wind has high IncNodePurity (20.2) but moderate %IncMSE (4.4). The true value may be somewhere between these - keep. 
+- accumulative 1 month and 5 year precipitation, and 3 month mean temperature also show meaningful signal across both metrics
+
+Borderline Predictors:
+- accumulative 2 and 3 month precipitation - these should be first to drop if model cant handle co-correlation/is too complex (start with 3 month precip)
+- Broadleaf cover shows moderate %IncMSE (6.0) but low IncNodePurity (6.2), suggesting it captures some signal but isnt a domninant driver. keep since decisuous cover does make physical sense with regard to resistance to fire spread. Will it survive regularization in the Bayes model?
+
+Exclusion:
+- Conifer cover and snow depth show near-zero %IncMSE (0.44 and 0.41) and low IncNodeImpurity. 
+- For Conifer, this is surprising! coniver cover would be expected to matter for burned area given its role in fire spread and its spatial connection to fire occurance. Maybe this is because the training data makes up interior Alaska whre conifer cover doesnt vary much (consistantly high). 
+- Same goes for snow depth - the region that the training data makes up does not have much summer snow pack, which means that snow depth varies little and provides little signal. 
+- Openland is low but not negligible (%IncMSE=3.5). Given the colinearity between C, B and U (sum to 1), dropping one remove statistical redundancy, probably openland. 
+
+# Exclude from burned area model:
+# sd    — effectively zero in summer fire events
+# C     — near-zero importance, low variance in training data
+# U     — collinear with C and B (they sum to 1)
+# tair_1m — redundant with tair_2m
+# tair_3m — redundant with tair_2m
+
+Maybe exclude B too - it has slightly elevated %IncMSE, but near-zero correlation. With r2<0.002, and only 223 observations, the signal it provides may just be noise. 
+
+Also, vegetation cover is more important to ignition processes and rate of spread. Instead, climate inidces will get at fuel conditions (drying). Furthermore, at the 0.25 degree scale, the within-gridcell mix of conifer, broadleaf, and open land is too coarse to capture fine-scale fuel that controls fire spread. 
+
+Finally, with only 223 observations, its worth aggressively eliminating predictors to reduce parsimony. 
+
+```{r}
+ggplot(data=df, aes(x=lon, y=lat, color=C)) + geom_point()
+hist(df$C)
+ggplot(data=df, aes(x=lon, y=lat, color=U)) + geom_point()
+hist(df$U)
+ggplot(data=df, aes(x=lon, y=lat, color=sd)) + geom_point()
+hist(df$sd)
+
+ggplot(data=df, aes(x=U, y=burned_area_km2_total)) + geom_point() + ggtitle("Openland x burned area")
+ggplot(data=df, aes(x=C, y=burned_area_km2_total)) + geom_point() + ggtitle("Conifer x burned area")
+ggplot(data=df, aes(x=B, y=burned_area_km2_total)) + geom_point() + ggtitle("Broadleaf x burned area")
+```
+
+
+

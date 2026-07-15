@@ -1,0 +1,2429 @@
+---
+title: "Burned Area Model"
+author: "Charlotte Uden"
+date: "2026-06-08"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+
+rds_root <- file.path(rds_root, "Burned_Area")
+```
+
+```{r}
+df <- read.csv(file.path(drivers_root, "lightning_fires_burned_area_jja_2002_2011.csv"))
+#df <- df[,2:29]
+
+#Filter for total burned areas associated with single lightning-caused ignition. This makes sure that we arent predicting burned area from multiple ignition sources. 
+df <- filter(df, single_lightning_ignition == 1 & total_ignition_count == 1)
+
+df <- df %>% mutate(
+  road_proximity_binary = if_else(dist_road >= 30, 0, 1),
+  urban_proximity_binary = if_else(dist_urban >= 40, 0, 1),
+  river_proximity_binary = if_else(dist_river >= 30, 0, 1)
+)
+
+head(df)
+```
+
+Split into training and testing data
+```{r, echo=FALSE}
+## 80% of the sample size
+sample_size <- floor(0.8 * nrow(df))
+
+## set the seed to make partition reproducible
+set.seed(123)
+train_index <- sample(seq_len(nrow(df)), size = sample_size)
+
+train <- df[train_index, ]
+test <- df[-train_index, ]
+```
+
+```{r}
+# ── Save scaling parameters ───────────────────────────────────────────────────
+predictors_ignition <- c("rh", "tair", "precip", "wind",
+                          "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                          "tair_2m", "tair_5y", "B",
+                         "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary")
+
+mu_rh        <- mean(train$rh);        sigma_rh        <- sd(train$rh)
+mu_tair      <- mean(train$tair);      sigma_tair      <- sd(train$tair)
+mu_precip    <- mean(train$precip);    sigma_precip    <- sd(train$precip)
+mu_wind      <- mean(train$wind);      sigma_wind      <- sd(train$wind)
+mu_precip_1m <- mean(train$precip_1m); sigma_precip_1m <- sd(train$precip_1m)
+mu_precip_2m <- mean(train$precip_2m); sigma_precip_2m <- sd(train$precip_2m)
+mu_precip_3m <- mean(train$precip_3m); sigma_precip_3m <- sd(train$precip_3m)
+mu_precip_5y <- mean(train$precip_5y); sigma_precip_5y <- sd(train$precip_5y)
+mu_tair_2m   <- mean(train$tair_2m);   sigma_tair_2m   <- sd(train$tair_2m)
+mu_tair_5y   <- mean(train$tair_5y);   sigma_tair_5y   <- sd(train$tair_5y)
+mu_B         <- mean(train$B);         sigma_B         <- sd(train$B)
+#mu_road_proximity_binary <- mean(train$road_proximity_binary); sigma_road_proximity_binary  <- sd(train$road_proximity_binary)
+#mu_urban_proximity_binary <- mean(train$urban_proximity_binary); sigma_urban_proximity_binary <- sd(train$urban_proximity_binary)
+#mu_river_proximity_binary <- mean(train$river_proximity_binary); sigma_river_proximity_binary <- sd(train$river_proximity_binary)
+
+
+# Store and save
+mean_sd_ignition <- data.frame(
+  var   = predictors_ignition,
+  mu    = c(mu_rh, mu_tair, mu_precip, mu_wind,
+            mu_precip_1m, mu_precip_2m, mu_precip_3m, mu_precip_5y,
+            mu_tair_2m, mu_tair_5y, mu_B, NA, NA, NA),
+            #mu_road_proximity_binary, mu_urban_proximity_binary, mu_river_proximity_binary),
+  sigma = c(sigma_rh, sigma_tair, sigma_precip, sigma_wind,
+            sigma_precip_1m, sigma_precip_2m, sigma_precip_3m, sigma_precip_5y,
+            sigma_tair_2m, sigma_tair_5y, sigma_B, NA, NA, NA))
+            #sigma_road_proximity_binary, sigma_urban_proximity_binary, sigma_river_proximity_binary)
+
+
+write.csv(mean_sd_ignition,
+          file.path(mu_sigma_root, "mu_sigma_burned_area_predictors.csv"),
+          row.names = FALSE)
+
+# ── Standardize train ─────────────────────────────────────────────────────────
+train <- train %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B
+    #road_proximity_binary         = (road_proximity_binary         - mu_road_proximity_binary)         / sigma_road_proximity_binary,
+    #urban_proximity_binary         = (urban_proximity_binary         - mu_urban_proximity_binary)         / sigma_urban_proximity_binary,
+    #river_proximity_binary         = (river_proximity_binary         - mu_river_proximity_binary)         / sigma_river_proximity_binary
+  )
+
+train <- train[, c("lat", "lon", "year", "month",
+                   "burned_area_km2_total",
+                   "rh", "tair", "precip", "wind",
+                   "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                   "tair_2m", "tair_5y", "B",
+                   "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary")]
+
+# ── Standardize test ──────────────────────────────────────────────────────────
+# Use training means and sds 
+test <- test %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B)
+    #road_proximity_binary         = (road_proximity_binary         - mu_road_proximity_binary)         / sigma_road_proximity_binary,
+    #urban_proximity_binary         = (urban_proximity_binary         - mu_urban_proximity_binary)         / sigma_urban_proximity_binary,
+    #river_proximity_binary         = (river_proximity_binary         - mu_river_proximity_binary)         / sigma_river_proximity_binary,
+    #burned_area_km2_lag1         = (burned_area_km2_lag1         - mu_burned_area_km2_lag1)         / sigma_river_proximity_binary
+
+
+test <- test[, c("lat", "lon", "year", "month",
+                 "burned_area_km2_total",
+                 "rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y", "B",
+                 "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary")]
+
+head(train)
+
+```
+
+Take a look at outcome distribution
+```{r}
+par(mfrow = c(1, 3))
+hist(train$burned_area_km2_total,
+     main = "Train Burned area (raw)", xlab = "km²")
+hist(log(train$burned_area_km2_total),
+     main = "Train Burned area (log)", xlab = "log(km²)")
+hist(sqrt(train$burned_area_km2_total),
+     main = "Train Burned area (sqrt)", xlab = "sqrt(km²)")
+
+summary(train$burned_area_km2_total)
+
+par(mfrow = c(1, 3))
+hist(df$burned_area_km2_total,
+     main = "Burned area (raw)", xlab = "km²")
+hist(log(df$burned_area_km2_total),
+     main = "Burned area (log)", xlab = "log(km²)")
+hist(sqrt(df$burned_area_km2_total),
+     main = "Burned area (sqrt)", xlab = "sqrt(km²)")
+
+summary(df$burned_area_km2_total)
+
+```
+Define predictors. 
+The Random Forest identified tair_m1 and tair_m3 as having low imortance. 
+```{r}
+# ── Predictor sets ────────────────────────────────────────────────────────────
+preds_m1 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y", "B")
+```
+
+# ---- Check for colinearity between predictors --- 
+
+Condition number (kappa(X)) is a diagnostic metric that assesses the severity of multicollinearity across the entire set of predictors. It measures how unstable or sensitive your model's coefficient estimates are to tiny changes in the data.
+
+1 to 10 (Low Collinearity): The predictors are nearly orthogonal (independent). The model is numerically stable, and coefficients are reliable.
+10 to 30 (Moderate Collinearity): Interdependence is present. The variance of your coefficients is inflating, but it may not destroy the model's predictive power.
+Greater than 30 (Severe Collinearity): Strong linear dependencies exist. Minor tweaks to your data will cause massive, erratic swings in your coefficient signs and values
+
+```{r}
+X <- model.matrix(as.formula(paste("~", paste(preds_m1, collapse = " + "))),
+                  data = train)
+kappa(X)   # values > 1e6 (1,000,000) indicate severe collinearity
+cor(train[, preds_m1])  # look for correlations > 0.9
+```
+
+precip_2m and precip_3m: r = 0.936 — this is the problematic correlation. These two variables are carrying nearly identical information, which will destabilize the GLM fitting algorithm.
+
+Remove precip_2m (between precip_1m and precip_3m):
+```{r}
+preds_m1 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y", "B")
+
+# Verify correlation is resolved
+cor(train[, preds_m1])[c("precip_1m","precip_3m"), 
+                        c("precip_1m","precip_3m")]
+
+```
+Interpretation: precip_1m captures very recent fuel moisture (FFMC/DMC analogue) and precip_3m captures the longer-term moisture deficit (DC analogue). The middle lag is redundant given those two endpoints are included.
+
+
+
+########################
+# ----- Fit models ----#
+########################
+1. Log-normal OLS (baseline) - simplest approach. take log of the outcome and fit a simple linear model
+2. Gamma GLM with log link - positive right skewed data. multiplicative affect, ie. 1 unit increase in rh multiplies expected burned area by exp(beta)
+3. Bayesian log-normal regression (Stan) - With 178 observations and 11 predictors, the Normal(0,1) priors on standardised coefficients act as ridge regularisation, preventing overfitting
+4. Bayesian Gamma regression (Stan) - similar to log normal model (1) but the Gamma likelihood is more appropriate if the variance scales with the mean
+
+
+```{r}
+##############################################################################
+#
+# Unified function for fitting burned area models.
+# Follows the same structure as ignition_model_functions.R.
+#
+# Methods:
+#   "lognormal_ols"   : OLS on log-transformed outcome (baseline)
+#   "gamma_glm"       : Gamma GLM with log link
+#   "bayes_lognormal" : Bayesian log-normal regression (RStan)
+#   "bayes_gamma"     : Bayesian Gamma regression (RStan)
+#
+# Train/test split performed OUTSIDE this function.
+# Pass pre-standardised train and test sets.
+# Outcome variable: burned_area_km2_total (must be > 0 for all rows)
+##############################################################################
+
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+# ── Shared helper functions ───────────────────────────────────────────────────
+
+compute_burned_metrics <- function(y_true, y_pred,
+                                    n_boot = 1000, seed = 123) {
+  # Performance metrics for a continuous positive outcome
+  # y_true / y_pred: burned area in km² (original scale, not log)
+
+  rmse_val  <- sqrt(mean((y_pred - y_true)^2))
+  nrmse_val <- rmse_val / mean(y_true)
+  cor_val   <- cor(y_pred,  y_true)
+  spear_val <- cor(y_pred,  y_true, method = "spearman")
+  r2_val    <- 1 - sum((y_true - y_pred)^2) /
+                   sum((y_true - mean(y_true))^2)
+  mae_val   <- mean(abs(y_pred - y_true))
+
+  # Also compute on log scale (more stable for skewed data)
+  log_cor_val   <- cor(log(y_pred + 1), log(y_true + 1))
+  log_rmse_val  <- sqrt(mean((log(y_pred + 1) - log(y_true + 1))^2))
+
+  # Bootstrap CIs
+  set.seed(seed)
+  n        <- length(y_true)
+  boot_mat <- matrix(
+    NA_real_, nrow = n_boot, ncol = 7,
+    dimnames = list(NULL, c("nrmse","cor","spear","r2","mae",
+                             "log_cor","log_rmse"))
+  )
+
+  for (b in seq_len(n_boot)) {
+    idx  <- sample.int(n, n, replace = TRUE)
+    y_t  <- y_true[idx]
+    y_p  <- y_pred[idx]
+    boot_mat[b, "nrmse"]    <- sqrt(mean((y_p - y_t)^2)) / mean(y_t)
+    boot_mat[b, "cor"]      <- tryCatch(cor(y_p, y_t),
+                                         error = function(e) NA_real_)
+    boot_mat[b, "spear"]    <- tryCatch(cor(y_p, y_t, method = "spearman"),
+                                         error = function(e) NA_real_)
+    boot_mat[b, "r2"]       <- 1 - sum((y_t - y_p)^2) /
+                                    sum((y_t - mean(y_t))^2)
+    boot_mat[b, "mae"]      <- mean(abs(y_p - y_t))
+    boot_mat[b, "log_cor"]  <- tryCatch(
+      cor(log(y_p + 1), log(y_t + 1)), error = function(e) NA_real_)
+    boot_mat[b, "log_rmse"] <- sqrt(mean((log(y_p + 1) - log(y_t + 1))^2))
+  }
+
+  qfun <- function(x) quantile(x[is.finite(x)], probs = c(0.025, 0.975),
+                                na.rm = TRUE)
+
+  list(
+    nrmse    = nrmse_val,  nrmse_ci   = qfun(boot_mat[, "nrmse"]),
+    cor      = cor_val,    cor_ci     = qfun(boot_mat[, "cor"]),
+    spearman = spear_val,  spear_ci   = qfun(boot_mat[, "spear"]),
+    r2       = r2_val,     r2_ci      = qfun(boot_mat[, "r2"]),
+    mae      = mae_val,    mae_ci     = qfun(boot_mat[, "mae"]),
+    log_cor  = log_cor_val,log_cor_ci = qfun(boot_mat[, "log_cor"]),
+    log_rmse = log_rmse_val,log_rmse_ci = qfun(boot_mat[, "log_rmse"])
+  )
+}
+
+run_or_load_model <- function(path, fit_expr, verbose = TRUE) {
+  if (file.exists(path)) {
+    if (verbose) message("Loading saved model from: ", path)
+    readRDS(path)
+  } else {
+    if (verbose) message("Fitting model (cache not found): ", path)
+    fit <- eval.parent(substitute(fit_expr))
+    dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+    if (verbose) message("Saving model to: ", path)
+    saveRDS(fit, path)
+    fit
+  }
+}
+
+# ── Stan model code ───────────────────────────────────────────────────────────
+
+# Log-normal: log(y) ~ Normal(alpha + X*beta, sigma)
+# Equivalent to y ~ LogNormal(alpha + X*beta, sigma)
+.stan_lognormal <- "
+data {
+  int<lower=1> N;
+  int<lower=1> K;
+  matrix[N, K] X;
+  vector<lower=0>[N] y;
+  real<lower=0> sigma_beta;
+  real<lower=0> sigma_alpha;
+}
+parameters {
+  real alpha;
+  vector[K] beta;
+  real<lower=0> sigma;
+}
+model {
+  alpha ~ normal(0, sigma_alpha);
+  beta  ~ normal(0, sigma_beta);
+  sigma ~ exponential(1);
+  log(y) ~ normal(alpha + X * beta, sigma);
+}
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_pred;
+  for (n in 1:N) {
+    real mu_n   = alpha + dot_product(X[n], beta);
+    log_lik[n]  = normal_lpdf(log(y[n]) | mu_n, sigma);
+    // Back-transform with log-normal bias correction
+    // E[Y] = exp(mu + sigma^2/2)
+    y_pred[n]   = exp(mu_n + 0.5 * sigma^2);
+  }
+}"
+
+# Gamma GLM: y ~ Gamma(shape, rate)
+# log(E[y]) = alpha + X*beta
+# Parameterised via mean mu and shape phi
+.stan_gamma <- "
+data {
+  int<lower=1> N;
+  int<lower=1> K;
+  matrix[N, K] X;
+  vector<lower=0>[N] y;
+  real<lower=0> sigma_beta;
+  real<lower=0> sigma_alpha;
+}
+parameters {
+  real alpha;
+  vector[K] beta;
+  real<lower=0> phi;   // shape / concentration parameter
+}
+model {
+  alpha ~ normal(0, sigma_alpha);
+  beta  ~ normal(0, sigma_beta);
+  phi   ~ exponential(0.1);   // weakly informative — allows large shapes
+  for (n in 1:N) {
+    real mu_n = exp(alpha + dot_product(X[n], beta));
+    y[n] ~ gamma(phi, phi / mu_n);
+  }
+}
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_pred;
+  for (n in 1:N) {
+    real mu_n  = exp(alpha + dot_product(X[n], beta));
+    log_lik[n] = gamma_lpdf(y[n] | phi, phi / mu_n);
+    y_pred[n]  = mu_n;   // posterior mean prediction
+  }
+}"
+
+# ── Main function ─────────────────────────────────────────────────────────────
+
+fit_burned_area_model <- function(train,
+                                   test,
+                                   predictors,
+                                   outcome         = "burned_area_km2_total",
+                                   method          = c("lognormal_ols",
+                                                       "gamma_glm",
+                                                       "bayes_lognormal",
+                                                       "bayes_gamma"),
+                                   sigma_beta      = 1,
+                                   sigma_alpha     = 5,
+                                   iter            = 2000,
+                                   chains          = 4,
+                                   seed            = 123,
+                                   n_boot          = 1000,
+                                   compiled_model  = NULL) {
+  # ── Args ──────────────────────────────────────────────────────────────────
+  # train / test   : pre-standardised data; must contain outcome and predictors
+  # predictors     : character vector of predictor column names
+  # outcome        : name of outcome column (default "burned_area_km2_total")
+  # method         : one of "lognormal_ols", "gamma_glm",
+  #                          "bayes_lognormal", "bayes_gamma"
+  # sigma_beta     : prior SD for regression coefficients (Bayesian only)
+  # sigma_alpha    : prior SD for intercept (Bayesian only)
+  # iter / chains  : Stan sampling settings (Bayesian only)
+  # seed           : random seed
+  # n_boot         : bootstrap resamples for confidence intervals
+  # compiled_model : pre-compiled Stan model (Bayesian only)
+
+  method <- match.arg(method)
+
+  # Validate outcome is positive (required for Gamma and log-normal)
+  if (any(train[[outcome]] <= 0)) {
+    stop(sprintf(
+      "All values of '%s' must be > 0. Found %d non-positive values.",
+      outcome, sum(train[[outcome]] <= 0)
+    ))
+  }
+
+  cat(sprintf("[%s] Training rows : %d\n", method, nrow(train)))
+  cat(sprintf("[%s] Test rows     : %d\n", method, nrow(test)))
+  cat(sprintf("[%s] Outcome range : %.2f – %.2f km²\n",
+              method, min(train[[outcome]]), max(train[[outcome]])))
+
+  y_train <- train[[outcome]]
+  y_test  <- test[[outcome]]
+
+  # ── Formula objects ───────────────────────────────────────────────────────
+  formula_obj <- as.formula(
+    paste(outcome, "~", paste(predictors, collapse = " + "))
+  )
+  formula_matrix <- as.formula(
+    paste("~", paste(predictors, collapse = " + "), "- 1")
+  )
+
+  # Initialise
+  fit        <- NULL
+  coef_table <- NULL
+  p_hat      <- NULL    # predictions on original km² scale
+  extra      <- list()
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 1. Log-normal OLS
+  # ══════════════════════════════════════════════════════════════════════════
+
+  if (method == "lognormal_ols") {
+
+    cat("[lognormal_ols] Fitting OLS on log(burned_area)...\n")
+
+    train_log        <- train
+    train_log$log_y  <- log(train[[outcome]])
+    test_log         <- test
+    test_log$log_y   <- log(test[[outcome]])
+
+    formula_log <- as.formula(
+      paste("log_y ~", paste(predictors, collapse = " + "))
+    )
+
+    fit <- lm(formula_log, data = train_log)
+
+    coef_table           <- as.data.frame(summary(fit)$coefficients)
+    coef_table$variable  <- rownames(coef_table)
+    rownames(coef_table) <- NULL
+
+    # Back-transform with log-normal bias correction: E[Y] = exp(mu + sigma²/2)
+    sigma_hat <- summary(fit)$sigma
+    log_pred  <- predict(fit, newdata = test_log)
+    p_hat     <- exp(log_pred + 0.5 * sigma_hat^2)
+
+    extra$sigma_hat   <- sigma_hat
+    extra$log_pred    <- log_pred
+    extra$aic         <- AIC(fit)
+    cat(sprintf("[lognormal_ols] Sigma (log scale): %.4f | AIC: %.2f\n",
+                sigma_hat, AIC(fit)))
+  }
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2. Gamma GLM with log link
+  # ══════════════════════════════════════════════════════════════════════════
+
+  if (method == "gamma_glm") {
+
+    cat("[gamma_glm] Fitting Gamma GLM with log link...\n")
+
+    fit <- glm(formula_obj,
+               data   = train,
+               family = Gamma(link = "log"))
+
+    coef_table           <- as.data.frame(summary(fit)$coefficients)
+    coef_table$variable  <- rownames(coef_table)
+    rownames(coef_table) <- NULL
+
+    p_hat      <- predict(fit, newdata = test, type = "response")
+    extra$aic  <- AIC(fit)
+
+    # Dispersion estimate
+    extra$dispersion <- summary(fit)$dispersion
+    cat(sprintf("[gamma_glm] Dispersion: %.4f | AIC: %.2f\n",
+                extra$dispersion, AIC(fit)))
+  }
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 3 & 4. Bayesian models (log-normal or Gamma)
+  # ══════════════════════════════════════════════════════════════════════════
+
+  if (method %in% c("bayes_lognormal", "bayes_gamma")) {
+
+    stan_code <- if (method == "bayes_lognormal") {
+      .stan_lognormal
+    } else {
+      .stan_gamma
+    }
+
+    X_train <- model.matrix(formula_matrix, data = train)
+    X_test  <- model.matrix(formula_matrix, data = test)
+
+    stan_data <- list(
+      N           = nrow(train),
+      K           = ncol(X_train),
+      X           = X_train,
+      y           = y_train,
+      sigma_beta  = sigma_beta,
+      sigma_alpha = sigma_alpha
+    )
+
+    # Compile (once per session)
+    if (is.null(compiled_model)) {
+      cat(sprintf("[%s] Compiling Stan model...\n", method))
+      compiled_model <- compiled_model <- stan_model(
+        model_code = stan_code,
+        model_name = paste0("burned_area_", method, "_",
+                            digest::digest(predictors)))
+    }
+
+    cat(sprintf("[%s] Sampling (%d chains × %d iter)...\n",
+                method, chains, iter))
+    fit <- sampling(
+      compiled_model,
+      data    = stan_data,
+      iter    = iter,
+      chains  = chains,
+      seed    = seed,
+      control = list(adapt_delta = 0.95),
+      refresh = 200
+    )
+
+    # Convergence check
+    rhat_vals <- summary(fit)$summary[, "Rhat"]
+    max_rhat  <- max(rhat_vals, na.rm = TRUE)
+    cat(sprintf("[%s] Max R-hat: %.4f %s\n",
+                method, max_rhat,
+                ifelse(max_rhat > 1.01, "⚠ CONVERGENCE WARNING", "✓")))
+
+    # LOO-CV
+    loo_result <- tryCatch(
+      loo(fit, pars = "log_lik"),
+      error = function(e) {
+        message("LOO-CV failed: ", e$message)
+        NULL
+      }
+    )
+    extra$loo        <- loo_result
+    extra$max_rhat   <- max_rhat
+    extra$compiled_model <- compiled_model
+
+    # Posterior summaries
+    pars_to_summarise <- if (method == "bayes_lognormal") {
+      c("alpha", "beta", "sigma")
+    } else {
+      c("alpha", "beta", "phi")
+    }
+
+    summ <- summary(fit, pars = pars_to_summarise,
+                     probs = c(0.025, 0.25, 0.5, 0.75, 0.975))$summary
+
+    alpha_mean <- summ["alpha", "mean"]
+    beta_rows  <- grep("^beta\\[", rownames(summ))
+    beta_means <- summ[beta_rows, "mean"]
+    names(beta_means) <- colnames(X_train)
+
+    coef_table           <- as.data.frame(summ)
+    coef_table$variable  <- rownames(summ)
+    rownames(coef_table) <- NULL
+
+    extra$coef_means <- list(alpha = alpha_mean, beta = beta_means)
+
+    # Posterior predictions on test set (posterior mean of y_pred draws)
+    post   <- rstan::extract(fit)
+
+    # Generate predictions for test set from posterior draws
+    n_draws    <- length(post$alpha)
+    pred_draws <- matrix(NA_real_, nrow = nrow(test), ncol = n_draws)
+
+    for (d in seq_len(n_draws)) {
+      mu_d <- post$alpha[d] + X_test %*% post$beta[d, ]
+      if (method == "bayes_lognormal") {
+        sigma_d       <- post$sigma[d]
+        pred_draws[, d] <- exp(mu_d + 0.5 * sigma_d^2)
+      } else {
+        pred_draws[, d] <- exp(mu_d)   # Gamma mean = exp(linear predictor)
+      }
+    }
+
+    p_hat  <- rowMeans(pred_draws)   # posterior mean prediction
+    p_sd   <- apply(pred_draws, 1, sd)
+    p_low  <- apply(pred_draws, 1, quantile, 0.025)
+    p_high <- apply(pred_draws, 1, quantile, 0.975)
+
+    extra$pred_sd   <- p_sd
+    extra$pred_low  <- p_low
+    extra$pred_high <- p_high
+  }
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Shared: metrics and output
+  # ══════════════════════════════════════════════════════════════════════════
+
+  metrics <- compute_burned_metrics(y_test, p_hat,
+                                     n_boot = n_boot, seed = seed)
+
+  cat(sprintf("[%s] nRMSE    : %.4f (%.4f, %.4f)\n",
+              method, metrics$nrmse,   metrics$nrmse_ci[1],   metrics$nrmse_ci[2]))
+  cat(sprintf("[%s] Pearson r: %.4f (%.4f, %.4f)\n",
+              method, metrics$cor,     metrics$cor_ci[1],     metrics$cor_ci[2]))
+  cat(sprintf("[%s] Spearman : %.4f (%.4f, %.4f)\n",
+              method, metrics$spearman,metrics$spear_ci[1],   metrics$spear_ci[2]))
+  cat(sprintf("[%s] R²       : %.4f (%.4f, %.4f)\n",
+              method, metrics$r2,      metrics$r2_ci[1],      metrics$r2_ci[2]))
+  cat(sprintf("[%s] MAE (km²): %.2f  (%.2f, %.2f)\n",
+              method, metrics$mae,     metrics$mae_ci[1],     metrics$mae_ci[2]))
+  cat(sprintf("[%s] Log corr : %.4f (%.4f, %.4f)\n",
+              method, metrics$log_cor, metrics$log_cor_ci[1], metrics$log_cor_ci[2]))
+
+  # Prediction data frame
+  pred_df <- data.frame(
+    lat                   = test$lat,
+    lon                   = test$lon,
+    year                  = test$year,
+    month                 = test$month,
+    burned_area_km2_total = y_test,
+    burned_area_pred      = p_hat,
+    residual              = y_test - p_hat,
+    log_residual          = log(y_test + 1) - log(p_hat + 1)
+  )
+
+  # Add posterior uncertainty columns for Bayesian models
+  if (!is.null(extra$pred_sd)) {
+    pred_df$pred_sd   <- extra$pred_sd
+    pred_df$pred_low  <- extra$pred_low
+    pred_df$pred_high <- extra$pred_high
+  }
+
+  c(
+    list(
+      method      = method,
+      predictors  = predictors,
+      outcome     = outcome,
+      fit         = fit,
+      coef_table  = coef_table,
+      predictions = pred_df,
+      metrics     = metrics
+    ),
+    extra   # appends aic, dispersion, loo, max_rhat, compiled_model, etc.
+  )
+}
+
+# ── Convenience: compare metrics across fitted models ─────────────────────────
+
+compare_burned_models <- function(model_list) {
+  do.call(rbind, lapply(model_list, function(m) {
+    mt <- m$metrics
+    data.frame(
+      method       = m$method,
+      predictors   = paste(m$predictors, collapse = ", "),
+      nrmse        = mt$nrmse,
+      nrmse_low    = mt$nrmse_ci[1],
+      nrmse_high   = mt$nrmse_ci[2],
+      cor          = mt$cor,
+      cor_low      = mt$cor_ci[1],
+      cor_high     = mt$cor_ci[2],
+      spearman     = mt$spearman,
+      spear_low    = mt$spear_ci[1],
+      spear_high   = mt$spear_ci[2],
+      r2           = mt$r2,
+      r2_low       = mt$r2_ci[1],
+      r2_high      = mt$r2_ci[2],
+      mae          = mt$mae,
+      mae_low      = mt$mae_ci[1],
+      mae_high     = mt$mae_ci[2],
+      log_cor      = mt$log_cor,
+      log_cor_low  = mt$log_cor_ci[1],
+      log_cor_high = mt$log_cor_ci[2],
+      row.names    = NULL
+    )
+  }))
+}
+
+##############################################################################
+# Example usage
+##############################################################################
+
+# ── Predictor sets ────────────────────────────────────────────────────────────
+# preds_BA1 <- c("rh", "tair", "precip", "wind",
+#                "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+#                "tair_2m", "tair_5y", "B")
+#
+# preds_BA2 <- c("rh", "tair", "precip", "wind",
+#                "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+#                "tair_2m", "tair_5y")   # drop B
+
+# ── Fit all methods ───────────────────────────────────────────────────────────
+#
+# BA1_lm <- run_or_load_model(
+#   file.path(rds_root, "BA1_lognormal_ols.rds"),
+#   fit_burned_area_model(train, test, preds_BA1, method = "lognormal_ols"))
+#
+# BA1_gamma <- run_or_load_model(
+#   file.path(rds_root, "BA1_gamma_glm.rds"),
+#   fit_burned_area_model(train, test, preds_BA1, method = "gamma_glm"))
+#
+# BA1_bayes_ln <- run_or_load_model(
+#   file.path(rds_root, "BA1_bayes_lognormal.rds"),
+#   fit_burned_area_model(train, test, preds_BA1, method = "bayes_lognormal",
+#                          sigma_beta = 1, sigma_alpha = 5))
+#
+# BA1_bayes_g <- run_or_load_model(
+#   file.path(rds_root, "BA1_bayes_gamma.rds"),
+#   fit_burned_area_model(train, test, preds_BA1, method = "bayes_gamma",
+#                          sigma_beta  = 1,
+#                          sigma_alpha = 5,
+#                          compiled_model = BA1_bayes_ln$compiled_model))
+#
+# ── Compare ───────────────────────────────────────────────────────────────────
+#
+# metrics_BA <- compare_burned_models(
+#   list(BA1_lm, BA1_gamma, BA1_bayes_ln, BA1_bayes_g)
+# )
+# rownames(metrics_BA) <- NULL
+# print(metrics_BA)
+#
+# write.csv(metrics_BA,
+#           file.path(predictions_root, "burned_area_model_comparison.csv"),
+#           row.names = FALSE)
+#
+# ── LOO-CV comparison for Bayesian models ─────────────────────────────────────
+#
+# loo_compare(BA1_bayes_ln$loo, BA1_bayes_g$loo)
+```
+
+
+Fit!
+
+```{r}
+# ── Predictor sets ────────────────────────────────────────────────────────────
+preds_m1 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y", "B")
+
+
+preds_m2 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y")   # drop B - was low in importance (random)
+
+# ── Fit all methods ───────────────────────────────────────────────────────────
+
+m1_lm <- run_or_load_model(
+  file.path(rds_root, "m1_lognormal_ols.rds"),
+  fit_burned_area_model(train, test, preds_m1, method = "lognormal_ols"))
+
+# m1_gamma <- run_or_load_model(
+#   file.path(rds_root, "m1_gamma_glm.rds"),
+#   fit_burned_area_model(train, test, preds_m1, method = "gamma_glm"))
+
+m1_bayes_ln <- run_or_load_model(
+  file.path(rds_root, "m1_bayes_lognormal.rds"),
+  fit_burned_area_model(train, test, preds_m1, method = "bayes_lognormal",
+                         sigma_beta = 1, sigma_alpha = 5,
+                         chains      = 2))
+
+m1_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m1_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m1, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2))
+
+m2_lm <- run_or_load_model(
+  file.path(rds_root, "m2_lognormal_ols.rds"),
+  fit_burned_area_model(train, test, preds_m2, method = "lognormal_ols"))
+
+m2_gamma <- run_or_load_model(
+  file.path(rds_root, "m2_gamma_glm.rds"),
+  fit_burned_area_model(train, test, preds_m2, method = "gamma_glm"))
+
+m2_bayes_ln <- run_or_load_model(
+  file.path(rds_root, "m2_bayes_lognormal.rds"),
+  fit_burned_area_model(train, test, preds_m2, method = "bayes_lognormal",
+                         sigma_beta = 1, sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_ln$compiled_model))
+
+m2_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m2_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m2, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+```
+
+
+Try adding distance to settlement. Calef et al. used distance to settlement and found effects up to 40km. Make the predictor binary: 0=farther than 40km from settlment, 1=within 40 km of a settlement. 
+
+```{r}
+preds_m3 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y", "B",
+              "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary")
+
+m3_lm <- run_or_load_model(
+  file.path(rds_root, "m3_lognormal_ols.rds"),
+  fit_burned_area_model(train, test, preds_m3, method = "lognormal_ols"))
+
+# m3_gamma <- run_or_load_model(
+#   file.path(rds_root, "m3_gamma_glm.rds"),
+#   fit_burned_area_model(train, test, preds_m3, method = "gamma_glm"))
+
+m3_bayes_ln <- run_or_load_model(
+  file.path(rds_root, "m3_bayes_lognormal.rds"),
+  fit_burned_area_model(train, test, preds_m3, method = "bayes_lognormal",
+                         sigma_beta = 1, sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_ln$compiled_model))
+
+m3_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m3_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m3, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+#Random Forest identified road proximity as most important - remove urban and river
+preds_m4 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y", "B",
+              "road_proximity_binary")
+
+m4_lm <- run_or_load_model(
+  file.path(rds_root, "m4_lognormal_ols.rds"),
+  fit_burned_area_model(train, test, preds_m4, method = "lognormal_ols"))
+
+# m4_gamma <- run_or_load_model(
+#   file.path(rds_root, "m4_gamma_glm.rds"),
+#   fit_burned_area_model(train, test, preds_m4, method = "gamma_glm"))
+
+m4_bayes_ln <- run_or_load_model(
+  file.path(rds_root, "m4_bayes_lognormal.rds"),
+  fit_burned_area_model(train, test, preds_m4, method = "bayes_lognormal",
+                         sigma_beta = 1, sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_ln$compiled_model))
+
+m4_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m4_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m4, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+#remove B:
+preds_m5 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y",
+              "road_proximity_binary")
+
+m5_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m5_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m5, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+#add urban proximity back:
+preds_m6 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y",
+              "road_proximity_binary", "urban_proximity_binary")
+
+m6_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m6_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m6, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+#add river proximity back:
+preds_m7 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y",
+              "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary")
+
+m7_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m7_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m7, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+#add river proximity back:
+preds_m8 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y",
+              "urban_proximity_binary")
+
+m8_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m8_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m8, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+```
+
+
+#------- AUTOCORRELATION: lagged burned area
+Add autocorrelation (previous years burned area is input)
+This is burned area for all fire types. it is the previous year's total burned area in that gridcell, and does not include the burned area in adjacent gridcells.
+```{r}
+#read in data with the burn lag
+df <- read.csv(file.path(drivers_root, "lightning_fires_burned_area_jja_2002_2011_withLag.csv"))
+#Filter for total burned areas associated with single lightning-caused ignition. This makes sure that we arent predicting burned area from multiple ignition sources. 
+
+#Add previous years annual total burned area across all gridcells
+annual_total <- df |>
+  group_by(year) |>
+  summarise(
+    burned_area_annual_total = sum(burned_area_km2, na.rm = TRUE),
+    .groups = "drop"
+  )
+annual_total
+#lag by 1 year
+annual_total_lag <- annual_total |>
+  mutate(year_lead = year + 1) |>
+  dplyr::select(year_lead, burned_area_annual_total_lag = burned_area_annual_total)
+annual_total_lag
+
+annual_total_lag <- filter(annual_total_lag, year_lead < 2012)
+
+# ── Merge into df ─────────────────────────────────────────────────────────────
+df <- df |>
+  left_join(annual_total_lag, by = c("year" = "year_lead")) |>
+  mutate(burned_area_annual_total_lag = replace_na(burned_area_annual_total_lag, 0))
+
+# ── Verify — every row in a given year should have the same lag value ─────────
+df |>
+  group_by(year) |>
+  summarise(
+    lag_value = first(burned_area_annual_total_lag),
+    n_unique  = n_distinct(burned_area_annual_total_lag),
+    .groups   = "drop"
+  ) |>
+  print()
+# n_unique should be 1 for every year — confirms all gridcells share the same value
+
+df <- filter(df, single_lightning_ignition == 1 & total_ignition_count == 1)
+
+#for the lag models, we cannot use the 2002 data because there is no previous year's bunred area associated wth it
+df <- filter(df, year > 2002)
+
+df <- df %>% mutate(
+  road_proximity_binary = if_else(dist_road >= 30, 0, 1),
+  urban_proximity_binary = if_else(dist_urban >= 40, 0, 1),
+  river_proximity_binary = if_else(dist_river >= 30, 0, 1), 
+  burn_lag_binary = if_else(burned_area_km2_lag1 > 0, 1, 0),
+  burn_lag_binary_5 = if_else(burned_area_km2_lag1 >= 5, 1, 0),
+  burn_lag_binary_10 = if_else(burned_area_km2_lag1 >= 10, 1, 0),
+  burn_lag_binary_15 = if_else(burned_area_km2_lag1 >= 15, 1, 0),
+  burn_lag_binary_20 = if_else(burned_area_km2_lag1 >= 20, 1, 0),
+  burn_lag_binary_25 = if_else(burned_area_km2_lag1 >= 25, 1, 0)
+)
+
+
+head(df)
+```
+
+Split into training and testing data
+```{r, echo=FALSE}
+## 80% of the sample size
+sample_size <- floor(0.8 * nrow(df))
+
+## set the seed to make partition reproducible
+set.seed(123)
+train_index <- sample(seq_len(nrow(df)), size = sample_size)
+
+train <- df[train_index, ]
+test <- df[-train_index, ]
+```
+
+```{r}
+# ── Save scaling parameters ───────────────────────────────────────────────────
+predictors_ignition <- c("rh", "tair", "precip", "wind",
+                          "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                          "tair_2m", "tair_5y", "B",
+                         #"road_proximity_binary", "urban_proximity_binary", "river_proximity_binary", 
+                         "burned_area_km2_lag1", "burned_area_annual_total_lag")
+                         #"burn_lag_binary", "burn_lag_binary_5")
+
+mu_rh        <- mean(train$rh);        sigma_rh        <- sd(train$rh)
+mu_tair      <- mean(train$tair);      sigma_tair      <- sd(train$tair)
+mu_precip    <- mean(train$precip);    sigma_precip    <- sd(train$precip)
+mu_wind      <- mean(train$wind);      sigma_wind      <- sd(train$wind)
+mu_precip_1m <- mean(train$precip_1m); sigma_precip_1m <- sd(train$precip_1m)
+mu_precip_2m <- mean(train$precip_2m); sigma_precip_2m <- sd(train$precip_2m)
+mu_precip_3m <- mean(train$precip_3m); sigma_precip_3m <- sd(train$precip_3m)
+mu_precip_5y <- mean(train$precip_5y); sigma_precip_5y <- sd(train$precip_5y)
+mu_tair_2m   <- mean(train$tair_2m);   sigma_tair_2m   <- sd(train$tair_2m)
+mu_tair_5y   <- mean(train$tair_5y);   sigma_tair_5y   <- sd(train$tair_5y)
+mu_B         <- mean(train$B);         sigma_B         <- sd(train$B)
+# mu_road_proximity_binary <- mean(train$road_proximity_binary); sigma_road_proximity_binary  <- sd(train$road_proximity_binary)
+# mu_urban_proximity_binary <- mean(train$urban_proximity_binary); sigma_urban_proximity_binary <- sd(train$urban_proximity_binary)
+# mu_river_proximity_binary <- mean(train$river_proximity_binary); sigma_river_proximity_binary <- sd(train$river_proximity_binary)
+mu_burned_area_km2_lag1 <- mean(train$burned_area_km2_lag1); sigma_burned_area_km2_lag1 <- sd(train$burned_area_km2_lag1)
+mu_burned_area_annual_total_lag <- mean(train$burned_area_annual_total_lag); sigma_burned_area_annual_total_lag <- sd(train$burned_area_annual_total_lag)
+
+# Store and save
+mean_sd_ignition <- data.frame(
+  var   = predictors_ignition,
+  mu    = c(mu_rh, mu_tair, mu_precip, mu_wind,
+            mu_precip_1m, mu_precip_2m, mu_precip_3m, mu_precip_5y,
+            mu_tair_2m, mu_tair_5y, mu_B, 
+            #mu_road_proximity_binary, mu_urban_proximity_binary, mu_river_proximity_binary, 
+            mu_burned_area_km2_lag1, mu_burned_area_annual_total_lag),
+  sigma = c(sigma_rh, sigma_tair, sigma_precip, sigma_wind,
+            sigma_precip_1m, sigma_precip_2m, sigma_precip_3m, sigma_precip_5y,
+            sigma_tair_2m, sigma_tair_5y, sigma_B, 
+            #sigma_road_proximity_binary, sigma_urban_proximity_binary, sigma_river_proximity_binary, 
+            sigma_burned_area_km2_lag1, sigma_burned_area_annual_total_lag)
+)
+
+write.csv(mean_sd_ignition,
+          file.path(mu_sigma_root, "mu_sigma_burned_area_predictors_lag.csv"),
+          row.names = FALSE)
+
+# ── Standardize train ─────────────────────────────────────────────────────────
+train <- train %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B,
+    #road_proximity_binary         = (road_proximity_binary         - mu_road_proximity_binary)         / sigma_road_proximity_binary,
+    #urban_proximity_binary         = (urban_proximity_binary         - mu_urban_proximity_binary)         / sigma_urban_proximity_binary,
+    #river_proximity_binary         = (river_proximity_binary         - mu_river_proximity_binary)         / sigma_river_proximity_binary,
+    burned_area_km2_lag1         = (burned_area_km2_lag1         - mu_burned_area_km2_lag1)         / sigma_river_proximity_binary,
+    burned_area_annual_total_lag  = (burned_area_annual_total_lag - mu_burned_area_annual_total_lag) / sigma_burned_area_annual_total_lag
+  )
+
+train <- train[, c("lat", "lon", "year", "month",
+                   "burned_area_km2_total",
+                   "rh", "tair", "precip", "wind",
+                   "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                   "tair_2m", "tair_5y", "B",
+                   "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary",
+                   "burned_area_km2_lag1", "burned_area_annual_total_lag", "burn_lag_binary", "burn_lag_binary_5", "burn_lag_binary_10", "burn_lag_binary_15", "burn_lag_binary_20", "burn_lag_binary_25")]
+
+# ── Standardize test ──────────────────────────────────────────────────────────
+# Use training means and sds 
+test <- test %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B,
+    #road_proximity_binary         = (road_proximity_binary         - mu_road_proximity_binary)         / sigma_road_proximity_binary,
+    #urban_proximity_binary         = (urban_proximity_binary         - mu_urban_proximity_binary)         / sigma_urban_proximity_binary,
+    #river_proximity_binary         = (river_proximity_binary         - mu_river_proximity_binary)         / sigma_river_proximity_binary,
+    burned_area_km2_lag1         = (burned_area_km2_lag1         - mu_burned_area_km2_lag1)         / sigma_river_proximity_binary,
+    burned_area_annual_total_lag  = (burned_area_annual_total_lag - mu_burned_area_annual_total_lag) / sigma_burned_area_annual_total_lag
+  )
+
+test <- test[, c("lat", "lon", "year", "month",
+                 "burned_area_km2_total",
+                 "rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y", "B",
+                 "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary",
+                 "burned_area_km2_lag1", "burned_area_annual_total_lag", "burn_lag_binary", "burn_lag_binary_5", "burn_lag_binary_10", "burn_lag_binary_15", "burn_lag_binary_20", "burn_lag_binary_25")]
+
+#head(train)
+lag_test_save <- test
+lag_train_save <- train
+```
+
+
+Apply bayes Gamma model
+```{r}
+preds_m9 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burned_area_km2_lag1")
+
+m9_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m9_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m9, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+preds_m10 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burn_lag_binary")
+
+m10_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m10_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m10, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+preds_m11 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burn_lag_binary_5")
+
+m11_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m11_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m11, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+preds_m12 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burn_lag_binary_10")
+
+m12_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m12_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m12, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+preds_m13 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burn_lag_binary_15")
+
+m13_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m13_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m13, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+preds_m14 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burn_lag_binary_20")
+
+m14_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m14_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m14, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+preds_m15 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burn_lag_binary_25")
+
+m15_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m15_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m15, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+
+preds_m16 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burned_area_annual_total_lag")
+
+m16_bayes_g <- run_or_load_model(
+  file.path(rds_root, "m16_bayes_gamma.rds"),
+  fit_burned_area_model(train, test, preds_m16, method = "bayes_gamma",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2,
+                         compiled_model = m1_bayes_g$compiled_model))
+```
+
+```{r}
+##############################################################################
+# burned_area_model_functions.R
+#
+# Unified function for fitting burned area models.
+# Follows the same structure as ignition_model_functions.R.
+#
+# Methods:
+#   "lognormal_ols"   : OLS on log-transformed outcome (baseline)
+#   "gamma_glm"       : Gamma GLM with log link
+#   "bayes_lognormal" : Bayesian log-normal regression (RStan)
+#   "bayes_gamma"     : Bayesian Gamma regression (RStan)
+#
+# Train/test split performed OUTSIDE this function.
+# Pass pre-standardised train and test sets.
+# Outcome variable: burned_area_km2_total (must be > 0 for all rows)
+##############################################################################
+
+library(rstan)
+library(pROC)
+library(dplyr)
+library(loo)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+# ── Shared helper functions ───────────────────────────────────────────────────
+
+compute_burned_metrics <- function(y_true, y_pred,
+                                    n_boot = 1000, seed = 123) {
+  # Performance metrics for a continuous positive outcome
+  # y_true / y_pred: burned area in km² (original scale, not log)
+
+  rmse_val  <- sqrt(mean((y_pred - y_true)^2))
+  nrmse_val <- rmse_val / mean(y_true)
+  cor_val   <- cor(y_pred,  y_true)
+  spear_val <- cor(y_pred,  y_true, method = "spearman")
+  r2_val    <- 1 - sum((y_true - y_pred)^2) /
+                   sum((y_true - mean(y_true))^2)
+  mae_val   <- mean(abs(y_pred - y_true))
+
+  # Also compute on log scale (more stable for skewed data)
+  log_cor_val   <- cor(log(y_pred + 1), log(y_true + 1))
+  log_rmse_val  <- sqrt(mean((log(y_pred + 1) - log(y_true + 1))^2))
+
+  # Bootstrap CIs
+  set.seed(seed)
+  n        <- length(y_true)
+  boot_mat <- matrix(
+    NA_real_, nrow = n_boot, ncol = 7,
+    dimnames = list(NULL, c("nrmse","cor","spear","r2","mae",
+                             "log_cor","log_rmse"))
+  )
+
+  for (b in seq_len(n_boot)) {
+    idx  <- sample.int(n, n, replace = TRUE)
+    y_t  <- y_true[idx]
+    y_p  <- y_pred[idx]
+    boot_mat[b, "nrmse"]    <- sqrt(mean((y_p - y_t)^2)) / mean(y_t)
+    boot_mat[b, "cor"]      <- tryCatch(cor(y_p, y_t),
+                                         error = function(e) NA_real_)
+    boot_mat[b, "spear"]    <- tryCatch(cor(y_p, y_t, method = "spearman"),
+                                         error = function(e) NA_real_)
+    boot_mat[b, "r2"]       <- 1 - sum((y_t - y_p)^2) /
+                                    sum((y_t - mean(y_t))^2)
+    boot_mat[b, "mae"]      <- mean(abs(y_p - y_t))
+    boot_mat[b, "log_cor"]  <- tryCatch(
+      cor(log(y_p + 1), log(y_t + 1)), error = function(e) NA_real_)
+    boot_mat[b, "log_rmse"] <- sqrt(mean((log(y_p + 1) - log(y_t + 1))^2))
+  }
+
+  qfun <- function(x) quantile(x[is.finite(x)], probs = c(0.025, 0.975),
+                                na.rm = TRUE)
+
+  list(
+    nrmse    = nrmse_val,  nrmse_ci   = qfun(boot_mat[, "nrmse"]),
+    cor      = cor_val,    cor_ci     = qfun(boot_mat[, "cor"]),
+    spearman = spear_val,  spear_ci   = qfun(boot_mat[, "spear"]),
+    r2       = r2_val,     r2_ci      = qfun(boot_mat[, "r2"]),
+    mae      = mae_val,    mae_ci     = qfun(boot_mat[, "mae"]),
+    log_cor  = log_cor_val,log_cor_ci = qfun(boot_mat[, "log_cor"]),
+    log_rmse = log_rmse_val,log_rmse_ci = qfun(boot_mat[, "log_rmse"])
+  )
+}
+
+run_or_load_model <- function(path, fit_expr, verbose = TRUE) {
+  if (file.exists(path)) {
+    if (verbose) message("Loading saved model from: ", path)
+    readRDS(path)
+  } else {
+    if (verbose) message("Fitting model (cache not found): ", path)
+    fit <- eval.parent(substitute(fit_expr))
+    dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+    if (verbose) message("Saving model to: ", path)
+    saveRDS(fit, path)
+    fit
+  }
+}
+
+# ── Stan model code ───────────────────────────────────────────────────────────
+
+# Log-normal: log(y) ~ Normal(alpha + X*beta, sigma)
+# Equivalent to y ~ LogNormal(alpha + X*beta, sigma)
+.stan_lognormal <- "
+data {
+  int<lower=1> N;
+  int<lower=1> K;
+  matrix[N, K] X;
+  vector<lower=0>[N] y;
+  real<lower=0> sigma_beta;
+  real<lower=0> sigma_alpha;
+}
+parameters {
+  real alpha;
+  vector[K] beta;
+  real<lower=0> sigma;
+}
+model {
+  alpha ~ normal(0, sigma_alpha);
+  beta  ~ normal(0, sigma_beta);
+  sigma ~ exponential(1);
+  log(y) ~ normal(alpha + X * beta, sigma);
+}
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_pred;
+  for (n in 1:N) {
+    real mu_n   = alpha + dot_product(X[n], beta);
+    log_lik[n]  = normal_lpdf(log(y[n]) | mu_n, sigma);
+    // Back-transform with log-normal bias correction
+    // E[Y] = exp(mu + sigma^2/2)
+    y_pred[n]   = exp(mu_n + 0.5 * sigma^2);
+  }
+}"
+
+# Gamma GLM: y ~ Gamma(shape, rate)
+# log(E[y]) = alpha + X*beta
+# Parameterised via mean mu and shape phi
+.stan_gamma <- "
+data {
+  int<lower=1> N;
+  int<lower=1> K;
+  matrix[N, K] X;
+  vector<lower=0>[N] y;
+  real<lower=0> sigma_beta;
+  real<lower=0> sigma_alpha;
+}
+parameters {
+  real alpha;
+  vector[K] beta;
+  real<lower=0> phi;   // shape / concentration parameter
+}
+model {
+  alpha ~ normal(0, sigma_alpha);
+  beta  ~ normal(0, sigma_beta);
+  phi   ~ exponential(0.1);   // weakly informative — allows large shapes
+  for (n in 1:N) {
+    real mu_n = exp(alpha + dot_product(X[n], beta));
+    y[n] ~ gamma(phi, phi / mu_n);
+  }
+}
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_pred;
+  for (n in 1:N) {
+    real mu_n  = exp(alpha + dot_product(X[n], beta));
+    log_lik[n] = gamma_lpdf(y[n] | phi, phi / mu_n);
+    y_pred[n]  = mu_n;   // posterior mean prediction
+  }
+}"
+
+# Bayesian Gamma with year-level random intercepts
+# log(E[y_i]) = alpha + alpha_year[year_i] + X_i * beta
+# alpha_year[y] ~ Normal(0, sigma_year)  — partial pooling across years
+# For paleo application: set alpha_year = 0 (prior mean = average year)
+.stan_gamma_re <- "
+data {
+  int<lower=1> N;
+  int<lower=1> K;
+  int<lower=1> Y;                        // number of unique years
+  matrix[N, K] X;
+  vector<lower=0>[N] y;
+  int<lower=1,upper=Y> year_idx[N];      // year index for each observation
+  real<lower=0> sigma_beta;
+  real<lower=0> sigma_alpha;
+}
+parameters {
+  real alpha;
+  vector[K] beta;
+  real<lower=0> phi;
+  vector[Y] alpha_year;                  // year random intercepts
+  real<lower=0> sigma_year;             // SD of year random effects
+}
+model {
+  alpha      ~ normal(0, sigma_alpha);
+  beta       ~ normal(0, sigma_beta);
+  phi        ~ exponential(0.1);
+  sigma_year ~ exponential(1);           // weakly informative
+  alpha_year ~ normal(0, sigma_year);    // partial pooling
+  for (n in 1:N) {
+    real mu_n = exp(alpha + alpha_year[year_idx[n]] + dot_product(X[n], beta));
+    y[n] ~ gamma(phi, phi / mu_n);
+  }
+}
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_pred;
+  for (n in 1:N) {
+    real mu_n  = exp(alpha + alpha_year[year_idx[n]] + dot_product(X[n], beta));
+    log_lik[n] = gamma_lpdf(y[n] | phi, phi / mu_n);
+    y_pred[n]  = mu_n;
+  }
+}"
+
+# ── Main function ─────────────────────────────────────────────────────────────
+
+fit_burned_area_model <- function(train,
+                                   test,
+                                   predictors,
+                                   outcome         = "burned_area_km2_total",
+                                   method          = c("lognormal_ols",
+                                                       "gamma_glm",
+                                                       "bayes_lognormal",
+                                                       "bayes_gamma",
+                                                       "bayes_gamma_re"),
+                                   sigma_beta      = 1,
+                                   sigma_alpha     = 5,
+                                   iter            = 2000,
+                                   chains          = 4,
+                                   seed            = 123,
+                                   n_boot          = 1000,
+                                   compiled_model  = NULL) {
+  # ── Args ──────────────────────────────────────────────────────────────────
+  # train / test   : pre-standardised data; must contain outcome and predictors
+  # predictors     : character vector of predictor column names
+  # outcome        : name of outcome column (default "burned_area_km2_total")
+  # method         : one of "lognormal_ols", "gamma_glm",
+  #                          "bayes_lognormal", "bayes_gamma"
+  # sigma_beta     : prior SD for regression coefficients (Bayesian only)
+  # sigma_alpha    : prior SD for intercept (Bayesian only)
+  # iter / chains  : Stan sampling settings (Bayesian only)
+  # seed           : random seed
+  # n_boot         : bootstrap resamples for confidence intervals
+  # compiled_model : pre-compiled Stan model (Bayesian only)
+
+  method <- match.arg(method)
+
+  # Validate outcome is positive (required for Gamma and log-normal)
+  if (any(train[[outcome]] <= 0)) {
+    stop(sprintf(
+      "All values of '%s' must be > 0. Found %d non-positive values.",
+      outcome, sum(train[[outcome]] <= 0)
+    ))
+  }
+
+  cat(sprintf("[%s] Training rows : %d\n", method, nrow(train)))
+  cat(sprintf("[%s] Test rows     : %d\n", method, nrow(test)))
+  cat(sprintf("[%s] Outcome range : %.2f – %.2f km²\n",
+              method, min(train[[outcome]]), max(train[[outcome]])))
+
+  y_train <- train[[outcome]]
+  y_test  <- test[[outcome]]
+
+  # ── Formula objects ───────────────────────────────────────────────────────
+  formula_obj <- as.formula(
+    paste(outcome, "~", paste(predictors, collapse = " + "))
+  )
+  formula_matrix <- as.formula(
+    paste("~", paste(predictors, collapse = " + "), "- 1")
+  )
+
+  # Initialise
+  fit        <- NULL
+  coef_table <- NULL
+  p_hat      <- NULL    # predictions on original km² scale
+  extra      <- list()
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 1. Log-normal OLS
+  # ══════════════════════════════════════════════════════════════════════════
+
+  if (method == "lognormal_ols") {
+
+    cat("[lognormal_ols] Fitting OLS on log(burned_area)...\n")
+
+    train_log        <- train
+    train_log$log_y  <- log(train[[outcome]])
+    test_log         <- test
+    test_log$log_y   <- log(test[[outcome]])
+
+    formula_log <- as.formula(
+      paste("log_y ~", paste(predictors, collapse = " + "))
+    )
+
+    fit <- lm(formula_log, data = train_log)
+
+    coef_table           <- as.data.frame(summary(fit)$coefficients)
+    coef_table$variable  <- rownames(coef_table)
+    rownames(coef_table) <- NULL
+
+    # Back-transform with log-normal bias correction: E[Y] = exp(mu + sigma²/2)
+    sigma_hat <- summary(fit)$sigma
+    log_pred  <- predict(fit, newdata = test_log)
+    p_hat     <- exp(log_pred + 0.5 * sigma_hat^2)
+
+    extra$sigma_hat   <- sigma_hat
+    extra$log_pred    <- log_pred
+    extra$aic         <- AIC(fit)
+    cat(sprintf("[lognormal_ols] Sigma (log scale): %.4f | AIC: %.2f\n",
+                sigma_hat, AIC(fit)))
+  }
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2. Gamma GLM with log link
+  # ══════════════════════════════════════════════════════════════════════════
+
+  if (method == "gamma_glm") {
+
+    cat("[gamma_glm] Fitting Gamma GLM with log link...\n")
+
+    fit <- glm(formula_obj,
+               data   = train,
+               family = Gamma(link = "log"))
+
+    coef_table           <- as.data.frame(summary(fit)$coefficients)
+    coef_table$variable  <- rownames(coef_table)
+    rownames(coef_table) <- NULL
+
+    p_hat      <- predict(fit, newdata = test, type = "response")
+    extra$aic  <- AIC(fit)
+
+    # Dispersion estimate
+    extra$dispersion <- summary(fit)$dispersion
+    cat(sprintf("[gamma_glm] Dispersion: %.4f | AIC: %.2f\n",
+                extra$dispersion, AIC(fit)))
+  }
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 3 & 4. Bayesian models (log-normal or Gamma)
+  # ══════════════════════════════════════════════════════════════════════════
+
+  if (method %in% c("bayes_lognormal", "bayes_gamma")) {
+
+    stan_code <- if (method == "bayes_lognormal") {
+      .stan_lognormal
+    } else {
+      .stan_gamma
+    }
+
+    X_train <- model.matrix(formula_matrix, data = train)
+    X_test  <- model.matrix(formula_matrix, data = test)
+
+    stan_data <- list(
+      N           = nrow(train),
+      K           = ncol(X_train),
+      X           = X_train,
+      y           = y_train,
+      sigma_beta  = sigma_beta,
+      sigma_alpha = sigma_alpha
+    )
+
+    # Compile (once per session)
+    if (is.null(compiled_model)) {
+      cat(sprintf("[%s] Compiling Stan model...\n", method))
+      compiled_model <- stan_model(model_code = stan_code)
+    }
+
+    cat(sprintf("[%s] Sampling (%d chains × %d iter)...\n",
+                method, chains, iter))
+    fit <- sampling(
+      compiled_model,
+      data    = stan_data,
+      iter    = iter,
+      chains  = chains,
+      seed    = seed,
+      control = list(adapt_delta = 0.95),
+      refresh = 200
+    )
+
+    # Convergence check
+    rhat_vals <- summary(fit)$summary[, "Rhat"]
+    max_rhat  <- max(rhat_vals, na.rm = TRUE)
+    cat(sprintf("[%s] Max R-hat: %.4f %s\n",
+                method, max_rhat,
+                ifelse(max_rhat > 1.01, "⚠ CONVERGENCE WARNING", "✓")))
+
+    # LOO-CV
+    loo_result <- tryCatch(
+      loo(fit, pars = "log_lik"),
+      error = function(e) {
+        message("LOO-CV failed: ", e$message)
+        NULL
+      }
+    )
+    extra$loo        <- loo_result
+    extra$max_rhat   <- max_rhat
+    extra$compiled_model <- compiled_model
+
+    # Posterior summaries
+    pars_to_summarise <- if (method == "bayes_lognormal") {
+      c("alpha", "beta", "sigma")
+    } else {
+      c("alpha", "beta", "phi")
+    }
+
+    summ <- summary(fit, pars = pars_to_summarise,
+                     probs = c(0.025, 0.25, 0.5, 0.75, 0.975))$summary
+
+    alpha_mean <- summ["alpha", "mean"]
+    beta_rows  <- grep("^beta\\[", rownames(summ))
+    beta_means <- summ[beta_rows, "mean"]
+    names(beta_means) <- colnames(X_train)
+
+    coef_table           <- as.data.frame(summ)
+    coef_table$variable  <- rownames(summ)
+    rownames(coef_table) <- NULL
+
+    extra$coef_means <- list(alpha = alpha_mean, beta = beta_means)
+
+    # Posterior predictions on test set (posterior mean of y_pred draws)
+    post   <- extract(fit)
+
+    # Generate predictions for test set from posterior draws
+    n_draws    <- length(post$alpha)
+    pred_draws <- matrix(NA_real_, nrow = nrow(test), ncol = n_draws)
+
+    for (d in seq_len(n_draws)) {
+      mu_d <- post$alpha[d] + X_test %*% post$beta[d, ]
+      if (method == "bayes_lognormal") {
+        sigma_d       <- post$sigma[d]
+        pred_draws[, d] <- exp(mu_d + 0.5 * sigma_d^2)
+      } else {
+        pred_draws[, d] <- exp(mu_d)   # Gamma mean = exp(linear predictor)
+      }
+    }
+
+    p_hat  <- rowMeans(pred_draws)   # posterior mean prediction
+    p_sd   <- apply(pred_draws, 1, sd)
+    p_low  <- apply(pred_draws, 1, quantile, 0.025)
+    p_high <- apply(pred_draws, 1, quantile, 0.975)
+
+    extra$pred_sd   <- p_sd
+    extra$pred_low  <- p_low
+    extra$pred_high <- p_high
+  }
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 5. Bayesian Gamma with year random effects
+  # ══════════════════════════════════════════════════════════════════════════
+
+  if (method == "bayes_gamma_re") {
+
+    X_train <- model.matrix(formula_matrix, data = train)
+    X_test  <- model.matrix(formula_matrix, data = test)
+
+    # ── Year index mapping ─────────────────────────────────────────────────
+    # Map year values to consecutive integers 1:Y for Stan
+    unique_years  <- sort(unique(train$year))
+    year_map      <- setNames(seq_along(unique_years), unique_years)
+    year_idx_train <- as.integer(year_map[as.character(train$year)])
+
+    # For test years: use mapped index if year seen in training, else NA
+    year_idx_test  <- as.integer(year_map[as.character(test$year)])
+    unseen_years   <- is.na(year_idx_test)
+    if (any(unseen_years)) {
+      cat(sprintf("[bayes_gamma_re] %d test observations have unseen years — using prior mean (0) for RE\n",
+                  sum(unseen_years)))
+    }
+
+    cat(sprintf("[bayes_gamma_re] Training years: %s\n",
+                paste(unique_years, collapse = ", ")))
+
+    stan_data <- list(
+      N           = nrow(train),
+      K           = ncol(X_train),
+      Y           = length(unique_years),
+      X           = X_train,
+      y           = y_train,
+      year_idx    = year_idx_train,
+      sigma_beta  = sigma_beta,
+      sigma_alpha = sigma_alpha
+    )
+
+    # Compile
+    if (is.null(compiled_model)) {
+      cat("[bayes_gamma_re] Compiling Stan model...\n")
+      compiled_model <- stan_model(
+        model_code = .stan_gamma_re,
+        model_name = "burned_area_bayes_gamma_re"
+      )
+    }
+
+    cat(sprintf("[bayes_gamma_re] Sampling (%d chains × %d iter)...\n",
+                chains, iter))
+    fit <- sampling(
+      compiled_model,
+      data    = stan_data,
+      iter    = iter,
+      chains  = chains,
+      seed    = seed,
+      control = list(adapt_delta = 0.99),   # higher adapt_delta for RE models
+      refresh = 200
+    )
+
+    # Convergence
+    rhat_vals <- summary(fit)$summary[, "Rhat"]
+    max_rhat  <- max(rhat_vals, na.rm = TRUE)
+    cat(sprintf("[bayes_gamma_re] Max R-hat: %.4f %s\n",
+                max_rhat,
+                ifelse(max_rhat > 1.01, "⚠ CONVERGENCE WARNING", "✓")))
+
+    # LOO-CV
+    loo_result <- tryCatch(
+      loo(fit, pars = "log_lik"),
+      error = function(e) { message("LOO-CV failed: ", e$message); NULL }
+    )
+    extra$loo            <- loo_result
+    extra$max_rhat       <- max_rhat
+    extra$compiled_model <- compiled_model
+    extra$year_map       <- year_map   # save for applying to new data
+
+    # Posterior summaries
+    summ <- summary(fit,
+                     pars  = c("alpha", "beta", "phi",
+                               "alpha_year", "sigma_year"),
+                     probs = c(0.025, 0.25, 0.5, 0.75, 0.975))$summary
+
+    alpha_mean      <- summ["alpha", "mean"]
+    beta_rows       <- grep("^beta\\[", rownames(summ))
+    beta_means      <- summ[beta_rows, "mean"]
+    names(beta_means) <- colnames(X_train)
+
+    # Year random effect posterior means
+    re_rows         <- grep("^alpha_year\\[", rownames(summ))
+    alpha_year_means <- summ[re_rows, "mean"]
+    names(alpha_year_means) <- as.character(unique_years)
+
+    cat("[bayes_gamma_re] Year random effects (posterior mean):\n")
+    print(round(setNames(alpha_year_means, unique_years), 3))
+
+    coef_table           <- as.data.frame(summ)
+    coef_table$variable  <- rownames(summ)
+    rownames(coef_table) <- NULL
+
+    extra$coef_means <- list(
+      alpha      = alpha_mean,
+      beta       = beta_means,
+      alpha_year = alpha_year_means
+    )
+
+    # ── Posterior predictions on test set ─────────────────────────────────
+    post    <- rstan::extract(fit)
+    n_draws <- length(post$alpha)
+    pred_draws <- matrix(NA_real_, nrow = nrow(test), ncol = n_draws)
+
+    for (d in seq_len(n_draws)) {
+      for (i in seq_len(nrow(test))) {
+        yr_idx <- year_idx_test[i]
+        # Use estimated RE if year seen in training; use 0 (prior mean) otherwise
+        re_val <- if (!is.na(yr_idx)) post$alpha_year[d, yr_idx] else 0
+        eta    <- post$alpha[d] + re_val + sum(X_test[i, ] * post$beta[d, ])
+        pred_draws[i, d] <- exp(eta)
+      }
+    }
+
+    p_hat  <- rowMeans(pred_draws)
+    p_sd   <- apply(pred_draws, 1, sd)
+    p_low  <- apply(pred_draws, 1, quantile, 0.025)
+    p_high <- apply(pred_draws, 1, quantile, 0.975)
+
+    extra$pred_sd   <- p_sd
+    extra$pred_low  <- p_low
+    extra$pred_high <- p_high
+  }
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # Shared: metrics and output
+  # ══════════════════════════════════════════════════════════════════════════
+
+  metrics <- compute_burned_metrics(y_test, p_hat,
+                                     n_boot = n_boot, seed = seed)
+
+  cat(sprintf("[%s] nRMSE    : %.4f (%.4f, %.4f)\n",
+              method, metrics$nrmse,   metrics$nrmse_ci[1],   metrics$nrmse_ci[2]))
+  cat(sprintf("[%s] Pearson r: %.4f (%.4f, %.4f)\n",
+              method, metrics$cor,     metrics$cor_ci[1],     metrics$cor_ci[2]))
+  cat(sprintf("[%s] Spearman : %.4f (%.4f, %.4f)\n",
+              method, metrics$spearman,metrics$spear_ci[1],   metrics$spear_ci[2]))
+  cat(sprintf("[%s] R²       : %.4f (%.4f, %.4f)\n",
+              method, metrics$r2,      metrics$r2_ci[1],      metrics$r2_ci[2]))
+  cat(sprintf("[%s] MAE (km²): %.2f  (%.2f, %.2f)\n",
+              method, metrics$mae,     metrics$mae_ci[1],     metrics$mae_ci[2]))
+  cat(sprintf("[%s] Log corr : %.4f (%.4f, %.4f)\n",
+              method, metrics$log_cor, metrics$log_cor_ci[1], metrics$log_cor_ci[2]))
+
+  # Prediction data frame
+  pred_df <- data.frame(
+    lat                   = test$lat,
+    lon                   = test$lon,
+    year                  = test$year,
+    month                 = test$month,
+    burned_area_km2_total = y_test,
+    burned_area_pred      = p_hat,
+    residual              = y_test - p_hat,
+    log_residual          = log(y_test + 1) - log(p_hat + 1)
+  )
+
+  # Add posterior uncertainty columns for Bayesian models
+  if (!is.null(extra$pred_sd)) {
+    pred_df$pred_sd   <- extra$pred_sd
+    pred_df$pred_low  <- extra$pred_low
+    pred_df$pred_high <- extra$pred_high
+  }
+
+  c(
+    list(
+      method      = method,
+      predictors  = predictors,
+      outcome     = outcome,
+      fit         = fit,
+      coef_table  = coef_table,
+      predictions = pred_df,
+      metrics     = metrics
+    ),
+    extra   # appends aic, dispersion, loo, max_rhat, compiled_model, etc.
+  )
+}
+
+# ── Convenience: compare metrics across fitted models ─────────────────────────
+
+compare_burned_models <- function(model_list) {
+  do.call(rbind, lapply(model_list, function(m) {
+    mt <- m$metrics
+    data.frame(
+      method       = m$method,
+      predictors   = paste(m$predictors, collapse = ", "),
+      nrmse        = mt$nrmse,
+      nrmse_low    = mt$nrmse_ci[1],
+      nrmse_high   = mt$nrmse_ci[2],
+      cor          = mt$cor,
+      cor_low      = mt$cor_ci[1],
+      cor_high     = mt$cor_ci[2],
+      spearman     = mt$spearman,
+      spear_low    = mt$spear_ci[1],
+      spear_high   = mt$spear_ci[2],
+      r2           = mt$r2,
+      r2_low       = mt$r2_ci[1],
+      r2_high      = mt$r2_ci[2],
+      mae          = mt$mae,
+      mae_low      = mt$mae_ci[1],
+      mae_high     = mt$mae_ci[2],
+      log_cor      = mt$log_cor,
+      log_cor_low  = mt$log_cor_ci[1],
+      log_cor_high = mt$log_cor_ci[2],
+      row.names    = NULL
+    )
+  }))
+}
+
+
+```
+
+get no lag df  back
+```{r, echo=FALSE}
+df <- read.csv(file.path(drivers_root, "lightning_fires_burned_area_jja_2002_2011.csv"))
+#df <- df[,2:29]
+
+#Filter for total burned areas associated with single lightning-caused ignition. This makes sure that we arent predicting burned area from multiple ignition sources. 
+df <- filter(df, single_lightning_ignition == 1 & total_ignition_count == 1)
+
+df <- df %>% mutate(
+  road_proximity_binary = if_else(dist_road >= 30, 0, 1),
+  urban_proximity_binary = if_else(dist_urban >= 40, 0, 1),
+  river_proximity_binary = if_else(dist_river >= 30, 0, 1)
+)
+
+#Split into training and testing data
+## 80% of the sample size
+sample_size <- floor(0.8 * nrow(df))
+
+## set the seed to make partition reproducible
+set.seed(123)
+train_index <- sample(seq_len(nrow(df)), size = sample_size)
+
+train <- df[train_index, ]
+test <- df[-train_index, ]
+
+# ── Save scaling parameters ───────────────────────────────────────────────────
+predictors_ignition <- c("rh", "tair", "precip", "wind",
+                          "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                          "tair_2m", "tair_5y", "B",
+                         "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary")
+
+mu_rh        <- mean(train$rh);        sigma_rh        <- sd(train$rh)
+mu_tair      <- mean(train$tair);      sigma_tair      <- sd(train$tair)
+mu_precip    <- mean(train$precip);    sigma_precip    <- sd(train$precip)
+mu_wind      <- mean(train$wind);      sigma_wind      <- sd(train$wind)
+mu_precip_1m <- mean(train$precip_1m); sigma_precip_1m <- sd(train$precip_1m)
+mu_precip_2m <- mean(train$precip_2m); sigma_precip_2m <- sd(train$precip_2m)
+mu_precip_3m <- mean(train$precip_3m); sigma_precip_3m <- sd(train$precip_3m)
+mu_precip_5y <- mean(train$precip_5y); sigma_precip_5y <- sd(train$precip_5y)
+mu_tair_2m   <- mean(train$tair_2m);   sigma_tair_2m   <- sd(train$tair_2m)
+mu_tair_5y   <- mean(train$tair_5y);   sigma_tair_5y   <- sd(train$tair_5y)
+mu_B         <- mean(train$B);         sigma_B         <- sd(train$B)
+#mu_road_proximity_binary <- mean(train$road_proximity_binary); sigma_road_proximity_binary  <- sd(train$road_proximity_binary)
+#mu_urban_proximity_binary <- mean(train$urban_proximity_binary); sigma_urban_proximity_binary <- sd(train$urban_proximity_binary)
+#mu_river_proximity_binary <- mean(train$river_proximity_binary); sigma_river_proximity_binary <- sd(train$river_proximity_binary)
+
+
+# Store and save
+mean_sd_ignition <- data.frame(
+  var   = predictors_ignition,
+  mu    = c(mu_rh, mu_tair, mu_precip, mu_wind,
+            mu_precip_1m, mu_precip_2m, mu_precip_3m, mu_precip_5y,
+            mu_tair_2m, mu_tair_5y, mu_B, NA, NA, NA),
+            #mu_road_proximity_binary, mu_urban_proximity_binary, mu_river_proximity_binary),
+  sigma = c(sigma_rh, sigma_tair, sigma_precip, sigma_wind,
+            sigma_precip_1m, sigma_precip_2m, sigma_precip_3m, sigma_precip_5y,
+            sigma_tair_2m, sigma_tair_5y, sigma_B, NA, NA, NA))
+            #sigma_road_proximity_binary, sigma_urban_proximity_binary, sigma_river_proximity_binary)
+
+
+write.csv(mean_sd_ignition,
+          file.path(mu_sigma_root, "mu_sigma_burned_area_predictors.csv"),
+          row.names = FALSE)
+
+# ── Standardize train ─────────────────────────────────────────────────────────
+train <- train %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B
+    #road_proximity_binary         = (road_proximity_binary         - mu_road_proximity_binary)         / sigma_road_proximity_binary,
+    #urban_proximity_binary         = (urban_proximity_binary         - mu_urban_proximity_binary)         / sigma_urban_proximity_binary,
+    #river_proximity_binary         = (river_proximity_binary         - mu_river_proximity_binary)         / sigma_river_proximity_binary
+  )
+
+train <- train[, c("lat", "lon", "year", "month",
+                   "burned_area_km2_total",
+                   "rh", "tair", "precip", "wind",
+                   "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                   "tair_2m", "tair_5y", "B",
+                   "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary")]
+
+# ── Standardize test ──────────────────────────────────────────────────────────
+# Use training means and sds 
+test <- test %>%
+  mutate(
+    rh        = (rh        - mu_rh)        / sigma_rh,
+    tair      = (tair      - mu_tair)      / sigma_tair,
+    precip    = (precip    - mu_precip)    / sigma_precip,
+    wind      = (wind      - mu_wind)      / sigma_wind,
+    precip_1m = (precip_1m - mu_precip_1m) / sigma_precip_1m,
+    precip_2m = (precip_2m - mu_precip_2m) / sigma_precip_2m,
+    precip_3m = (precip_3m - mu_precip_3m) / sigma_precip_3m,
+    precip_5y = (precip_5y - mu_precip_5y) / sigma_precip_5y,
+    tair_2m   = (tair_2m   - mu_tair_2m)   / sigma_tair_2m,
+    tair_5y   = (tair_5y   - mu_tair_5y)   / sigma_tair_5y,
+    B         = (B         - mu_B)         / sigma_B)
+    #road_proximity_binary         = (road_proximity_binary         - mu_road_proximity_binary)         / sigma_road_proximity_binary,
+    #urban_proximity_binary         = (urban_proximity_binary         - mu_urban_proximity_binary)         / sigma_urban_proximity_binary,
+    #river_proximity_binary         = (river_proximity_binary         - mu_river_proximity_binary)         / sigma_river_proximity_binary,
+    #burned_area_km2_lag1         = (burned_area_km2_lag1         - mu_burned_area_km2_lag1)         / sigma_river_proximity_binary
+
+
+test <- test[, c("lat", "lon", "year", "month",
+                 "burned_area_km2_total",
+                 "rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y", "B",
+                 "road_proximity_binary", "urban_proximity_binary", "river_proximity_binary")]
+
+head(train)
+
+```
+
+
+################################################
+#add year as RANDOM AFFECT
+################################################
+
+The year random effect addresses the same ecological concern as the lag (year-to-year autocorrelation) but in a statistically appropriate way — it absorbs the residual year-level variance without trying to predict it from a single lagged value estimated from one cycle of extreme years. It also has a cleaner paleo interpretation: in the paleo application, the year random effect is simply set to zero (its prior mean), representing the expectation that any given year is climatologically average, with deviation from average captured entirely by the climate predictors.
+
+
+```{r}
+preds_m6 <- c("rh", "tair", "precip", "wind",
+                   "precip_1m", "precip_3m", "precip_5y",
+                   "tair_2m", "tair_5y",
+                   "road_proximity_binary",
+                   "urban_proximity_binary")
+
+m6_bayes_gamma_re <- run_or_load_model(
+  file.path(rds_root, "Burned_Area/m6_bayes_gamma_re.rds"),
+  fit_burned_area_model(train, test, preds_m6,
+                         method      = "bayes_gamma_re",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2))
+
+#Look at posterior mean per training year. 
+m6_bayes_gamma_re$coef_means$alpha_year
+#This lls me how much each yera deviated from the climate predicted baseline. 
+#2004 and 2005 higve large positive values, which would be expected since they were years of high fire severity
+#for paleo predictions, set the year random effect to 0 (prior mean) for all simulation years — this represents "an average year" and lets the climate predictors do the work. For example, 
+#eta <- alpha_mean + X_new %*% beta_means  # no alpha_year term
+#burned_area_pred <- exp(eta)
+
+preds_m16 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burned_area_annual_total_lag")
+
+m16_bayes_gamma_re <- run_or_load_model(
+  file.path(rds_root, "Burned_Area/m16_bayes_gamma_re.rds"),
+  fit_burned_area_model(lag_train_save, lag_test_save, preds_m16,
+                         method      = "bayes_gamma_re",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2))
+
+m16_bayes_gamma_re$coef_means$alpha_year
+
+preds_m10 <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary", 
+              "burn_lag_binary")
+
+m10_bayes_gamma_re <- run_or_load_model(
+  file.path(rds_root, "Burned_Area/m10_bayes_gamma_re.rds"),
+  fit_burned_area_model(lag_train_save, lag_test_save, preds_m10,
+                         method      = "bayes_gamma_re",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2))
+
+m10_bayes_gamma_re$coef_means$alpha_year
+
+preds_m12 <- c("rh", "tair", "precip", "wind",
+               "precip_1m", "precip_3m", "precip_5y",
+               "tair_2m", "tair_5y",
+               "road_proximity_binary",
+               "urban_proximity_binary", 
+               "burn_lag_binary_10")
+
+m12_bayes_gamma_re <- run_or_load_model(
+  file.path(rds_root, "Burned_Area/m12_bayes_gamma_re.rds"),
+  fit_burned_area_model(lag_train_save, lag_test_save, preds_m12,
+                         method      = "bayes_gamma_re",
+                         sigma_beta  = 1,
+                         sigma_alpha = 5,
+                         chains      = 2))
+
+m12_bayes_gamma_re$coef_means$alpha_year
+```
+
+
+#
+# ── Compare ───────────────────────────────────────────────────────────────────
+#
+
+```{r}
+metrics <- compare_burned_models(
+  list(m1_lm, m1_bayes_ln, m1_bayes_g, m2_lm, m2_gamma, m2_bayes_ln, m2_bayes_g, #m1_gamma did not work
+       m3_lm, m3_bayes_ln, m3_bayes_g, m4_lm, m4_bayes_ln, m4_bayes_g,
+       m5_bayes_g, m6_bayes_g, m7_bayes_g, m8_bayes_g, m9_bayes_g, m10_bayes_g, m11_bayes_g, m12_bayes_g, m13_bayes_g, m14_bayes_g, m15_bayes_g, m16_bayes_g, m6_bayes_gamma_re, m16_bayes_gamma_re, m10_bayes_gamma_re, m12_bayes_gamma_re)
+)
+rownames(metrics) <- NULL
+
+write.csv(metrics,
+          file.path(performance_root, "burned_area_model_performance.csv"),
+          row.names = FALSE)
+#
+# ── LOO-CV comparison for Bayesian models ─────────────────────────────────────
+#
+loo_compare(m1_bayes_ln$loo, m1_bayes_g$loo)
+loo_compare(m2_bayes_ln$loo, m2_bayes_g$loo)
+loo_compare(m3_bayes_ln$loo, m3_bayes_g$loo)
+loo_compare(m4_bayes_ln$loo, m4_bayes_g$loo)
+
+loo_compare(m1_bayes_ln$loo, m1_bayes_g$loo, m2_bayes_ln$loo, m2_bayes_g$loo, m3_bayes_ln$loo, m3_bayes_g$loo, m4_bayes_ln$loo, m4_bayes_g$loo, m5_bayes_g$loo, m6_bayes_g$loo, m7_bayes_g$loo, m8_bayes_g$loo, m6_bayes_gamma_re$loo)
+```
+
+
+
+```{r}
+#better y-axis labels:
+metrics <- cbind(metrics, pred_summary=c(rep("climate+B",3), rep("climate", 4), rep("climate+B+road+urban+river", 3), rep("climate+B+road", 3), rep("cliamte+road", 1), rep("cliamte+road+urban", 1), rep("cliamte+road+urban+river", 1), rep("cliamte+urban", 1), rep("cliamte+urban+lag", 1), rep("cliamte+urban+binaryLag", 1), rep("cliamte+urban+binaryLag5", 1), rep("cliamte+urban+binaryLag10", 1), rep("cliamte+urban+binaryLag15", 1), rep("cliamte+urban+binaryLag20", 1), rep("cliamte+urban+binaryLag21", 1), rep("cliamte+urban+LagTotal", 1), rep("cliamte+road+urban", 1), rep("cliamte+road+urban+LagTotal", 1), rep("cliamte+road+urban+binaryLag", 1), rep("cliamte+road+urban+binaryLag10", 1)))
+```
+
+
+```{r}
+#metrics <- filter(metrics, method=="bayes_gamma")
+
+p_nrmse <- ggplot(data=metrics, aes(x=nrmse, y=pred_summary, color=method)) + geom_point(position = position_dodge(width = 0.6)) +
+    geom_errorbarh(aes(xmin = nrmse_low,
+                     xmax = nrmse_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = scales::label_wrap(20)) +
+  theme(legend.position  = "none")
+
+p_cor <- ggplot(data=metrics, aes(x=cor, y=pred_summary, color=method)) + geom_point(position = position_dodge(width = 0.6)) +
+    geom_errorbarh(aes(xmin = cor_low,
+                     xmax = cor_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = scales::label_wrap(20)) +
+  theme(legend.position  = "none")
+
+p_spearman <- ggplot(data=metrics, aes(x=spearman, y=pred_summary, color=method)) + geom_point(position = position_dodge(width = 0.6)) +
+    geom_errorbarh(aes(xmin = spear_low,
+                     xmax = spear_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = scales::label_wrap(20)) +
+  theme(legend.position  = "none")
+
+p_r2 <- ggplot(data=metrics, aes(x=r2, y=pred_summary, color=method)) + geom_point(position = position_dodge(width = 0.6)) +
+    geom_errorbarh(aes(xmin = r2_low,
+                     xmax = r2_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = scales::label_wrap(20)) +
+  theme(legend.position  = "none")
+
+p_mae <- ggplot(data=metrics, aes(x=mae, y=pred_summary, color=method)) + geom_point(position = position_dodge(width = 0.6)) +
+    geom_errorbarh(aes(xmin = mae_low,
+                     xmax = mae_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = scales::label_wrap(20)) +
+  theme(legend.position  = "none")
+
+p_log_cor <- ggplot(data=metrics, aes(x=log_cor, y=pred_summary, color=method)) + geom_point(position = position_dodge(width = 0.6)) +
+    geom_errorbarh(aes(xmin = log_cor_low,
+                     xmax = log_cor_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = scales::label_wrap(20)) +
+  theme(legend.position  = "none")
+
+legend_plot <- ggplot(data=metrics, aes(x=log_cor, y=pred_summary, color=method)) + geom_point()  +
+  theme(
+    legend.position   = "bottom",
+    legend.box        = "horizontal",
+    legend.title      = element_text(size = 10),
+    legend.text       = element_text(size = 9),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width  = unit(1.0, "cm"),
+    legend.spacing.x  = unit(2, "cm")
+  )
+
+shared_legend <- ggpubr::get_legend(legend_plot)
+
+blank_plot <- ggplot() + theme_void()
+
+fig_panels <- plot_grid(
+  p_nrmse, p_cor, p_spearman, p_r2, p_mae, p_log_cor,
+  ncol = 2,
+  align = "h"
+)
+
+plot_grid(
+  fig_panels,
+  shared_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.05)
+)
+
+```
+
+Best model: Gamma GLM with
+preds_final <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary")
+                 
+But, is this model better than random?                 
+Spearman correlation (0.375): Statistically meaningful — ranks fires better than random — but modest. The bootstrap CI (0.027, 0.621) is wide and barely excludes zero, meaning you can't confidently assert the model ranks fire sizes better than random in all samples of this size.
+Pearson correlation (0.219): The bootstrap CI (-0.023, 0.511) crosses zero. This means on the original km² scale, the model's linear relationship with observed burned area is not statistically distinguishable from random. This is largely driven by a few extreme large fire events dominating the variance.
+R² (-0.231): Negative R² means the model explains less variance than simply predicting the mean burned area for every observation. On the absolute scale, the model is worse than a no-predictor baseline.
+nRMSE (1.480): Greater than 1.0, meaning prediction errors exceed the observed mean burned area. A perfect model would be 0; a mean-only model would be approximately 1. Being above 1 means the model is adding noise relative to just predicting the mean.
+log_cor (0.475): This is the most encouraging metric — correlation on the log scale is moderate and the CI (0.175, 0.679) comfortably excludes zero. The model meaningfully ranks relative fire sizes when extreme values are dampened.
+MAE (817 km²): With burned area ranging from 0.25 to 4,604 km², an average error of 817 km² is large — roughly 18% of the maximum observed value.
+
+What the model can do:
+
+Distinguish relatively larger from relatively smaller fires on the log scale (log_cor = 0.475, CI excludes zero)
+Respond to climate and human proximity predictors in physically sensible directions
+Provide a quantitative framework for comparing fire severity across paleo time periods in relative terms
+
+What the model cannot do:
+
+Predict absolute burned area reliably (negative R², nRMSE > 1)
+Provide confident predictions for individual fire events (wide bootstrap CIs throughout)
+Distinguish fire size from random on the original km² scale (Pearson CI crosses zero)
+
+The core limitation is the 178-observation training set combined with the extreme variance in fire size. A single anomalous year like 2004 (which produced Alaska's largest recorded fire season) disproportionately influences the entire model. No statistical model can reliably learn from that level of variance at this sample size. The burned area model provides relative fire severity rankings across time periods rather than absolute burned area estimates. Instead of "the model predicts X km² burned in period Y", the true statement is "the model indicates conditions in period Y were conducive to relatively larger/smaller fires than period Z, based on the direction of climate and human proximity predictors."
+This framing is consistent with how the ignition model is used. ROC AUC measures ranking skill, not absolute probability accuracy. The burned area model's log_cor of 0.475 is the analogue: it shows meaningful but imperfect ranking skill.
+
+
+
+Look at the best model
+```{r}
+predictions <- m6_bayes_gamma_re$predictions
+
+print(summary(predictions[, c("burned_area_km2_total",
+                               "burned_area_pred",
+                               "pred_sd",
+                               "pred_low",
+                               "pred_high")]))
+
+coef_table <- m6_bayes_gamma_re$coef_table
+
+# Clean up for display — select key posterior summary columns
+coef_display <- coef_table |>
+  dplyr::select(variable, mean, sd,
+                `2.5%`, `25%`, `50%`, `75%`, `97.5%`) |>
+  mutate(across(where(is.numeric), ~ round(., 4)))
+
+print(coef_display)
+
+# write.csv(coef_display,
+#           file.path(predictions_root, "burned_area_coefficients.csv"),
+#           row.names = FALSE)
+
+coef_plot_df <- coef_display |>
+  filter(!variable %in% c("alpha", "phi")) |>
+  mutate(variable = factor(variable,
+                            levels = variable[order(mean)]))
+
+p_coef <- ggplot(coef_plot_df,
+                  aes(x = mean, y = variable)) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "grey50", linewidth = 0.5) +
+  geom_errorbarh(aes(xmin = `2.5%`, xmax = `97.5%`),
+                 height = 0.2, alpha = 0.5, linewidth = 0.5) +
+  geom_errorbarh(aes(xmin = `25%`, xmax = `75%`),
+                 height = 0, linewidth = 1.2) +
+  geom_point(size = 3, shape = 21,
+             fill = "white", color = "black", stroke = 0.8) +
+  labs(
+    title    = "Posterior coefficients — Bayesian Gamma burned area model",
+    subtitle = "Points = posterior mean | thick bars = 50% CI | thin bars = 95% CI",
+    x        = "Coefficient (log scale — multiplicative effect on burned area)",
+    y        = NULL
+  ) +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        panel.border = element_rect(color = "black", linewidth = 0.8))
+
+print(p_coef)
+# ggsave("burned_area_coefficients.png", p_coef,
+#        width = 7, height = 5, dpi = 300)
+
+
+```
+
+
+```{r}
+# Compute overall model metrics for annotation
+metrics <- m6_bayes_gamma_re$metrics
+
+p_obs_pred <- ggplot(predictions,
+                      aes(x = burned_area_pred,
+                          y = burned_area_km2_total)) +
+
+  # 1:1 perfect prediction line
+  geom_abline(intercept = 0, slope = 1,
+              linetype = "dashed", color = "grey50",
+              linewidth = 0.5) +
+
+  # Posterior uncertainty on predictions
+  geom_errorbarh(aes(xmin = pred_low, xmax = pred_high),
+                 height = 0, alpha = 0.3,
+                 linewidth = 0.4, color = "steelblue") +
+
+  # Points
+  geom_point(shape = 21, size = 2.5,
+             fill = "white", color = "black",
+             stroke = 0.7, alpha = 0.8) +
+
+  # Metrics annotation
+  annotate("text", x = -Inf, y = Inf,
+           label = sprintf(
+             "nRMSE = %.3f\nSpearman = %.3f\nlog r = %.3f\nMAE = %.0f km²",
+             metrics$nrmse, metrics$spearman,
+             metrics$log_cor, metrics$mae),
+           hjust = -0.1, vjust = 1.2,
+           size = 3, color = "grey30", family = "mono") +
+
+  scale_x_continuous(name = "Predicted burned area (km²)",
+                     limits = c(0, NA)) +
+  scale_y_continuous(name = "Observed burned area (km²)",
+                     limits = c(0, NA)) +
+
+  labs(
+    title    = "Observed vs predicted Random Effect Bayesian Gamma burned area",
+    subtitle = "Horizontal bars = 95% posterior predictive interval | dashed = 1:1 line"
+  ) +
+  theme_bw() +
+  theme(panel.grid   = element_blank(),
+        panel.border = element_rect(color = "black", linewidth = 0.8))
+
+print(p_obs_pred)
+
+#Log-scale version (often more informative for fire size data) ──────────
+
+p_obs_pred_log <- p_obs_pred +
+  scale_x_log10(name = "Predicted burned area (km², log scale)") +
+  scale_y_log10(name = "Observed burned area (km², log scale)") +
+  labs(title = "Observed vs predicted (log scale) Random Effect Bayesian Gamma burned area")
+
+print(p_obs_pred_log)
+ggsave("burned_area_obs_vs_pred_log.png", p_obs_pred_log,
+       width = 6, height = 5, dpi = 300)
+```
+
+
+
+Is it good enough for paleo applications?
+With appropriate framing:
+The model demonstrates strong discriminatory skill: Spearman 0.732 and log_cor 0.706 are good for a fire size model at this resolution and sample size. It correctly identifies which gridcell-months produced large vs small fires in relative terms, which is what matters for reconstructing the spatial and temporal pattern of fire severity across the Holocene.
+The absolute underprediction of extreme fires is less problematic for paleo applications than it would be for operational fire management. In the paleo context you're asking: "relative to the long-term mean, were fires larger or smaller during warm-dry periods?" The model can answer that question reliably. You're not trying to predict that a specific gridcell burned exactly 3,847 km² in a specific millennium.
+The year random effects should be set to zero for paleo predictions, which means the model will consistently predict values in the moderate-to-large range without the extreme tails. This is actually appropriate — it represents the expected fire size under a given climate state, averaged over the noise of any particular year's synoptic weather. The uncertainty in those predictions (captured by the posterior predictive intervals) is wide enough to encompass the observed range of fire sizes, which is ecologically honest.
+The framing in your methods and discussion should be: the model provides skillful reconstruction of relative fire severity across climate states (Spearman 0.732, log_cor 0.706) but underestimates the magnitude of extreme fire years, consistent with the known difficulty of predicting fire size at coarse spatial and temporal resolution. Absolute burned area estimates should be interpreted as climatological expectations rather than precise event predictions.
+That's a defensible and publishable position, and it's consistent with what comparable studies in the fire modeling literature report.

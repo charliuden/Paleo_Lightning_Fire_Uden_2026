@@ -1,0 +1,805 @@
+---
+title: "Fire_Probability"
+author: "Charlotte Uden"
+date: "2026-06-14"
+output: html_document
+---
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+##########################################
+#####       LIGHTNING    (r_strike)  #####
+##########################################
+
+r_strike ~ Gamma(alpha, beta)
+
+alpha = exp(a_alpha + b_alpha * X)
+
+beta = exp(a_beta + b_beta * X)
+
+a_alpha, b_alpha, a_beta, b_beta ~ Normal(0, 1)
+
+r_strike: lightning strikes / km2 / month
+X: temperature, precipitation, relative humidity, shortwave radiation, surface pressure
+
+exp(): ensures alpha and beta stay positive, which the gamma distribution requires. 
+
+```{r}
+lightning <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+head(lightning)
+hist(lightning$strikes)
+```
+
+Predict lightning strike rate for all gridcells and years
+```{r}
+#standardize:
+lightning_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_lightning_predictors.csv"))
+
+# Helper function: look up mu and sigma by variable name
+get_mu    <- function(var) lightning_mu_sigma$mu[lightning_mu_sigma$var == var]
+get_sigma <- function(var) lightning_mu_sigma$sigma[lightning_mu_sigma$var == var]
+
+lightning_scaled <- lightning |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    swr    = (swr    - get_mu("swr"))    / get_sigma("swr"),
+    sp     = (sp     - get_mu("sp"))     / get_sigma("sp"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh")
+  )
+
+#read in model
+#lightning_model <- readRDS(file.path(rds_root, "G13_gamma_glm_lightning.rds"))
+
+#make predictions
+# lightning_scaled <- lightning_scaled |>
+#   mutate(
+#     strikes_pred = predict(lightning_model,
+#                            newdata = lightning_scaled,
+#                            type    = "response")
+#   )
+
+# ── Load B12 Bayesian lightning model ─────────────────────────────────────────
+B12 <- readRDS(file.path(rds_root, "Lightning/B12_gamma_bayes.rds"))
+
+# ── Extract posterior samples ─────────────────────────────────────────────────
+posterior_samples <- as.data.frame(B12)
+
+# Generate predictions using posterior mean coefficients
+# B12 excludes wind — predictors: swr, tair, rh, precip, sp
+
+a_alpha_mean <- mean(posterior_samples$a_alpha)
+b_alpha_mean <- mean(posterior_samples$b_alpha)
+c_alpha_mean <- mean(posterior_samples$c_alpha)
+d_alpha_mean <- mean(posterior_samples$d_alpha)
+e_alpha_mean <- mean(posterior_samples$e_alpha)
+f_alpha_mean <- mean(posterior_samples$f_alpha)
+
+a_beta_mean  <- mean(posterior_samples$a_beta)
+b_beta_mean  <- mean(posterior_samples$b_beta)
+c_beta_mean  <- mean(posterior_samples$c_beta)
+d_beta_mean  <- mean(posterior_samples$d_beta)
+e_beta_mean  <- mean(posterior_samples$e_beta)
+f_beta_mean  <- mean(posterior_samples$f_beta)
+
+# Compute alpha and beta per observation using posterior means
+# Using vectorised operations rather than a loop for speed
+
+lp_alpha <- a_alpha_mean +
+            b_alpha_mean * lightning_scaled$swr   +
+            c_alpha_mean * lightning_scaled$tair  +
+            d_alpha_mean * lightning_scaled$rh    +
+            e_alpha_mean * lightning_scaled$precip +
+            f_alpha_mean * lightning_scaled$sp
+
+lp_beta  <- a_beta_mean  +
+            b_beta_mean  * lightning_scaled$swr   +
+            c_beta_mean  * lightning_scaled$tair  +
+            d_beta_mean  * lightning_scaled$rh    +
+            e_beta_mean  * lightning_scaled$precip +
+            f_beta_mean  * lightning_scaled$sp
+
+alpha_pred <- exp(lp_alpha)
+beta_pred  <- exp(lp_beta)
+
+set.seed(123)
+
+# Gamma alpha and beta
+# if you want the mean: alpha / beta
+lightning_scaled <- lightning_scaled |>
+  mutate(
+    gamma_alpha   = alpha_pred,
+    gamma_beta    = beta_pred,
+    #r_strike_mean  = alpha_pred / beta_pred   # posterior mean prediction
+    r_strike = rgamma(n(), shape = gamma_alpha, rate = gamma_beta)
+  )
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+cat("Predicted strike rate summary:\n")
+print(summary(lightning_scaled$r_strike))
+cat("Observed strike rate summary:\n")
+print(summary(lightning_scaled$strikes))
+
+lightning_scaled <- lightning_scaled[, c("lat", "lon", "year", "strikes", "r_strike")]
+```
+
+
+##########################################
+##### STRIKE COUNT       (n_strikes) #####
+##########################################
+
+n_strikes ~ NegBinomial(mu, theta)
+
+mu = r_strike * area
+
+theta = exp(gamma_0 + gamma * X)
+
+Gamma_0 ~ Normal(2,2)
+Gamma ~ Normal(0, sigma2)
+Sigma = 1 
+
+r_strike: strikes/km2/month
+area: gridcell area, km2
+n_strikes: number of strikes in a gridcell-month
+X: monthly climate predictors, temperature, precipitation, wind, relative humidity, shortwave radiation, surface pressure
+theta: Precision/dispersion parameter of the Negative Binomial distribution predicted from climate. Theta > 0.
+mu: mean lightning strike rate, strikes/gridcell/month. This is predicted from the Gamma model above and is the same for all summer months (June, July, August) in a year. The summer mean was used to ensure that mu > 0, which is required by the negative binomial distribution. 
+
+
+```{r}
+# ── Apply negative binomial model to fire dataframe ────────────────────────────────────────────────────
+
+#read in drivers
+df <- read.csv(file.path(drivers_root, "lightning_strike_count_climate_jja_2002_2011.csv"))
+
+#merge summer strike rate (strikes/km2/month) predictions, r_strike - months will be duplicated
+df <- df %>%
+  left_join(
+    lightning_scaled %>% dplyr::select(lat, lon, year, strikes, r_strike),
+    by = c("lat", "lon", "year")
+  )
+
+df <- na.omit(df)
+
+names(df)[names(df) == "strikes"] <- "r_strike_obs"
+names(df)[names(df) == "strike_count"] <- "n_strikes_obs"
+
+#Scale strike rate from strikes/km2/month to strikes/gridcell/month
+area <- read.csv("~/raid/cuden/data/paleo_fire/era5_grid_area.csv")
+
+df <- df %>%
+  left_join(
+    area %>% dplyr::select(lat, lon, area),
+    by = c("lat", "lon")
+  )
+
+#standardize:
+n_strike_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_lightning_count_predictors.csv"))
+
+# Helper function: look up mu and sigma by variable name
+get_mu    <- function(var) n_strike_mu_sigma$mu[n_strike_mu_sigma$var == var]
+get_sigma <- function(var) n_strike_mu_sigma$sigma[n_strike_mu_sigma$var == var]
+
+n_strike_scaled <- df |>
+  dplyr::select(lat, lon, year, month, r_strike_obs, n_strikes_obs, r_strike, area, precip, tair, wind, rh, swr, sp) |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh"),
+    swr     = (swr     - get_mu("swr"))     / get_sigma("swr"),
+    sp     = (sp     - get_mu("sp"))     / get_sigma("sp")
+  )
+
+#caluclate mu for the negative binomial distribution: r_strike * area = strikes/month/gridcell
+n_strike_scaled <- n_strike_scaled |>
+  mutate(mu_r_strike_gridcell = r_strike * area)
+
+#Predictors for theta (negative binomial parameter we need to sample strike count)
+theta_predictors <- c("swr", "tair", "rh", "precip", "sp", "wind")
+
+#read in model
+nb_model <- readRDS(file.path(rds_root, "Lightning/neg_bin_strike_count_small.rds"))
+
+#Posterior mean gamma coefficients
+gamma_0_mean <- nb_model$coef_means$gamma_0
+gamma_means  <- nb_model$coef_means$gamma
+
+#Build predictor matrix for full fire dataframe
+Z_fire <- model.matrix(
+  as.formula(paste("~", paste(theta_predictors, collapse = " + "), "- 1")),
+  data = n_strike_scaled   # must have same standardised predictors
+)
+
+#Compute posterior mean theta per gridcell-month
+log_theta_pred <- as.numeric(gamma_0_mean + Z_fire %*% gamma_means)
+theta_pred     <- exp(log_theta_pred)
+
+#sample strike count using mu=r_strike*area and theta
+n_strike_scaled <- n_strike_scaled |>
+  mutate(
+    nb_theta         = theta_pred,
+    log_mu_pred      = log(pmax(mu_r_strike_gridcell, 1e-8)),
+    n_strikes = rnbinom(n    = n(),
+                                 mu   = mu_r_strike_gridcell,
+                                 size = nb_theta)
+  )
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+cat("Observed zeros:    ", mean(n_strike_scaled$n_strikes_obs == 0), "\n")
+cat("Simulated zeros:   ", mean(n_strike_scaled$n_strikes == 0), "\n")
+cat("Observed mean:     ", mean(n_strike_scaled$n_strikes_obs), "\n")
+cat("Simulated mean:    ", mean(n_strike_scaled$n_strikes), "\n")
+cat("Observed count:     ", sum(n_strike_scaled$n_strikes_obs), "\n")
+cat("Simulated count:    ", sum(n_strike_scaled$n_strikes), "\n")
+cat("Observed variance: ", var(n_strike_scaled$n_strikes_obs), "\n")
+cat("Simulated variance:", var(n_strike_scaled$n_strikes), "\n")
+summary(n_strike_scaled$n_strikes)
+summary(n_strike_scaled$n_strikes_obs)
+hist(n_strike_scaled$n_strikes)
+hist(n_strike_scaled$n_strikes_obs)
+
+
+```
+Simulated counts come close to observations, capturing the zero outcomes well (zero strike make up 55% of observed outcomes and 64% of simulated outcomes). This issue comes with the model's ability to capture variance in strike counts (simulated var = 453, observed var = 22580). This is driving both a reduction in the simulated mean (8.99, while simulated is 4.94) and total count (1,192,293, while simulated is 654,492). 
+
+It this point, I feel pretty good with the lightning models. 
+
+
+Read in ingition efficiency and burned area predictors
+```{r}
+fire <- read.csv(file.path(drivers_root, "lightning_fires_burned_area_jja_2002_2011.csv"))
+
+fire <- fire |>
+  mutate(lat = round(lat, 2), lon = round(lon, 2)) |>
+  distinct(lat, lon, year, month, .keep_all = TRUE)
+```
+
+##########################################
+##### IGNITION EFFICINCY (p_ignite) #####
+##########################################
+
+Y ~ Binomial(n, p_ignite) --> technically, this is applied in the next step, to estimate fire count.
+
+logit(p_ignite) = alpha + X * beta
+
+alpha ~ normal(mu_alpha, sigma_alpha)
+beta  ~ normal(0, sigma_beta)
+
+p_ignite_corrected = plogis(qlogis(pie) + cal_shift)
+
+p_ignite: probability of 1 strike resulting in an ignition in a given gridcell and month. 
+X: average precipitation rate, temperature, relative humidity, cumulative precipitation for the previous 1, 2, 3 months, and 5 years, mean temperature for the previous 1, 2, 3 months, and 5 years, and % broadleaf cover. 
+
+
+```{r}
+#standardize:
+ignition_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_ignition_predictors.csv"))
+
+# Helper function: look up mu and sigma by variable name
+get_mu    <- function(var) ignition_mu_sigma$mu[ignition_mu_sigma$var == var]
+get_sigma <- function(var) ignition_mu_sigma$sigma[ignition_mu_sigma$var == var]
+
+ignition_scaled <- fire |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh"),
+    precip_1m = (precip_1m - get_mu("precip_1m")) / get_sigma("precip_1m"),
+    precip_2m   = (precip_2m   - get_mu("precip_2m"))   / get_sigma("precip_2m"),
+    precip_3m   = (precip_3m   - get_mu("precip_3m"))   / get_sigma("precip_3m"),
+    precip_5y     = (precip_5y     - get_mu("precip_5y"))     / get_sigma("precip_5y"),
+    tair_1m = (tair_1m - get_mu("tair_1m")) / get_sigma("tair_1m"),
+    tair_2m   = (tair_2m   - get_mu("tair_2m"))   / get_sigma("tair_2m"),
+    tair_3m   = (tair_3m   - get_mu("tair_3m"))   / get_sigma("tair_3m"),
+    tair_5y     = (tair_5y     - get_mu("tair_5y"))     / get_sigma("tair_5y"),
+    B     = (B     - get_mu("B"))     / get_sigma("B")
+  )
+
+#Bayes recalibrated
+# ── Load calibrated Bayesian model ────────────────────────────────────────────
+ignition_bayes_obj <- readRDS(file.path(rds_root, 
+                                         "Ignition_Efficiency/m2_bayes_calibrated.rds"))
+ignition_bayes_fit <- ignition_bayes_obj$fit        # stanfit object
+cal_shift_bayes    <- ignition_bayes_obj$cal_shift  # intercept shift
+coef_means         <- ignition_bayes_obj$coef_means # posterior mean alpha and beta
+
+cat("Bayesian calibration shift:", round(cal_shift_bayes, 3), "\n")
+
+# ── Build predictor matrix from standardised data ─────────────────────────────
+predictors_m2 <- c("rh", "tair", "precip",
+                    "precip_1m", "precip_2m", "precip_3m",
+                    "precip_5y", "tair_1m", "tair_2m",
+                    "tair_3m", "tair_5y", "B")
+
+X_new <- model.matrix(
+  as.formula(paste("~", paste(predictors_m2, collapse = " + "), "- 1")),
+  data = ignition_scaled
+)
+
+# ── Generate predictions using posterior mean ─────────────────────────────────
+alpha_mean <- coef_means$alpha
+beta_means <- coef_means$beta
+
+eps <- 1e-8
+
+linpred <- as.numeric(alpha_mean + X_new %*% beta_means)
+
+ignition_scaled <- ignition_scaled |>
+  mutate(
+    #inverse_logit of linear predictor, linpred
+    p_ignite_bayes     = plogis(linpred),
+    #add calibration shift 
+    p_ignite_bayes_cal = plogis(pmin(pmax(linpred + cal_shift_bayes,     #pmin and pmax make sure arguments in plogis from reaching infinity
+                                           log(eps / (1 - eps))),
+                                      log((1 - eps) / eps)))
+  )
+
+# Note: adding cal_shift directly to the linear predictor (before plogis)
+# is equivalent to plogis(qlogis(p) + cal_shift) but avoids the
+# double transformation and is numerically more stable
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+cat("Raw Bayes p_ignite summary:\n")
+print(summary(ignition_scaled$p_ignite_bayes))
+
+cat("Calibrated Bayes p_ignite summary:\n")
+print(summary(ignition_scaled$p_ignite_bayes_cal))
+
+ignition_scaled <- ignition_scaled[, c("lat", "lon", "year", "month",
+                          "fire_count", "strike_count",
+                          "p_ignite_bayes_cal")]
+
+ignition_scaled <- ignition_scaled %>% dplyr::rename(p_ignite = p_ignite_bayes_cal)
+
+#add monthly ignition probability, p_ignite, to fire df
+fire <- fire %>%
+  left_join(
+    ignition_scaled %>% dplyr::select(lat, lon, year, month, p_ignite),
+    by = c("lat", "lon", "year", "month"))
+
+```
+
+
+##### RATE CALIBRATION SHIFT FOR P_IGNITE ##### 
+
+```{r}
+
+rate_cal_shift <- readRDS(file.path(rds_root, "Ignition_Efficiency/calibration_shifts.rds"))$rate_cal_shift
+
+eps <- 1e-8
+
+fire <- fire |>
+  mutate(
+    p_ignite_rate_cal = plogis(
+      qlogis(pmin(pmax(p_ignite, eps), 1 - eps)) + rate_cal_shift
+    )
+  )
+
+# Dannual rates now match observed
+fire |>
+  filter(strike_count > 0) |>
+  group_by(year) |>
+  summarise(
+    obs_rate           = sum(fire_count) / sum(strike_count),
+    pred_binary_cal    = mean(p_ignite),
+    pred_rate_cal      = mean(p_ignite_rate_cal),
+    .groups            = "drop"
+  )
+
+#loook at expected fire count
+cat("Expected fires (binary cal):  ",
+    sum(fire$strike_count * fire$p_ignite, na.rm = TRUE), "\n")
+cat("Expected fires (rate cal):    ",
+    sum(fire$strike_count * fire$p_ignite_rate_cal,  na.rm = TRUE), "\n")
+cat("Observed fires:               ",
+    sum(fire$lightning_ignition), "\n")
+```
+
+
+##########################################
+#####     BURNED AREA | 1 ignition  #####
+##########################################
+
+Burned_area ~ Gamma(theta, theta/mu)
+
+log(mu) = alpha + alpha_year + X * beta
+
+alpha ~ Normal(0, sigma^2_alpha)
+beta ~ Normal(0, sigma^2_beta)
+theta ~ Exponential(1)
+alpha_year ~ Normal(0, sigma^2_year)
+sigma^2_year ~ Exponential(1)
+
+
+Burned_area: area of 1 lightning-caused ignition (km2)
+X: Relative humidity, temperature, precipitation, wind, cumulative precipitation for the previous 1, 3 months, and 5 years, mean temperature for the previous 2 months and 5 years, proximity to urban area (binary; 1 = within 40 km of an urban area), proximity to road (binary; 1 = within 40 km of an major road)
+alpha_year: year random affect
+
+Apply model
+```{r}
+#standardize:
+burned_area_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_burned_area_predictors.csv"))
+
+# Helper function: look up mu and sigma by variable name
+get_mu    <- function(var) burned_area_mu_sigma$mu[burned_area_mu_sigma$var == var]
+get_sigma <- function(var) burned_area_mu_sigma$sigma[burned_area_mu_sigma$var == var]
+
+burned_area_scaled <- fire |>
+  mutate(
+    rh        = (rh        - get_mu("rh"))        / get_sigma("rh"),
+    tair      = (tair      - get_mu("tair"))      / get_sigma("tair"),
+    precip    = (precip    - get_mu("precip"))    / get_sigma("precip"),
+    wind      = (wind      - get_mu("wind"))      / get_sigma("wind"),
+    precip_1m = (precip_1m - get_mu("precip_1m")) / get_sigma("precip_1m"),
+    precip_3m = (precip_3m - get_mu("precip_3m")) / get_sigma("precip_3m"),
+    precip_5y = (precip_5y - get_mu("precip_5y")) / get_sigma("precip_5y"),
+    tair_2m   = (tair_2m   - get_mu("tair_2m"))   / get_sigma("tair_2m"),
+    tair_5y   = (tair_5y   - get_mu("tair_5y"))   / get_sigma("tair_5y")
+  ) #no scaling for binary urban and road data.
+
+#read in binary distance data:
+proximity <- read.csv(file.path(proximity_data_root, "era5_proximity_road_river_urban.csv"))
+proximity <- dplyr::select(proximity, lon, lat, road_proximity_binary, urban_proximity_binary)
+#check:
+# ggplot() +
+#   geom_point(data = proximity |> distinct(lat, lon),
+#              aes(x = lon, y = lat),
+#              color = "grey70", size = 0.8, alpha = 0.5) 
+
+# Round to 2 decimal places in both dataframes
+burned_area_scaled <- burned_area_scaled |>
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+proximity <- proximity |>
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+#merge by lat lon
+burned_area_scaled <- burned_area_scaled |>
+  left_join(
+    proximity |> dplyr::select(lat, lon, 
+                                road_proximity_binary, 
+                                urban_proximity_binary),
+    by = c("lat", "lon")
+  )
+
+
+preds_final <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary")
+
+
+
+# ── Load model and extract posterior parameters ───────────────────────────────
+m6_obj     <- readRDS(file.path(rds_root, "Burned_Area/m6_bayes_gamma_re.rds"))
+m6_fit     <- m6_obj$fit           # stanfit object
+coef_means <- m6_obj$coef_means    # list: alpha, beta, alpha_year
+
+alpha_mean <- coef_means$alpha
+beta_means <- coef_means$beta
+
+cat("Global intercept (alpha):", round(alpha_mean, 3), "\n")
+cat("Year random effects:\n")
+print(round(coef_means$alpha_year, 3))
+
+# ── Build predictor matrix ────────────────────────────────────────────────────
+X_new <- model.matrix(
+  as.formula(paste("~", paste(preds_final, collapse = " + "), "- 1")),
+  data = burned_area_scaled
+)
+
+# ── Generate predictions ──────────────────────────────────────────────────────
+# Year random effects set to ZERO for new data (paleo or ERA5 application)
+# This represents "climatologically average year" — variation comes from
+# climate predictors only, not year-specific synoptic noise
+
+# ── Option A: posterior mean prediction (fast, point estimate) ────────────────
+linpred <- as.numeric(alpha_mean + X_new %*% beta_means)
+# alpha_year term is omitted — equivalent to setting it to 0
+
+burned_area_scaled <- burned_area_scaled |>
+  mutate(burned_area_pred = exp(linpred))
+
+# Extract posterior draws
+post <- rstan::extract(m6_fit)
+
+# ── Extract shape parameter (phi) from posterior ───────────────────────────────
+phi_mean <- mean(post$phi)
+phi_sd   <- sd(post$phi)
+
+cat("Gamma shape (phi) posterior mean:", round(phi_mean, 3), "\n")
+cat("Gamma shape (phi) posterior sd:  ", round(phi_sd, 3), "\n")
+
+# ── Add gamma_mean and gamma_shape columns to burned_area_scaled ──────────────
+burned_area_scaled <- burned_area_scaled |>
+  mutate(
+    gamma_mean  = burned_area_pred,   # mean (mu) per gridcell-month
+    gamma_shape = phi_mean             # shape (phi) — constant across rows
+  )
+
+# rgamma requires rate, not the mean. calculate this as:
+# rgamma(n, shape, rate) where rate = shape / mean
+burned_area_scaled$gamma_rate <- burned_area_scaled$gamma_shape / burned_area_scaled$gamma_mean
+
+```
+
+##########################################
+#####         STRIKE COUNT         #######
+##########################################
+
+strike_count = Poisson(r_strike * area)
+
+```{r}
+# #merge summer strike rate (strikes/km2/month) predictions - months will be duplicated
+# fire <- fire %>%
+#   left_join(
+#     lightning_scaled %>% dplyr::select(lat, lon, year, strikes, r_strike),
+#     by = c("lat", "lon", "year")
+#   )
+# 
+# #Scale strike rate from strikes/km2/month to strikes/gridcell/month
+# area <- read.csv("~/raid/cuden/data/paleo_fire/era5_grid_area.csv")
+# 
+# fire <- fire %>%
+#   left_join(
+#     area %>% dplyr::select(lat, lon, area),
+#     by = c("lat", "lon")
+#   )
+# 
+# #calculate grudcell-level striike rate (strikes/gridcell/month) and use as lambda in poisson distrubution to get strike count
+# set.seed(123) 
+# #simulated count from predicted rate
+# fire$strike_count_pred <- sapply(fire$r_strike * fire$area, function(lam) rpois(1, lambda = lam))
+# #simulated count from observed rate
+# fire$strike_count_test <- sapply(fire$strikes * fire$area, function(lam) rpois(1, lambda = lam))
+
+```
+
+##########################################
+#####         FIRE COUNT         #########
+##########################################
+
+fire_count | lightning = Binomial(n_strikes, p_ignite)
+
+```{r}
+
+#add monthly strike count, n_strikes, to fire df
+fire <- fire %>%
+  left_join(
+    n_strike_scaled %>% dplyr::select(lat, lon, year, month, r_strike_obs, n_strikes_obs, r_strike, n_strikes),
+    by = c("lat", "lon", "year", "month"))
+
+#adjust p_ignite
+#fire <- fire %>% mutate(p_ignite = p_ignite/10)
+
+#Use strike_count and p_ingite to sample fire count from a binomial distribution
+fire$fire_count_pred <- mapply(
+  function(n, p) rbinom(1, size = n, prob = p),
+  fire$n_strikes,
+  fire$p_ignite_rate_cal
+)   
+
+#Use OBSERVED strike_count and ignition rate (fires/strikes);  to sample fire count from a binomial distribution
+
+#caluclate ignintion frequency from obs fires/strikes, if strieks == 0, p_ignite_test==0. 
+fire$p_ignite_test <- mapply(
+  function(n_fires, n_strikes) {
+    if (is.na(n_fires) || is.na(n_strikes) || n_strikes == 0) return(0L)
+    n_fires/n_strikes
+  },
+  fire$fire_count,
+  fire$n_strikes_obs
+)
+  
+#simulate fire count
+fire$fire_count_test <- mapply(
+  function(n, p) {
+    if (is.na(n) || is.na(p) || n == 0) return(0L)
+    p_safe <- pmin(pmax(p, 0), 1)   # clip to [0,1] as safety guard
+    rbinom(1, size = n, prob = p_safe)
+  },
+  fire$n_strikes_obs,
+  fire$p_ignite_test
+)
+  
+```
+
+#####################################
+######### TOTAL BURNED AREA #########
+#####################################
+
+total_burned = rgamma(fire_count, burned_area_shape, burned_area_rate)
+
+```{r}
+#add monthly burned area gamma parameters to fire df
+fire <- fire %>%
+  left_join(
+    burned_area_scaled %>% dplyr::select(lat, lon, year, month, gamma_shape, gamma_rate),
+    by = c("lat", "lon", "year", "month")
+  )
+
+#Use fire_count and burned area shape and rate estimates to simulate total burned area from the gamma distribution
+fire$total_burned_area <- mapply(
+  function(fire_count, BA_shape, BA_rate) {
+    if (fire_count == 0 || is.na(fire_count)) return(0)
+    sum(rgamma(n = fire_count, shape = BA_shape, rate = BA_rate))
+  },
+  fire$fire_count_pred,
+  fire$gamma_shape,
+  fire$gamma_rate
+)
+
+#Use observed fire_count and predicted burned area shape and rate estimates to simulate total burned area from the gamma distribution
+fire$total_burned_area_test <- mapply(
+  function(fire_count, BA_shape, BA_rate) {
+    if (fire_count == 0 || is.na(fire_count)) return(0)
+    sum(rgamma(n = fire_count, shape = BA_shape, rate = BA_rate))
+  },
+  fire$fire_count_test,
+  fire$gamma_shape,
+  fire$gamma_rate
+)
+
+```
+
+Quick comparison between observed and predicted 10 year summaries
+
+```{r}
+pred_r_strike <- mean(fire$r_strike)
+obs_r_strike <- mean(fire$r_strike_obs)
+
+pred_strike_count <- sum(fire$n_strikes)
+obs_strike_count <- sum(fire$n_strikes_obs)
+
+pred_p_ignite <- mean(fire$p_ignite_rate_cal)
+sim_obs_p_ignite <- mean(fire$p_ignite_test)
+
+pred_fire_count <- sum(fire$fire_count_pred)
+obs_fire_count <- sum(fire$fire_count)
+
+pred_burned_area <- sum(fire$total_burned_area)
+sim_obs_burned_area <- sum(fire$total_burned_area_test)
+obs_burned_area <- sum(fire$burned_area_km2)
+
+summary_table <- as.data.frame(matrix(c(pred_r_strike, obs_r_strike, NA, pred_strike_count, NA, obs_strike_count, pred_p_ignite, sim_obs_p_ignite, NA, pred_fire_count, NA, obs_fire_count, pred_burned_area, sim_obs_burned_area, obs_burned_area), ncol=3, byrow=TRUE))
+
+colnames(summary_table) <- c("predicted", "sim_from_obs", "observed")
+
+summary_table <- cbind(model_outpit = c("strike_rate", "strike_count", "p_ignite", "fire_count", "total_burned_area"), summary_table)
+
+summary_table_fmt <- summary_table |>
+  mutate(across(where(is.numeric), ~ formatC(., format = "f", digits = 4, big.mark = ",")))
+
+print(summary_table_fmt)
+
+```
+
+Export Drivers and Predictions
+```{r}
+# df_out <- fire |> dplyr::select(lat,lon,year,month,
+#                                 rh,tair,precip,wind,precip_1m,precip_2m,precip_3m,precip_5y,tair_1m,tair_2m,tair_3m,tair_5y,C,B,U, fire_count, burned_area_km2, lightning_ignition, dist_road, dist_river, dist_urban, 
+#                                 total_ignition_count, single_lightning_ignition, burned_area_km2_total, p_ignite, p_ignite_rate_cal, r_strike_obs, n_strikes_obs, r_strike, n_strikes, fire_count_pred, p_ignite_test, fire_count_test, gamma_shape, gamma_rate, total_burned_area, total_burned_area_test)
+
+df_out <- fire |> dplyr::select(lat,lon,year,month,
+                                r_strike_obs, n_strikes_obs, burned_area_km2, lightning_ignition, total_ignition_count, fire_count, single_lightning_ignition, burned_area_km2_total, 
+                                r_strike, n_strikes, p_ignite, p_ignite_rate_cal, fire_count_pred, gamma_shape, gamma_rate, total_burned_area)
+
+
+write.csv(df_out, file.path(predictions_root, "predictions_2002_2011.csv"))
+
+
+```
+
+
+
+
+
+
+
+
+July 3rd
+- check gamma sampling for burned area. - is it using fire count as size correctly?
+- same for fire count sampling using p_ignite and strike_count. 
+- Why does sampling from poisson not work?? what does this plot tell us??
+```{r}
+plot(fire$strike_count_pred, fire$r_strike)
+plot(fire$strike_count, fire$strikes)
+plot(fire$strike_count_test, fire$strikes)
+plot(fire$strike_count, fire$strike_count_test)
+
+hist(fire$r_strike)
+hist(fire$strikes)
+
+hist(fire$strike_count_pred)
+hist(fire$strike_count_test)
+hist(fire$strike_count)
+
+```
+
+
+
+JULY 1
+
+LIGHTNING 
+
+mean strike rates are similar between observed and predicted. Issue arises when counts are sampled from the poisson distribution. Could it be an issue with tails - moments when strike rates are exceptionally high are not being captured by the gamma GLM - could the gamma Bayesian approach handle this better?
+
+IGNITION
+Predictions are too high, by an order of magnitude! 
+
+FIRE
+Best fire count: simulated from fire count (strikes * p_ignite) and conditioned on p_fire (rbinom(p_fire)==1)
+However, multiplying the mean observed strike count (8.989618 strikes per gridcell) by mean observed ignition rate (0.00023 ignitions/strikes) gets very close to the observed fire count (273, whereas actual fire count is 265)
+
+BURNED AREA
+Best burned area: simulated from fire count (strikes * P_ignite)
+
+Keep:
+strike count in a gridcell * p_ignite 
+
+- or try sampling form binomial distribution: 
+n_fires = rbinom(strike_count, ignition_efficiency)
+then:
+total burned area = sum(rgamma(n_fires, shape = gamma_shape, rate  = gamma_shape / gamma_mean))
+
+gamma_shape and gamma_mean are estimated by the burned area model. 
+
+What about strike rate? Is the model picking up tails
+
+Since the lightning model doesn't capture the tails, strike counts sampled from poisson have very small tail. 
+The model captures the mean well, but not gridcell/months when climate results in extreme lightning events. Max predicted fire count is > 60, while observed max count is > 20,000.
+
+
+
+

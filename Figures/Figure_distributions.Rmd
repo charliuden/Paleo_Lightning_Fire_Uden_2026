@@ -1,0 +1,401 @@
+---
+title: "Figure_distributions"
+output: html_document
+---
+
+Figure X. Comparison of observed and predicted distributions for each fire sub-model component. (a) Lightning strike rate (strikes/km²/month), (b) strike count (strikes/gridcell/month), (c) ignition probability, (d) fire count (fires/gridcell/month), and (e) burned area (km²/gridcell/month). Gold indicates observed values; red indicates model-predicted values.
+
+For continuous variables (a, c, e), distributions are shown as boundary-corrected kernel density estimates (Gaussian kernel, bandwidth adjusted by a smoothing factor of 1.5×, constrained to the physically valid range of ≥0 to prevent density from being estimated at impossible negative values). Because each variable is strongly right-skewed, with the majority of observations concentrated near zero and a small number of extreme values extending the range by several orders of magnitude, the x-axis in panels (a), (c), and (e) is broken into two segments: a left panel showing the region containing the bulk of the distribution, and a right panel showing a narrow window near the maximum observed value, allowing both the primary mode and the extent of the tail to be visualized simultaneously without one obscuring the other. The break point for burned area (e) was set manually at 100–4400 km² to align with the extent of the observed data; break points for (a) and (c) were determined by percentile thresholds of the pooled observed and predicted values.
+
+For discrete count variables (b, d), which are dominated by zero- or near-zero-inflation (the majority of gridcell-months have no lightning strikes or no fires), distributions are instead shown as frequency bar charts rather than kernel density estimates, since a continuous density is not an appropriate representation for sparse discrete counts. Strike counts (b) are grouped into log-spaced bins to accommodate their wide dynamic range (0–25,549 strikes/gridcell/month); fire counts (d) are shown at each discrete observed value (0–3 fires/gridcell/month), with bar labels indicating exact frequency (abbreviated using K/M suffixes for readability). In both (b) and (d), the y-axis is presented on a log10 scale to allow rare but nonzero categories to remain visible alongside the dominant zero-count category; axis labels display true (back-transformed) frequency values rather than log-transformed exponents. Bins or categories with zero observations for either observed or predicted data are omitted rather than shown as zero-height bars, since a bar height of zero cannot be represented on a logarithmic scale.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(geodata)
+library(terra)
+library(scales)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+
+```{r}
+df <- read.csv(file.path(predictions_root, "predictions_2002_2011.csv"))
+```
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(scales)
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+compare_distributions <- function(observed,
+                                   predicted,
+                                   plot_title = "",
+                                   x_label = "Value",
+                                   obs_color = "gold",
+                                   pred_color = "red",
+                                   obs_label = "Observed",
+                                   pred_label = "Predicted",
+                                   cut_axis = FALSE,
+                                   cut_start_percentile = 0.95,
+                                   cut_start_val = NULL,
+                                   cut_end_val = NULL,
+                                   cut_end_pad_frac = 0.02,
+                                   width_ratio = c(3, 1),
+                                   log_y = FALSE,
+                                   y_floor = 1e-4,
+                                   smooth_adjust = 1.5,
+                                   lower_bound = 0) {
+
+  plot_data <- dplyr::bind_rows(
+    data.frame(value = observed, source = obs_label),
+    data.frame(value = predicted, source = pred_label)
+  )
+  plot_data$source <- factor(plot_data$source, levels = c(obs_label, pred_label))
+
+  color_values <- setNames(c(obs_color, pred_color), c(obs_label, pred_label))
+  line_values  <- setNames(c("solid", "dashed"), c(obs_label, pred_label))
+
+  build_panel <- function(xlim, show_y_axis = TRUE, xlab = x_label) {
+    xlim_bounded <- c(max(xlim[1], lower_bound), xlim[2])
+
+    p <- ggplot(plot_data, aes(x = value, color = source, linetype = source)) +
+      geom_density(alpha = 0.4, linewidth = 0.8, na.rm = TRUE,
+                   adjust = smooth_adjust, bounds = c(lower_bound, Inf)) +
+      scale_linetype_manual(values = line_values, name = NULL) +
+      scale_color_manual(values = color_values, name = NULL) +
+      coord_cartesian(xlim = xlim_bounded, expand = FALSE) +
+      labs(x = xlab, y = if (show_y_axis) "Density" else NULL) +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(size = 13, hjust = 0),
+        axis.title.x = element_text(size = 11),
+        axis.title.y = element_text(size = 11, margin = margin(r = 10)),
+        axis.text.y = element_text(size = 11),
+        axis.text.x = element_text(size = 11, angle = 45, hjust = 1),
+        legend.text = element_text(size = 9),
+        legend.position = "none",
+        panel.grid.major = element_line(color = "darkgray", linewidth = 0.2),
+        panel.grid.minor = element_line(color = "darkgray", linewidth = 0.2),
+        panel.background = element_rect(fill = "white", color = NA),   
+        plot.background  = element_rect(fill = "white", color = NA)
+      )
+
+    if (!show_y_axis) {
+      p <- p + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+    }
+    if (log_y) {
+      p <- p + scale_y_log10(labels = scales::label_number(),
+                              limits = c(y_floor, NA), oob = scales::squish)
+    }
+    p
+  }
+
+  if (!cut_axis) {
+    p <- build_panel(xlim = range(plot_data$value, na.rm = TRUE)) +
+      ggtitle(plot_title)
+    return(p)
+  }
+
+  rng <- range(plot_data$value, na.rm = TRUE)
+  cut_start <- cut_start_val %||% as.numeric(quantile(plot_data$value, cut_start_percentile, na.rm = TRUE))
+  cut_end   <- cut_end_val   %||% (rng[2] - cut_end_pad_frac * diff(rng))
+
+  if (cut_start >= cut_end) {
+    warning("cut_start >= cut_end -- axis break would be invalid; returning unsplit plot instead.")
+    return(build_panel(xlim = rng) + ggtitle(plot_title))
+  }
+
+  p_left  <- build_panel(xlim = c(rng[1], cut_start), show_y_axis = TRUE)
+  p_right <- build_panel(xlim = c(cut_end, rng[2]),   show_y_axis = FALSE, xlab = "")
+
+  combined <- (p_left + p_right) +
+    plot_layout(widths = width_ratio, guides = "collect") +
+    plot_annotation(
+      title = plot_title,
+      theme = theme(plot.title = element_text(size = 13, hjust = 0))
+    ) &
+    theme(legend.position = "none")
+
+  combined
+}
+```
+
+```{r}
+r_strike_dist <- compare_distributions(
+  observed   = df$r_strike_obs,
+  predicted  = df$r_strike,
+  plot_title = "(a)",
+  x_label    = "Strike rate (strikes/km2/month)",
+  cut_axis   = TRUE,
+  log_y      = FALSE
+)
+r_strike_dist
+
+n_strikes_dist <- compare_distributions(
+  observed   = as.numeric(df$n_strikes),
+  predicted  = as.numeric(df$n_strikes_obs),
+  plot_title = "(b)",
+  x_label    = "Strike count (strikes/gridcell/month)",
+  cut_axis   = TRUE,
+  log_y      = FALSE
+)
+n_strikes_dist
+
+# Define log-spaced bin edges based on the strike count data's range
+bin_edges <- c(0, 1, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 26000)
+
+abbreviate_n <- function(x) {
+  ifelse(
+    is.na(x), NA_character_,
+    ifelse(x >= 1e6, paste0(round(x / 1e6, 1), "M"),
+    ifelse(x >= 1e3, paste0(round(x / 1e3, 1), "K"),
+           as.character(x)))
+  )
+}
+
+bin_labels <- paste0(
+  abbreviate_n(bin_edges[-length(bin_edges)]),
+  "-",
+  abbreviate_n(bin_edges[-1])
+)
+
+bin_data <- dplyr::bind_rows(
+  data.frame(value = df$n_strikes_obs, source = "Observed"),
+  data.frame(value = df$n_strikes, source = "Predicted")
+) %>%
+  mutate(
+    bin = cut(value, breaks = bin_edges, labels = bin_labels,
+               include.lowest = TRUE, right = FALSE)
+  )
+
+count_data <- bin_data %>%
+  count(source, bin, .drop = FALSE) %>%    # .drop = FALSE keeps empty bin levels
+  complete(source, bin, fill = list(n = 0)) %>%
+  group_by(source) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(n_plot = ifelse(n == 0, NA, n))
+
+pd <- position_dodge(width = 0.9) 
+
+n_strikes_dist <- ggplot(count_data, aes(x = bin, y = n_plot, fill = source)) +
+  geom_col(position = pd, alpha = 0.6, width = 0.6, na.rm = TRUE) + 
+  scale_y_log10(
+    breaks = scales::log_breaks(n = 5),   # more breaks than the default
+    labels = scales::label_number(),
+    expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Strike count (strikes/gridcell/month)", y = "Frequency (log scale)", title = "(b)") +
+  scale_fill_manual(values = c("Observed" = "gold", "Predicted" = "red"), name = NULL) +
+  theme_minimal()  +
+  theme(                    
+      plot.title = element_text(size = 13, hjust = 0),
+      axis.title.x = element_text(size = 11),
+      axis.title.y = element_text(size = 11, margin = margin(r = 10)),
+      axis.text.y = element_text(size = 11),
+      axis.text.x = element_text(size = 11, angle = 45, hjust = 1),
+      legend.text = element_text(size = 9),
+      legend.position = "none",
+      panel.grid.major = element_line(color = "darkgray", linewidth = 0.2),
+      panel.grid.minor = element_line(color = "darkgray", linewidth = 0.2),
+      panel.background = element_rect(fill = "white", color = NA),   
+      plot.background  = element_rect(fill = "white", color = NA))
+
+n_strikes_dist
+```
+
+
+```{r}
+p_ignite_dist <- compare_distributions(
+  observed   = df$p_ignite,
+  predicted  = filter(df, n_strikes_obs > 0)$fire_count / filter(df, n_strikes_obs > 0)$n_strikes_obs,
+  plot_title = "(c)",
+  x_label    = "Ignition probability",
+  cut_axis   = TRUE,
+  log_y      = FALSE
+)
+p_ignite_dist
+
+n_fires_dist <- compare_distributions(
+  observed   = df$fire_count_pred,
+  predicted  = df$fire_count,
+  plot_title = "(d)",
+  x_label    = "Fire count (fires/gridcell/month)",
+  cut_axis   = FALSE,
+  log_y      = TRUE
+)
+n_fires_dist
+
+count_data <- dplyr::bind_rows(
+  data.frame(value = df$fire_count_pred, source = "Observed"),
+  data.frame(value = df$fire_count, source = "Predicted")
+) %>%
+  count(source, value) %>%
+  complete(source, value, fill = list(n = 0)) %>%
+  group_by(source) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+count_data <- count_data %>%
+  mutate(n_plot = ifelse(n == 0, NA, n))
+
+pd <- position_dodge(width = 0.9) 
+
+abbreviate_n <- function(x) {
+  ifelse(
+    is.na(x), NA_character_,
+    ifelse(x >= 1e6, paste0(round(x / 1e6, 1), "M"),
+    ifelse(x >= 1e3, paste0(round(x / 1e3, 1), "K"),
+           as.character(x)))
+  )
+}
+
+n_fires_dist <- ggplot(count_data, aes(x = factor(value), y = n_plot, fill = source)) +
+  geom_col(position = pd, alpha = 0.6, width = 0.6, na.rm = TRUE) + 
+ geom_text(
+    aes(label = abbreviate_n(n), y = n_plot),
+    position = pd,
+    vjust = -0.5,        # nudge label above the bar top
+    size = 3.5,
+    na.rm = TRUE
+  ) + 
+  scale_y_log10(
+    breaks = scales::log_breaks(n = 5),   # more breaks than the default
+    labels = scales::label_number(),
+    expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Fire count (fires/gridcell/month)", y = "Frequency (log scale)", title = "(d)") +
+  scale_fill_manual(values = c("Observed" = "gold", "Predicted" = "red"), name = NULL) +
+  theme_minimal() +
+  theme(                    
+      plot.title = element_text(size = 13, hjust = 0),
+      axis.title.x = element_text(size = 11),
+      axis.title.y = element_text(size = 11, margin = margin(r = 10)),
+      axis.text.y = element_text(size = 11),
+      axis.text.x = element_text(size = 11, hjust = 1),
+      legend.text = element_text(size = 9),
+      legend.position = "none",
+      panel.grid.major = element_line(color = "darkgray", linewidth = 0.2),
+      panel.grid.minor = element_line(color = "darkgray", linewidth = 0.2),
+      panel.background = element_rect(fill = "white", color = NA),   
+      plot.background  = element_rect(fill = "white", color = NA))
+
+n_fires_dist
+#scale_y_log10() transforms the underlying axis so that positions are spaced logarithmically
+#equal visual distances represent equal multiplicative jumps rather than equal additive ones. 
+#labels = scales::label_number() assigns labels that match true values. 
+
+# Your burned area example: ~0-4500 km2, cut from ~100 to ~4400
+burned_area_dist <- compare_distributions(
+  observed   = df$total_burned_area,
+  predicted  = df$burned_area_km2_total,
+  plot_title = "(e)",
+  x_label    = "Burned area (km2/gridcell/month)",
+  cut_axis   = TRUE,
+  cut_start_val = 100,     # matches your example exactly
+  cut_end_val   = 4400,
+  log_y      = FALSE
+)
+burned_area_dist
+
+
+```
+```{r}
+plot_legend <- ggplot(count_data, aes(x = factor(value), y = n_plot, fill = source)) +
+  geom_col(position = pd, alpha = 0.6, width = 0.6, na.rm = TRUE) + 
+  scale_fill_manual(values = c("Observed" = "gold", "Predicted" = "red"), name = NULL) +
+  theme_minimal() +
+  theme(
+    legend.position   = "bottom",
+    legend.box        = "horizontal",
+    legend.title      = element_text(size = 10),
+    legend.text       = element_text(size = 9),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width  = unit(1.0, "cm"),
+    legend.spacing.x  = unit(2, "cm"),
+    panel.background = element_rect(fill = "white", color = NA),   
+    plot.background  = element_rect(fill = "white", color = NA)
+  )
+
+shared_legend <- ggpubr::get_legend(plot_legend)
+
+fig_panels <- plot_grid(
+  r_strike_dist, n_strikes_dist, p_ignite_dist, n_fires_dist, burned_area_dist,
+  ncol = 1
+)
+
+final_fig <- plot_grid(
+  fig_panels,
+  shared_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.05)
+)
+
+final_fig
+
+```
+
+
+```{r}
+combined_plot <- r_strike_dist / n_strikes_dist/ p_ignite_dist / n_fires_dist / burned_area_dist
+
+```
+
+```{r}
+
+ggsave(
+  filename = file.path(figure_root, "Figure_distribution.png"),
+  plot = final_fig,
+  width = 7,
+  height = 14,     
+  units = "in",
+  dpi = 300
+)
+
+```
+

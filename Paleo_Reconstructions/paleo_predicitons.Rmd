@@ -1,0 +1,16 @@
+---
+title: "paleo_predicitons"
+output: html_document
+---
+
+
+#add urban and road proximity
+```{r}
+rdf <- read_parquet("trace_ignition_burnedarea_model.parquet")
+
+# Add suppression predictors — all zero for paleoclimate (no roads/urban areas)
+df$road_proximity_binary  <- 0L
+df$urban_proximity_binary <- 0L
+
+predictions <- predict(your_model, newdata = df)
+```

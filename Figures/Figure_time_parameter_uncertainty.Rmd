@@ -1,0 +1,181 @@
+---
+title: "Figure_time_parameter_uncertainty"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(purrr)
+library(purrr)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+```{r}
+# ============================================================================
+# Two input dataframes:
+#
+#   df      -- Monte Carlo ensemble output (timeseries_by_run_year.csv)
+#              columns: run_id | year | submodel | stat_type | value
+#              Uncertainty here is the EMPIRICAL spread across the 100
+#              Monte Carlo runs -- ci_low/ci_high = 2.5/97.5 percentiles of
+#              `value` across run_id, for a given (year, submodel, stat_type).
+#              No bootstrap/quantile approximation needed since these are
+#              actual repeated realizations.
+#
+#   df_obs  -- observed truth, gridcell-month resolution
+#              (predictions_2002_2011.csv), columns include: lat, lon, year,
+#              month, r_strike_obs, n_strikes_obs, fire_count,
+#              burned_area_km2_total. Single fixed dataset, no run
+#              replication -- aggregated to yearly series via
+#              build_observed_timeseries() below for overlay on the ensemble.
+# ============================================================================
+
+df <- read.csv(file.path(predictions_root, "parameter_uncertainty/timeseries_by_run_year.csv"))
+
+df_obs <- read.csv(file.path(predictions_root, "predictions_2002_2011.csv"))
+```
+
+
+```{r}
+
+
+# ---- Summarize the ensemble: mean/median + 95% range across runs ----------
+summarize_ensemble <- function(df, submodel_name, stat_type_name, probs = c(0.025, 0.975)) {
+  df %>%
+    filter(submodel == submodel_name, stat_type == stat_type_name) %>%
+    group_by(year) %>%
+    summarise(
+      estimate = mean(value, na.rm = TRUE),
+      median   = median(value, na.rm = TRUE),
+      ci_low   = quantile(value, probs[1], na.rm = TRUE),
+      ci_high  = quantile(value, probs[2], na.rm = TRUE),
+      .groups  = "drop"
+    )
+}
+
+# ---- Optional: build an observed-side timeseries from df_obs, so it can  ----
+# ---- be overlaid on the ensemble plot.                                   ----
+# obs_col should be one of: r_strike_obs, n_strikes_obs, fire_count,
+# burned_area_km2_total (i.e. the observed counterpart to the submodel).
+build_observed_timeseries <- function(obs_df, obs_col, stat_type = c("mean", "sum")) {
+  stat_type <- match.arg(stat_type)
+  obs_df %>%
+    group_by(year) %>%
+    summarise(
+      value = if (stat_type == "sum") sum(.data[[obs_col]], na.rm = TRUE)
+              else mean(.data[[obs_col]], na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+# ---- Plot builder: ensemble ribbon + optional observed overlay ------------
+plot_ensemble_series <- function(df, submodel_name, stat_type_name, y_label, title,
+                                  observed_df = NULL,
+                                  pred_color = "red", obs_color = "gold") {
+
+  summary_df <- summarize_ensemble(df, submodel_name, stat_type_name)
+
+  p <- ggplot(summary_df, aes(x = year, y = estimate)) +
+    geom_ribbon(aes(ymin = ci_low, ymax = ci_high), fill = pred_color, alpha = 0.2) +
+    geom_line(color = pred_color) +
+    geom_point(color = pred_color, size = 3, shape = 7)
+
+  caption_txt <- "Shaded band: 95% range across 100 Monte Carlo runs"
+
+  if (!is.null(observed_df)) {
+    p <- p +
+      geom_point(data = observed_df, aes(x = year, y = value),
+                 color = obs_color, shape = 16, size = 3) +
+      geom_line(data = observed_df, aes(x = year, y = value),
+                color = obs_color, linetype = "dashed")
+    caption_txt <- paste0(caption_txt, " | Points: observed")
+  }
+
+  p +
+    scale_x_continuous(breaks = unique(summary_df$year)) +
+    labs(x = NULL, y = y_label, title = title, caption = caption_txt) +
+    theme_minimal() +
+    theme(plot.caption = element_text(hjust = 0, size = 8, face = "italic"))
+}
+
+
+# ============================================================================
+# Six panels, matching the structure of your original (a)-(f) plots.
+# df_obs is the gridcell-month-level dataframe read from
+# predictions_2002_2011.csv (single observed truth, no run replication).
+# Aggregated to yearly observed series here for overlay on the ensemble.
+# ============================================================================
+
+obs_r_strike    <- build_observed_timeseries(df_obs, "r_strike_obs", "mean")
+obs_n_strikes   <- build_observed_timeseries(df_obs, "n_strikes_obs", "mean")
+obs_n_fires     <- build_observed_timeseries(df_obs, "fire_count", "sum")
+obs_burned_mean <- build_observed_timeseries(df_obs, "burned_area_km2_total", "mean")
+obs_burned_sum  <- build_observed_timeseries(df_obs, "burned_area_km2_total", "sum")
+
+p1 <- plot_ensemble_series(df, "r_strike", "mean", "Strikes/km2/month", "(a)",
+                            observed_df = obs_r_strike)
+
+p2 <- plot_ensemble_series(df, "n_strikes", "mean", "Strike Count", "(b)",
+                            observed_df = obs_n_strikes)
+
+p3 <- plot_ensemble_series(df, "p_ignite", "mean", "Ignition Probability", "(c)")
+# p_ignite has no direct single-number observed counterpart (it's compared
+# against fires/strikes at the gridcell-month level, not a yearly mean) --
+# see the ECE/weighted-correlation metrics in metrics_by_iteration.csv
+# for the observed-comparison side of this submodel instead.
+
+p4 <- plot_ensemble_series(df, "n_fires", "sum", "Fire Count", "(d)",
+                            observed_df = obs_n_fires)
+
+p5 <- plot_ensemble_series(df, "burned_area", "mean", "Mean Burned Area (km2)", "(e)",
+                            observed_df = obs_burned_mean)
+
+p6 <- plot_ensemble_series(df, "burned_area", "sum", "Total Burned Area (km2)", "(f)",
+                            observed_df = obs_burned_sum)
+
+p1 / p2 / p3 / p4 / p5 / p6
+
+```

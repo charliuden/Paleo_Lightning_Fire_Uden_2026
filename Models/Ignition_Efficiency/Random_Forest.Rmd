@@ -1,0 +1,386 @@
+---
+title: "Ignition Efficiency Random Forest"
+output: html_document
+---
+
+```{r}
+#library(randomForest)
+library(ranger)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+```
+
+
+```{r}
+df <- read.csv(file.path(drivers_root, "lightning_fires_burned_area_jja_2002_2011.csv"))
+df <- df[,2:29]
+head(df)
+```
+
+----------------------------------------------
+Run random forest for Strike Count
+----------------------------------------------
+
+```{r}
+
+# ── Define predictor set ───────────────────────────────────────────────────────
+# Adjust column names to match your actual df
+predictors <- c("precip", "tair", "wind", "rh",
+                "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                "tair_1m", "tair_2m", "tair_3m", "tair_5y",
+                "C", "B", "U", "sd")
+
+# ── Random forest 1: Lightning strike count (rstrike) ─────────────────────────
+df_strikes <- df[, c("strike_count", predictors)]
+df_strikes <- na.omit(df_strikes)
+
+# Correlation check on a sample
+#df_sample <- df_strikes %>% sample_frac(0.1)
+#plot(df_sample)
+
+#remove a percent of 0s
+zero_indices <- which(df_strikes$strike_count == 0)
+num_to_remove <- round(length(zero_indices) * 0.75)
+set.seed(42)
+rows_to_remove <- sample(zero_indices, num_to_remove)
+df_strikes <- df_strikes[-rows_to_remove, ]
+
+# ── Fit ranger twice to get both importance metrics ───────────────────────────
+
+rf_permutation <- ranger(
+  strike_count ~ .,
+  data        = df_strikes,
+  num.trees   = 500,
+  importance  = "permutation",
+  num.threads = 4
+)
+
+rf_impurity <- ranger(
+  strike_count ~ .,
+  data        = df_strikes,
+  num.trees   = 500,
+  importance  = "impurity",
+  num.threads = 4
+)
+
+# ── Extract and combine importance scores ─────────────────────────────────────
+
+imp_mse <- data.frame(
+  variable   = names(importance(rf_permutation)),
+  importance = importance(rf_permutation),
+  metric     = "%IncMSE"
+)
+
+imp_purity <- data.frame(
+  variable   = names(importance(rf_impurity)),
+  importance = importance(rf_impurity),
+  metric     = "IncNodePurity"
+)
+
+imp_all <- bind_rows(imp_mse, imp_purity)
+
+# Order variables by %IncMSE value (so both panels share the same y-axis order)
+var_order <- imp_mse |>
+  arrange(importance) |>
+  pull(variable)
+
+imp_all <- imp_all |>
+  mutate(variable = factor(variable, levels = var_order))
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+
+# Label formatting: IncNodePurity values can be large — use scientific notation
+imp_all <- imp_all |>
+  mutate(metric = factor(metric, levels = c("%IncMSE", "IncNodePurity")))
+
+p <- ggplot(imp_all, aes(x = importance, y = variable)) +
+  geom_hline(
+    aes(yintercept = as.numeric(variable)),
+    linetype  = "dashed",
+    color     = "grey75",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    shape  = 21,
+    size   = 3,
+    color  = "black",
+    fill   = "white",
+    stroke = 0.7
+  ) +
+  facet_wrap(
+    ~ metric,
+    scales = "free_x",   # each panel gets its own x-axis scale
+    ncol   = 2
+  ) +
+  labs(
+    title = "Variable Importance — Strike Count",
+    x     = NULL,
+    y     = NULL
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid        = element_blank(),
+    panel.border      = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    strip.background  = element_blank(),
+    strip.text        = element_text(size = 10),
+    axis.text.y       = element_text(size = 9),
+    axis.text.x       = element_text(size = 8),
+    plot.title        = element_text(size = 11, hjust = 0.5)
+  )
+
+print(p)
+
+```
+
+Save
+```{r}
+#ggsave("varimp_burned_area.png", p, width = 7, height = 4.5, dpi = 300)
+
+write.csv(imp_all, (file.path(table_root, "strike_count_random_forest_075_zeros.csv")), row.names = FALSE)
+```
+
+----------------------------------------------
+Run random forest for Lightning-caused Fire Count
+----------------------------------------------
+```{r}
+#peak at data
+summary(df$fire_count)
+sum(df$fire_count == 0, na.rm = TRUE)
+nrow(df)
+sum(df$fire_count == 0, na.rm = TRUE)/nrow(df)
+hist(df$fire_count)
+ggplot(data=filter(df, year==2002), aes(x=lon, y=lat, color=fire_count)) + geom_point()
+ggplot(data=filter(df, fire_count>0), aes(x=lon, y=lat, color=fire_count)) + geom_point()
+```
+Over 99% of observations have burned_area=0. Let's remove 100% and then 75% of these rows before running the random forest. 
+
+```{r}
+
+# ── Define predictor set ───────────────────────────────────────────────────────
+# Adjust column names to match your actual df
+predictors <- c("precip", "tair", "wind", "rh",
+                "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                "tair_1m", "tair_2m", "tair_3m", "tair_5y",
+                "C", "B", "U", "sd")
+
+# ── Random forest 1: Lightning strike count (rstrike) ─────────────────────────
+df_fire <- df[, c("fire_count", predictors)]
+df_fire <- na.omit(df_fire)
+
+# Correlation check on a sample
+#df_sample <- df_fire %>% sample_frac(0.1)
+#plot(df_sample)
+
+#remove a percent of 0s
+zero_indices <- which(df_fire$fire_count == 0)
+num_to_remove <- round(length(zero_indices) * 0.5) # % of fire_count==0 rows to remove
+set.seed(42)
+rows_to_remove <- sample(zero_indices, num_to_remove)
+df_fire <- df_fire[-rows_to_remove, ]
+
+# ── Fit ranger twice to get both importance metrics ───────────────────────────
+
+rf_permutation <- ranger(
+  fire_count ~ .,
+  data        = df_fire,
+  num.trees   = 500,
+  importance  = "permutation",
+  num.threads = 4
+)
+
+rf_impurity <- ranger(
+  fire_count ~ .,
+  data        = df_fire,
+  num.trees   = 500,
+  importance  = "impurity",
+  num.threads = 4
+)
+
+# ── Extract and combine importance scores ─────────────────────────────────────
+
+imp_mse <- data.frame(
+  variable   = names(importance(rf_permutation)),
+  importance = importance(rf_permutation),
+  metric     = "%IncMSE"
+)
+
+imp_purity <- data.frame(
+  variable   = names(importance(rf_impurity)),
+  importance = importance(rf_impurity),
+  metric     = "IncNodePurity"
+)
+
+imp_all <- bind_rows(imp_mse, imp_purity)
+
+# Order variables by %IncMSE value (so both panels share the same y-axis order)
+var_order <- imp_mse |>
+  arrange(importance) |>
+  pull(variable)
+
+imp_all <- imp_all |>
+  mutate(variable = factor(variable, levels = var_order))
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+
+# Label formatting: IncNodePurity values can be large — use scientific notation
+imp_all <- imp_all |>
+  mutate(metric = factor(metric, levels = c("%IncMSE", "IncNodePurity")))
+
+p <- ggplot(imp_all, aes(x = importance, y = variable)) +
+  geom_hline(
+    aes(yintercept = as.numeric(variable)),
+    linetype  = "dashed",
+    color     = "grey75",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    shape  = 21,
+    size   = 3,
+    color  = "black",
+    fill   = "white",
+    stroke = 0.7
+  ) +
+  facet_wrap(
+    ~ metric,
+    scales = "free_x",   # each panel gets its own x-axis scale
+    ncol   = 2
+  ) +
+  labs(
+    title = "Variable Importance — Fire Count",
+    x     = NULL,
+    y     = NULL
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid        = element_blank(),
+    panel.border      = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    strip.background  = element_blank(),
+    strip.text        = element_text(size = 10),
+    axis.text.y       = element_text(size = 9),
+    axis.text.x       = element_text(size = 8),
+    plot.title        = element_text(size = 11, hjust = 0.5)
+  )
+
+print(p)
+```
+
+Save
+```{r}
+#ggsave("varimp_burned_area.png", p, width = 7, height = 4.5, dpi = 300)
+
+write.csv(imp_all, (file.path(table_root, "fire_count_random_forest_050_zeros.csv")), row.names = FALSE)
+```
+
+```{r}
+
+# ── Compare importance across both models ─────────────────────────────────────
+imp_strikes <- as.data.frame(importance(rf_strikes)) %>%
+  tibble::rownames_to_column("variable") %>%
+  mutate(model = "Strike count")
+
+imp_fire <- as.data.frame(importance(rf_fire)) %>%
+  tibble::rownames_to_column("variable") %>%
+  mutate(model = "Fire count")
+
+imp_combined <- bind_rows(imp_strikes, imp_fire)
+
+# Plot %IncMSE side by side for both models
+ggplot(imp_combined, aes(x = reorder(variable, `%IncMSE`),
+                          y = `%IncMSE`,
+                          fill = model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Variable Importance: Strike Count vs Fire Count",
+    x     = "Predictor",
+    y     = "%IncMSE",
+    fill  = "Model"
+  ) +
+  theme_minimal())
+
+
+```
+
+
+# Mean Decrease Accuracy (%IncMSE):
+- remove variables from the model and asses which have the greatest impact on model accuracy.
+- Higher the value of mean decrease accuracy or mean decrease gini score,
+       higher the importance of the variable in the model.
+- tells you effect of randomly shuffling values of a variable on increasing mse of model predictions
+- a higher number indicates that the variable is more important
+
+# Mean Decrease Gini or Increase in Node Purity (IncNodePurity):
+- expresses the change in the homogeneity of the of the groups created by the trees
+     (using the Gini coefficient as a measure).
+- What is expressed is the decrease in said purity if a particular variable
+      has no information. If a variable has no information to begin with,
+      the decrase would be zero. (from: https://www.reagro.org/methods/statistical/randomforest.html)
+
+Save random forest results for appendix figure. 
+```{r}
+rf_results <- importance(rf_burned_area)
+rf_results <- data.frame(Variable = rownames(rf_results),
+                     IncMSE = rf_results[, "%IncMSE"],
+                     IncNodePurity = rf_results[, "IncNodePurity"])
+# Export
+write.csv(rf_results, (file.path(table_root, "burned_area_random_forest.csv")), row.names = FALSE)
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```

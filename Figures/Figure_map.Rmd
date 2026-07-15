@@ -1,0 +1,526 @@
+---
+title: "Figure_map"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(geodata)
+library(terra)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+
+```{r}
+df <- read.csv(file.path(predictions_root, "predictions_2002_2011.csv"))
+```
+
+
+
+
+Alaska polygon and Elevation plot
+```{r}
+# Get USA polygon
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+# Filter to Alaska only
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+
+
+
+# Download SRTM elevation data for Alaska
+# Alaska spans multiple tiles so we download by country
+
+# 1. Download and crop
+elev <- geodata::elevation_global(res = 10, path = tempdir())
+alaska_ext <- ext(-170, -130, 51, 72)
+elev_alaska <- crop(elev, alaska_ext)
+
+# 2. Mask to Alaska polygon
+alaska_vect <- terra::vect(alaska)
+elev_masked <- terra::mask(elev_alaska, alaska_vect)
+
+# 3. Convert to data frame — use elev_masked instead of elev_alaska
+elev_df <- as.data.frame(elev_masked, xy = TRUE)
+names(elev_df) <- c("lon", "lat", "elevation")
+elev_df <- elev_df %>% filter(!is.na(elevation), elevation >= 0)
+```
+
+
+```{r}
+p_elevation <- ggplot() +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250)) +  # contour interval in metres
+  geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) +
+  xlim(-170, -130) +
+  ylim(51, 72) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(h)") +
+  theme_minimal() +
+  theme(
+    axis.title.x     = element_text(size=11),
+    axis.title.y     = element_text(size=11),
+    axis.text.y      = element_text(size=11),
+    axis.text.x      = element_text(size=11),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2),
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2)
+  )
+
+p_elevation
+```
+
+Map Function
+```{r}
+library(ggplot2)
+library(rlang)
+
+library(ggplot2)
+library(rlang)
+library(scales)
+
+make_fire_map <- function(data,
+                           fill_var,
+                           legend_label,
+                           title,
+                           min_val = NULL,
+                           max_val = NULL,
+                           viridis_option = "plasma",
+                           direction = -1,
+                           trans = "identity",
+                           elev_data = elev_df,
+                           boundary_data = alaska,
+                           is_bias = FALSE,
+                           bias_palette = NULL,   # e.g. "PuOr" — uses RColorBrewer diverging palette instead of blue/white/red
+                           legend_position = c(0.65, 0.16)) {
+
+  fill_var <- rlang::ensym(fill_var)
+
+  p <- ggplot(data, aes(x = lon, y = lat, fill = !!fill_var)) +
+    geom_raster() +
+    xlim(-170, -130) +
+    geom_sf(data = boundary_data, fill = NA, color = "black",
+            linewidth = 0.3, inherit.aes = FALSE)
+
+  if (is_bias) {
+    limits <- if (is.null(min_val) || is.null(max_val)) {
+      quantile(dplyr::pull(data, !!fill_var), c(0.01, 0.99), na.rm = TRUE)
+    } else {
+      c(min_val, max_val)
+    }
+
+    if (!is.null(bias_palette)) {
+      # Diverging RColorBrewer palette, e.g. "PuOr", "RdBu", "BrBG"
+      p <- p + scale_fill_distiller(
+        palette = bias_palette,
+        direction = direction,
+        limits = limits, oob = scales::squish, trans = trans,
+        name = legend_label,
+        guide = guide_colorbar(direction = "horizontal", title.position = "top")
+      )
+    } else {
+      p <- p + scale_fill_gradient2(
+        low = "blue", mid = "white", high = "red", midpoint = 0,
+        limits = limits, oob = scales::squish, trans = trans,
+        name = legend_label,
+        guide = guide_colorbar(direction = "horizontal", title.position = "top")
+      )
+    }
+  } else {
+    limits <- if (is.null(min_val) || is.null(max_val)) NULL else c(min_val, max_val)
+    p <- p + scale_fill_viridis_c(
+      option = viridis_option, direction = direction,
+      limits = limits, oob = scales::squish, trans = trans,
+      name = legend_label,
+      guide = guide_colorbar(direction = "horizontal", title.position = "top")
+    )
+  }
+
+  p <- p +
+    xlab("Lon") + ylab("Lat") + ggtitle(title) +
+    theme_minimal() +
+    theme(
+      axis.title.x = element_text(size = 11),
+      axis.title.y = element_text(size = 11),
+      axis.text.y = element_text(size = 11),
+      axis.text.x = element_text(size = 11),
+      legend.text = element_text(size = 8, angle = 45, hjust = 1),
+      legend.title = element_text(size = 8, hjust = 0),
+      panel.grid.major = element_line(color = "darkgray", size = 0.2),
+      panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+      legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+      legend.position = legend_position
+    ) +
+    geom_contour(data = elev_data,
+                 aes(x = lon, y = lat, z = elevation),
+                 color = "black", linewidth = 0.1,
+                 breaks = seq(0, 3000, by = 250),
+                 inherit.aes = FALSE)
+
+  p
+}
+```
+
+
+Prep data 
+```{r}
+#calculate bias for lightning prediction
+plot_df <- df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    r_s_pred = mean(r_strike),
+    r_s_obs = mean(r_strike_obs),
+    r_s_bias = mean(r_strike - r_strike_obs), 
+    n_s_pred = mean(n_strikes), 
+    n_s_obs = mean(n_strikes_obs), 
+    n_s_bias = mean(n_strikes - n_strikes_obs), 
+    p_i_pred = mean(p_ignite_rate_cal), 
+    p_i_obs = mean(fire_count / n_strikes_obs), 
+    p_i_bias = mean(p_ignite_rate_cal - (fire_count / n_strikes_obs)),
+    n_fire_pred = sum(fire_count_pred),
+    n_fire_obs = sum(fire_count),
+    n_fire_bias = mean(fire_count_pred - fire_count),
+    b_a_pred = sum(total_burned_area),
+    b_a_obs = sum(burned_area_km2_total),
+    b_a_bias = sum(total_burned_area - burned_area_km2_total),
+    .groups = "drop"
+  )
+```
+
+Make maps!
+
+strike rate
+```{r}
+# Predicted strike rate
+p_strike_pred <- make_fire_map(
+  data = plot_df,
+  fill_var = r_s_pred,
+  legend_label = "Predicted strike rate",
+  title = "(a)",
+  min_val = min(plot_df$r_s_pred, plot_df$r_strike_obs, na.rm = TRUE),
+  max_val = max(plot_df$r_s_pred, plot_df$r_strike_obs, na.rm = TRUE)
+)
+
+# Observed strike rate
+p_strike_obs <- make_fire_map(
+  data = plot_df,
+  fill_var = r_s_obs,
+  legend_label = "Observed strike rate",
+  title = "(b)",
+  min_val = min(plot_df$r_strike, plot_df$r_s_obs, na.rm = TRUE),
+  max_val = max(plot_df$r_strike, plot_df$r_s_obs, na.rm = TRUE)
+)
+
+# Bias for strike rate
+p_strike_bias <- make_fire_map(
+  data = plot_df,
+  fill_var = r_s_bias,
+  legend_label = "Strike rate bias",
+  title = "(c)",
+  min_val = NULL,
+  max_val = NULL,
+  is_bias = TRUE,
+  viridis_option = "PuOr",
+)
+
+p_strike_pred | p_strike_obs | p_strike_bias
+```
+
+strike count
+
+```{r}
+
+
+# Predicted strike count
+p_strike_count_pred <- make_fire_map(
+  data = plot_df,
+  fill_var = n_s_pred,
+  legend_label = "Predicted strike count",
+  title = "(d)",
+  min_val = NULL,
+  max_val = NULL
+)
+
+# Observed strike count
+p_strike_count_obs <- make_fire_map(
+  data = plot_df,
+  fill_var = n_s_obs,
+  legend_label = "Observed strike count",
+  title = "(e)",
+  min_val = NULL,
+  max_val = NULL
+)
+
+# Bias for strike count
+p_strike_count_bias <- make_fire_map(
+  data = plot_df,
+  fill_var = n_s_bias,
+  legend_label = "Strike count bias",
+  title = "(f)",
+  min_val = NULL,
+  max_val = NULL,
+  is_bias = TRUE,
+  viridis_option = "PuOr",
+)
+
+# Check percentiles first to pick sensible caps
+quantile(plot_df$n_s_pred, c(0.9, 0.95, 0.99), na.rm = TRUE)
+quantile(plot_df$n_s_obs,  c(0.9, 0.95, 0.99), na.rm = TRUE)
+quantile(plot_df$n_s_bias, c(0.01, 0.05, 0.95, 0.99), na.rm = TRUE)
+
+# Predicted strike count
+p_strike_count_pred <- make_fire_map(
+  data = plot_df,
+  fill_var = n_s_pred,
+  legend_label = "Predicted strike count",
+  title = "(d)",
+  min_val = 0,
+  max_val = max(quantile(plot_df$n_s_obs, 0.95, na.rm = TRUE), quantile(plot_df$n_s_pred, 0.95, na.rm = TRUE)) #squish max 95th quantile vale of pred and obs to one color
+)
+
+# Observed strike count
+p_strike_count_obs <- make_fire_map(
+  data = plot_df,
+  fill_var = n_s_obs,
+  legend_label = "Observed strike count",
+  title = "(e)",
+  min_val = 0,
+  max_val = max(quantile(plot_df$n_s_obs, 0.95, na.rm = TRUE), quantile(plot_df$n_s_pred, 0.95, na.rm = TRUE))
+)
+
+# Bias for strike count
+p_strike_count_bias <- make_fire_map(
+  data = plot_df,
+  fill_var = n_s_bias,
+  legend_label = "Strike count bias",
+  title = "(f)",
+  is_bias = TRUE,
+  bias_palette = "PuOr"
+)
+
+p_strike_count_pred | p_strike_count_obs | p_strike_count_bias
+```
+
+ignition efficiency
+
+```{r}
+    
+plot_df_ignite_pred <- df  %>%
+    filter(n_strikes > 0) %>%
+  group_by(lat, lon) %>%
+  summarise(
+  p_i_pred = mean(p_ignite), 
+  .groups = "drop"
+  )
+
+plot_df_ignite_obs <- df  %>%
+  filter(n_strikes_obs > 0) %>%
+  group_by(lat, lon) %>%
+  summarise(
+  p_i_obs = mean(fire_count / n_strikes_obs), 
+  p_i_bias = mean(p_ignite - (fire_count / n_strikes_obs)),
+    .groups = "drop"
+  )
+
+plot_df_ignite <- merge(plot_df_ignite_pred, plot_df_ignite_obs, by=c("lat", "lon"))
+
+# Predicted ignition efficiency
+p_ignite_pred <- make_fire_map(
+  data = plot_df_ignite,
+  fill_var = p_i_pred,
+  legend_label = "Predicted ignition probability",
+  title = "(g)",
+  min_val = min(plot_df_ignite$p_i_pred, plot_df_ignite$p_i_obs),
+  max_val = max(plot_df_ignite$p_i_pred, plot_df_ignite$p_i_obs)
+)
+
+# Observed ignition rate
+p_ignite_obs <- make_fire_map(
+  data = plot_df_ignite,
+  fill_var = p_i_obs,
+  legend_label = "Observed ignition rate",
+  title = "(h)",
+  min_val = min(plot_df_ignite$p_i_pred, plot_df_ignite$p_i_obs),
+  max_val = max(plot_df_ignite$p_i_pred, plot_df_ignite$p_i_obs)
+)
+
+# Bias for ignition efficiency/rate
+p_ignite_bias <- make_fire_map(
+  data = plot_df_ignite,
+  fill_var = p_i_bias,
+  legend_label = "Ignition rate/probability bias",
+  title = "(i)",
+  min_val = NULL,
+  max_val = NULL,
+  is_bias = TRUE,
+  viridis_option = "PuOr",
+)
+
+p_ignite_pred | p_ignite_obs | p_ignite_bias
+```
+
+fire count
+
+```{r}
+# Predicted strike rate
+p_fire_count_pred <- make_fire_map(
+  data = plot_df,
+  fill_var = n_fire_pred,
+  legend_label = "Predicted fire count",
+  title = "(h)",
+  min_val = NULL,
+  max_val = NULL
+)
+
+# Observed strike rate
+p_fire_count_obs <- make_fire_map(
+  data = plot_df,
+  fill_var = n_fire_obs,
+  legend_label = "Observed fire count",
+  title = "(i)",
+  min_val = NULL,
+  max_val = NULL
+)
+
+# Bias for strike rate
+p_fire_count_bias <- make_fire_map(
+  data = plot_df,
+  fill_var = n_fire_bias,
+  legend_label = "Fire count bias",
+  title = "(j)",
+  min_val = NULL,
+  max_val = NULL,
+  is_bias = TRUE,
+  viridis_option = "PuOr",
+)
+
+p_fire_count_pred | p_fire_count_obs | p_fire_count_bias
+```
+
+burned area
+
+```{r}
+plot_df_ba_pred <- df  %>%
+  group_by(lat, lon) %>%
+  summarise(
+  b_a_pred = sum(total_burned_area), 
+  .groups = "drop"
+  )
+
+plot_df_ba_obs <- df  %>%
+  filter(lightning_ignition == 1) %>% #only want burned area for lightning-caused fires
+  group_by(lat, lon) %>%
+  summarise(
+  b_a_obs = sum(burned_area_km2_total), 
+  b_a_bias = sum(total_burned_area) - b_a_obs,
+    .groups = "drop"
+  )
+
+plot_df_ba <- merge(plot_df_ba_pred, plot_df_ba_obs, by=c("lat", "lon"))
+
+# Predicted burned area
+p_ba_pred <- make_fire_map(
+  data = plot_df_ba,
+  fill_var = b_a_pred,
+  legend_label = "Predicted burned area",
+  title = "(k)",
+  min_val = 0,
+  max_val = max(plot_df_ba$b_a_pred, plot_df_ba$b_a_obs)
+)
+
+# Observed burned area
+p_ba_obs <- make_fire_map(
+  data = plot_df_ba,
+  fill_var = b_a_obs,
+  legend_label = "Observed burned area",
+  title = "(l)",
+  min_val = 0,
+  max_val = max(plot_df_ba$b_a_pred, plot_df_ba$b_a_obs)
+)
+
+# Bias for burned area
+p_ba_bias <- make_fire_map(
+  data = plot_df_ba,
+  fill_var = b_a_bias,
+  legend_label = "Burned area bias",
+  title = "(m)",
+  min_val = NULL,
+  max_val = NULL,
+  is_bias = TRUE,
+  viridis_option = "PuOr",
+)
+
+p_ba_pred | p_ba_obs | p_ba_bias
+```
+
+```{r}
+combined_plot <- (p_strike_pred | p_strike_obs | p_strike_bias) /
+(p_strike_count_pred | p_strike_count_obs | p_strike_count_bias) /
+(p_ignite_pred | p_ignite_obs | p_ignite_bias) /
+(p_fire_count_pred | p_fire_count_obs | p_fire_count_bias) /
+(p_ba_pred | p_ba_obs | p_ba_bias) 
+```
+
+
+
+```{r}
+
+ggsave(
+  filename = file.path(figure_root, "Figure_map.png"),
+  plot = combined_plot,
+  width = 9,
+  height = 18,     
+  units = "in",
+  dpi = 300
+)
+
+```
+
+

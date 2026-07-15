@@ -1,0 +1,8 @@
+paleo_config.properties
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.rds
+**/__pycache__/
+*.RData

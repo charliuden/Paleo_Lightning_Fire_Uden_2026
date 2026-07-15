@@ -1,0 +1,582 @@
+---
+title: "Negative_Binomial"
+output: html_document
+---
+
+
+```{r, echo=FALSE, include=FALSE}
+library(rstan)
+library(dplyr)
+library(stats)
+library(caret)
+library(tidyr)
+library(patchwork)
+library(ggplot2)
+library(gridExtra)
+library(terra)
+library(lubridate)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+```
+
+# Gamma
+
+r_strike ~ gamma(alpha, beta)
+alpha = exp(a + b * X)
+beta = exp(a + b * X)
+
+r_strike: mean summer strike rate (strikes/km2/month)
+
+
+# Negative Binomial
+
+n_strike ~ negative binomial(mu, theta)
+mu = r_strike * area
+log(theta) = a + b * X
+
+
+Read in drivers
+- strike rate data is at seasonal scale (summer mean, june-august)
+- strike count data is at monthly sclae (june-august)
+
+######################
+# Monthly PREDICTIONS #
+######################
+
+```{r}
+df <- read.csv(file.path(drivers_root, "lightning_strike_count_climate_jja_2002_2011.csv"))
+head(df)
+```
+
+Does strike count vary with month?
+Yes! There are more zeros in August, and the mean strike count is higher in June and July. This tells us that climate is 
+```{r}
+hist(filter(df, month==8)$strike_count, main="Augst Strike Count")
+hist(filter(df, month==7)$strike_count, main="July Strike Count")
+hist(filter(df, month==6)$strike_count, main="June Strike Count")
+
+as.data.frame(cbind(month = c("August", "July", "june"),
+              mean_strike_count = c(
+                mean(filter(df, month==8)$strike_count),
+                mean(filter(df, month==7)$strike_count),
+                mean(filter(df, month==6)$strike_count)),
+              median_strike_count = c(
+                median(filter(df, month==8)$strike_count),
+                median(filter(df, month==7)$strike_count),
+                median(filter(df, month==6)$strike_count)),
+              sd_strike_count = c(
+                sd(filter(df, month==8)$strike_count),
+                sd(filter(df, month==7)$strike_count),
+                sd(filter(df, month==6)$strike_count)),
+              max_strike_count = c(
+                max(filter(df, month==8)$strike_count),
+                max(filter(df, month==7)$strike_count),
+                max(filter(df, month==6)$strike_count)),
+              n_zeros = c(
+                nrow(filter(df, month==8 & strike_count == 0)),
+                nrow(filter(df, month==7 & strike_count == 0)),
+                nrow(filter(df, month==6 & strike_count == 0)))))
+
+```
+
+Next, lets get mu: mean summer (june-august) lightning strike rate, strikes/km2/month - this will be used as mu in the negative binomial distribution. 
+
+Gamma model predicts:
+
+r_strike ~ gamma(alpha, beta)
+alpha = exp(a + b * X)
+beta = exp(a + b * X)
+
+r_strike: mean summer strike rate (strikes/km2/month)
+
+n_strike ~ negative_binomial(mu, theta)
+mu = r_strike * area
+theta = a + b * X
+
+Note, mu in the negative binomial distribution must be greater than 0. This meas that we cannot use monthly mean rate, as some gridcell-months expereince no lightning. To resolve this, we use monthly summer mean strike rate so that all rates are greater than 0. 
+
+```{r}
+#read in seasonal data containing observed r_strike (mean summer strikes/km2/month)  
+lightning <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+
+#merge summer strike rate (strikes/km2/month) observations - months will be duplicated
+df <- df %>%
+  left_join(
+    lightning %>% dplyr::select(lat, lon, year, strikes),
+    by = c("lat", "lon", "year")
+  )
+
+names(df)[names(df) == "strikes"] <- "r_strike"
+
+#Scale strike rate from strikes/km2/month to strikes/gridcell/month
+area <- read.csv("~/raid/cuden/data/paleo_fire/era5_grid_area.csv")
+
+df <- df %>%
+  left_join(
+    area %>% dplyr::select(lat, lon, area),
+    by = c("lat", "lon")
+  )
+
+
+#df grid covers a rectangle rather than the alaska border. removing NAs will deal with this
+df <- na.omit(df)
+
+ggplot(filter(df, month==8 & year==2002), aes(x=lon, y=lat, color=r_strike)) + geom_point() + ggtitle("strike rates, Summer 2002")
+ggplot(filter(df, month==8 & year==2002), aes(x=lon, y=lat, color=strike_count)) + geom_point() + ggtitle("strike counts, August 2002")
+ggplot(filter(df, month==8 & year==2002 & strike_count < 10), aes(x=lon, y=lat, color=strike_count)) + geom_point() + ggtitle("strike count < 10, August 2002")
+
+cat("Number of observations:", nrow(df), "\n")
+cat("Number of 0 r_strike observations:", sum(df$r_strike == 0), "\n")
+cat("Frequency of 0s:", sum(df$r_strike == 0)/nrow(df), "\n")
+ 
+```
+ZEROS: Zero strike count values will need to be removed after standardization because mu parameter in the negative binomial has to be greater than 0. 
+
+
+Split into training and testing data
+```{r, echo=FALSE}
+## 80% of the sample size
+sample_size <- floor(0.8 * nrow(df))
+
+## set the seed to make partition reproducible
+set.seed(123)
+train_index <- sample(seq_len(nrow(df)), size = sample_size)
+
+train <- df[train_index, ]
+test <- df[-train_index, ]
+```
+
+
+#Standardize the data
+```{r}
+#-----
+mu_precip <- mean(train$precip)
+sigma_precip <- sd(train$precip)
+mu_tair <- mean(train$tair)
+sigma_tair <- sd(train$tair)
+mu_wind <- mean(train$wind)
+sigma_wind <- sd(train$wind)
+mu_swr <- mean(train$swr)
+sigma_swr <- sd(train$swr)
+mu_sp <- mean(train$sp)
+sigma_sp <- sd(train$sp)
+mu_rh <- mean(train$rh)
+sigma_rh <- sd(train$rh)
+
+#store means and sds
+mu <- c(mu_precip, mu_tair, mu_wind, mu_swr, mu_sp, mu_rh)
+sigma <- c(sigma_precip, sigma_tair, sigma_wind, sigma_swr, sigma_sp, sigma_rh)
+var <- c("precip", "tair", "wind", "swr", "sp", "rh")
+mean_sd <- data.frame(cbind(var, mu, sigma))
+write.csv(mean_sd, file.path(mu_sigma_root, "mu_sigma_lightning_count_predictors.csv"))
+#-----
+
+train <- train %>%
+  mutate(precip = (precip-mu_precip)/sigma_precip) %>%
+  mutate(tair = (tair-mu_tair)/sigma_tair) %>%
+  mutate(wind = (wind-mu_wind)/sigma_wind) %>%
+  mutate(swr = (swr-mu_swr)/sigma_swr) %>%
+  mutate(sp = (sp-mu_sp)/sigma_sp) %>%
+  mutate(rh = (rh-mu_rh)/sigma_rh) 
+
+train <- train[,c("r_strike", "area", "strike_count", "precip","tair", "wind", "swr", "sp", "rh")]
+head(train)
+
+test <- test %>%
+  mutate(precip = (precip-mu_precip)/sigma_precip) %>%
+  mutate(tair = (tair-mu_tair)/sigma_tair) %>%
+  mutate(wind = (wind-mu_wind)/sigma_wind) %>%
+  mutate(swr = (swr-mu_swr)/sigma_swr) %>%
+  mutate(sp = (sp-mu_sp)/sigma_sp) %>%
+  mutate(rh = (rh-mu_rh)/sigma_rh) %>%
+  mutate(lon = lon) %>%
+  mutate(lat = lat)
+
+test <- test[,c("lon", "lat", "year", "r_strike", "area", "strike_count", "precip", "tair", "wind", "swr", "sp", "rh")]
+
+hist(test$strike_count)
+```
+
+
+```{r}
+# ── Stan model code ────────────────────────────────────────────────────────────
+stan_nb_climate <- "
+data {
+  int<lower=0> N;              // number of observations
+  int<lower=0> K;              // number of predictors for theta
+  int<lower=0> y[N];           // observed strike counts
+  vector[N] log_mu;            // log of predicted rate x area (offset)
+  matrix[N, K] Z;              // climate predictors for theta
+  real<lower=0> sigma_gamma;   // prior SD for theta coefficients
+}
+parameters {
+  real gamma_0;                // intercept for log(theta)
+  vector[K] gamma;             // coefficients for log(theta)
+}
+transformed parameters {
+  vector[N] log_theta;
+  vector[N] theta;
+  log_theta = gamma_0 + Z * gamma;
+  theta     = exp(log_theta);   // theta > 0 always
+}
+model {
+  // Priors
+  gamma_0 ~ normal(2, 2);      // log(theta) intercept — prior mean exp(2)~7
+  gamma   ~ normal(0, sigma_gamma);
+  // Likelihood
+  // NB parameterised as NegBinomial2(mu, phi) where phi = theta
+  // E[y] = mu, Var[y] = mu + mu^2/theta
+  for (n in 1:N) {
+    y[n] ~ neg_binomial_2_log(log_mu[n], theta[n]);
+  }
+}
+generated quantities {
+  vector[N] log_lik;
+  for (n in 1:N) {
+    log_lik[n] = neg_binomial_2_log_lpmf(y[n] | log_mu[n], theta[n]);
+  }
+}"
+
+# ── Prepare data ───────────────────────────────────────────────────────────────
+# Predictors for theta — use same standardised climate predictors as rate model
+# Using a subset is fine — start with the most physically meaningful ones
+theta_predictors <- c("swr", "tair", "rh", "precip", "sp", "wind")
+
+# Training data must have strike_count and predicted rate
+train_nb <- train |>
+  filter(r_strike > 0) |> #if there are 0 strike rate summers, they will not contribute information and slow the model.
+  mutate(
+    log_mu = log(pmax(r_strike * area, 1e-8))   # log of rate x area
+  )
+
+Z_train <- model.matrix(
+  as.formula(paste("~", paste(theta_predictors, collapse = " + "), "- 1")),
+  data = train_nb
+)
+
+stan_data_nb <- list(
+  N           = nrow(train_nb),
+  K           = ncol(Z_train),
+  y           = as.integer(train_nb$strike_count),
+  log_mu      = train_nb$log_mu,
+  Z           = Z_train,
+  sigma_gamma = 1
+)
+
+# ── Compile and fit ────────────────────────────────────────────────────────────
+sm_nb <- stan_model(
+  model_code = stan_nb_climate,
+  model_name = "nb_lightning_theta"
+)
+
+fit_nb <- sampling(
+  sm_nb,
+  data    = stan_data_nb,
+  iter    = 2000,
+  chains  = 4,
+  cores = 4,
+  seed    = 123,
+  control = list(adapt_delta = 0.95),
+  refresh = 200
+)
+
+# ── Check convergence ──────────────────────────────────────────────────────────
+rhat_vals <- summary(fit_nb)$summary[, "Rhat"]
+cat("Max R-hat:", round(max(rhat_vals, na.rm = TRUE), 4), "\n")
+
+# ── Posterior summaries ────────────────────────────────────────────────────────
+summ <- summary(fit_nb,
+                 pars  = c("gamma_0", "gamma"),
+                 probs = c(0.025, 0.5, 0.975))$summary
+
+summ_df <- as.data.frame(summ)
+summ_df$variable <- c("intercept", theta_predictors)
+print(summ_df[, c("variable", "mean", "2.5%", "97.5%")])
+
+
+# ── LOO-CV ────────────────────────────────────────────────────────────────────
+library(loo)
+loo_nb <- loo(fit_nb, pars = "log_lik")
+print(loo_nb)
+
+#extract posterior draws:
+post_nb <- rstan::extract(fit_nb)
+# Posterior mean gamma coefficients
+gamma_0_mean <- mean(post_nb$gamma_0)
+gamma_means  <- colMeans(post_nb$gamma)
+
+# ── Save ──────────────────────────────────────────────────────────────────────
+saveRDS(list(
+  fit        = fit_nb,
+  coef_means = list(gamma_0 = gamma_0_mean, gamma = gamma_means),
+  predictors = theta_predictors
+), file.path(rds_root, "Lightning/neg_bin_strike_count.rds"))
+
+
+# Save lightweight version — coefficients only, not full stanfit. The full fit won't be needed for paleo predictions
+saveRDS(list(
+  #don't save fit, it's huge
+  coef_means  = list(gamma_0 = gamma_0_mean, gamma = gamma_means),
+  predictors  = theta_predictors,
+  loo         = loo_nb,            # already computed, small
+  summ        = summ_df            # posterior summaries
+), file.path(rds_root, "Lightning/neg_bin_strike_count_small.rds"))
+
+```
+
+
+
+
+```{r}
+#Add r_strike * area to test data:
+
+test_nb <- test %>% 
+  mutate(r_strike_gridcell = r_strike * area, 1e-8)
+
+# ── Apply to test data ────────────────────────────────────────────────────
+
+# Already did these steps:
+# post_nb <- rstan::extract(fit_nb)
+# gamma_0_mean <- mean(post_nb$gamma_0)
+# gamma_means  <- colMeans(post_nb$gamma)
+
+#Build predictor matrix for full fire dataframe
+Z_test <- model.matrix(
+  as.formula(paste("~", paste(theta_predictors, collapse = " + "), "- 1")),
+  data = test_nb 
+)
+
+# Compute posterior mean theta per gridcell-month
+log_theta_pred <- as.numeric(gamma_0_mean + Z_test %*% gamma_means)
+
+theta_pred     <- exp(log_theta_pred)
+
+#log_mu_pred can be used if you are usingneg_binomial_2_log Stan parameterisation, 
+#but R's rnbinom uses the natural scale directly
+test_nb <- test_nb |>
+  mutate(
+    nb_theta    = theta_pred,
+    log_mu_pred = log(pmax(r_strike_gridcell, 1e-8)),
+    n_strikes   = if_else(
+      r_strike_gridcell > 0,
+      rnbinom(n    = n(),
+              mu   = r_strike_gridcell,
+              size = nb_theta),
+      0L
+    )
+  )
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+cat("Observed frequency zeros:    ", mean(test$strike_count == 0), "\n")
+cat("Simulated frequency zeros:   ", mean(test$n_strikes == 0), "\n")
+cat("Observed total:     ", summ_df(test$strike_count), "\n")
+cat("Simulated total:    ", sum(test$n_strikes), "\n")
+cat("Observed mean:     ", mean(test$strike_count), "\n")
+cat("Simulated mean:    ", mean(test$n_strikes), "\n")
+cat("Observed variance: ", var(test$strike_count), "\n")
+cat("Simulated variance:", var(test$n_strikes), "\n")
+
+```
+
+
+Next, lets get mu from the Gamma Bayesian lightning strike rate model and see if it works when we use it to draw counts from the negative bonomial. 
+
+r_strike ~ gamma(alpha, beta)
+alpha = exp(a + b * X)
+beta = exp(a + b * X)
+
+r_strike: mean summer strike rate (strikes/km2/month) - this will be used as mu in the negative binomial distribution. 
+
+```{r}
+#read in seasonal data
+lightning <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+
+#standardize:
+lightning_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_lightning_predictors.csv"))
+
+# Helper function: look up mu and sigma by variable name
+get_mu    <- function(var) lightning_mu_sigma$mu[lightning_mu_sigma$var == var]
+get_sigma <- function(var) lightning_mu_sigma$sigma[lightning_mu_sigma$var == var]
+
+lightning_scaled <- lightning |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    swr    = (swr    - get_mu("swr"))    / get_sigma("swr"),
+    sp     = (sp     - get_mu("sp"))     / get_sigma("sp"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh")
+  )
+
+
+# ── Load B12 Bayesian lightning model ─────────────────────────────────────────
+B12 <- readRDS(file.path(rds_root, "Lightning/B12_gamma_bayes.rds"))
+
+# ── Extract posterior samples ─────────────────────────────────────────────────
+posterior_samples <- as.data.frame(B12)
+
+# Generate predictions using posterior mean coefficients
+# B12 excludes wind — predictors: swr, tair, rh, precip, sp
+
+a_alpha_mean <- mean(posterior_samples$a_alpha)
+b_alpha_mean <- mean(posterior_samples$b_alpha)
+c_alpha_mean <- mean(posterior_samples$c_alpha)
+d_alpha_mean <- mean(posterior_samples$d_alpha)
+e_alpha_mean <- mean(posterior_samples$e_alpha)
+f_alpha_mean <- mean(posterior_samples$f_alpha)
+
+a_beta_mean  <- mean(posterior_samples$a_beta)
+b_beta_mean  <- mean(posterior_samples$b_beta)
+c_beta_mean  <- mean(posterior_samples$c_beta)
+d_beta_mean  <- mean(posterior_samples$d_beta)
+e_beta_mean  <- mean(posterior_samples$e_beta)
+f_beta_mean  <- mean(posterior_samples$f_beta)
+
+# Compute alpha and beta per observation using posterior means
+# Using vectorised operations rather than a loop for speed
+
+lp_alpha <- a_alpha_mean +
+            b_alpha_mean * lightning_scaled$swr   +
+            c_alpha_mean * lightning_scaled$tair  +
+            d_alpha_mean * lightning_scaled$rh    +
+            e_alpha_mean * lightning_scaled$precip +
+            f_alpha_mean * lightning_scaled$sp
+
+lp_beta  <- a_beta_mean  +
+            b_beta_mean  * lightning_scaled$swr   +
+            c_beta_mean  * lightning_scaled$tair  +
+            d_beta_mean  * lightning_scaled$rh    +
+            e_beta_mean  * lightning_scaled$precip +
+            f_beta_mean  * lightning_scaled$sp
+
+alpha_pred <- exp(lp_alpha)
+beta_pred  <- exp(lp_beta)
+
+set.seed(123)
+
+# Gamma alpha and beta
+# if you want the mean: alpha / beta
+lightning_scaled <- lightning_scaled |>
+  mutate(
+    gamma_alpha   = alpha_pred,
+    gamma_beta    = beta_pred,
+    #r_strike_mean  = alpha_pred / beta_pred   # posterior mean prediction
+    r_strike_pred = rgamma(n(), shape = gamma_alpha, rate = gamma_beta)
+  )
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+cat("Predicted strike rate summary:\n")
+print(summary(lightning_scaled$r_strike_pred))
+cat("Observed strike rate summary:\n")
+print(summary(lightning_scaled$strikes))
+
+lightning_scaled <- lightning_scaled[, c("lat", "lon", "year", "r_strike_pred")]
+
+#merge summer strike rate (strikes/km2/month) predictions - months will be duplicated
+df <- df %>%
+  left_join(
+    lightning_scaled %>% dplyr::select(lat, lon, year, r_strike_pred),
+    by = c("lat", "lon", "year")
+  )
+
+#Add r_strike_gridcell = r_strike * area:
+df <- df %>% 
+  mutate(r_strike_pred_gridcell = r_strike_pred * area)
+
+# ── Apply to test data ────────────────────────────────────────────────────
+
+#already did this above.
+#post_nb <- rstan::extract(fit_nb)
+# Posterior mean gamma coefficients
+#gamma_0_mean <- mean(post_nb$gamma_0)
+#gamma_means  <- colMeans(post_nb$gamma)
+
+#Build predictor matrix for full fire dataframe
+Z_df <- model.matrix(
+  as.formula(paste("~", paste(theta_predictors, collapse = " + "), "- 1")),
+  data = df 
+)
+
+# Compute posterior mean theta per gridcell-month
+log_theta_pred <- as.numeric(gamma_0_mean + Z_df %*% gamma_means)
+
+theta_pred     <- exp(log_theta_pred)
+
+df <- df |>
+  mutate(
+    nb_theta         = theta_pred,
+    log_mu_pred      = log(pmax(r_strike_pred_gridcell, 1e-8)),
+    n_strikes = rnbinom(n    = n(),
+                                 mu   = r_strike_pred_gridcell,
+                                 size = nb_theta)
+  )
+
+df$n_strike_poisson <- sapply(df$r_strike_pred_gridcell, function(lam) rpois(1, lambda = lam))
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+cat("Observed zeros:    ", mean(df$strike_count == 0), "\n")
+cat("Simulated zeros:   ", mean(df$n_strikes == 0), "\n")
+cat("Simulated zeros poisson:   ", mean(df$n_strike_poisson == 0), "\n")
+cat("Observed total:    ", sum(df$strike_count), "\n")
+cat("Simulated total:   ", sum(df$n_strikes), "\n")
+cat("Simulated total poisson:   ", sum(df$n_strike_poisson), "\n")
+cat("Observed mean:     ", mean(df$strike_count), "\n")
+cat("Simulated mean:    ", mean(df$n_strikes), "\n")
+cat("Simulated mean poisson:    ", mean(df$n_strike_poisson), "\n")
+cat("Observed variance: ", var(df$strike_count), "\n")
+cat("Simulated variance:", var(df$n_strikes), "\n")
+cat("Simulated varianc poisson:", var(df$n_strike_poisson), "\n")
+
+
+```
+
+
+```{r}
+hist(df$r_strike)
+hist(df$r_strike_pred)
+hist(df$strike_count)
+hist(df$n_strikes)
+hist(df$n_strike_poisson)
+
+ggplot(df[sample(1:nrow(df), 0.5 * nrow(df)), ], aes(x=r_strike_pred, y=r_strike)) + geom_point()
+ggplot(df[sample(1:nrow(df), 0.5 * nrow(df)), ], aes(x=n_strikes, y=strike_count)) + geom_point()
+ggplot(df[sample(1:nrow(df), 0.5 * nrow(df)), ], aes(x=n_strike_poisson, y=strike_count)) + geom_point()
+```
+
+

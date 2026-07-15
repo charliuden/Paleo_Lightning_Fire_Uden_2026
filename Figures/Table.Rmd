@@ -1,0 +1,181 @@
+---
+title: "Table"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+
+```{r}
+df <- read.csv(file.path(predictions_root, "predictions_2002_2011.csv"))
+
+df$p_ignite_obs <- mapply(
+  function(n_fires, n_strikes) {
+    if (is.na(n_fires) || is.na(n_strikes) || n_strikes == 0) return(0L)
+    n_fires/n_strikes
+  },
+  fire$fire_count,
+  fire$n_strikes_obs
+)
+```
+
+Make summary table
+```{r}
+
+pred_r_strike <- mean(df$r_strike)
+obs_r_strike <- mean(df$r_strike_obs)
+
+pred_strike_count <- sum(df$n_strikes)
+obs_strike_count <- sum(df$n_strikes_obs)
+
+pred_p_ignite <- mean(df$p_ignite_rate_cal)
+sim_obs_p_ignite <- mean(df$p_ignite_obs)
+
+pred_fire_count <- sum(df$fire_count_pred)
+obs_fire_count <- sum(df$fire_count)
+
+pred_burned_area <- sum(df$total_burned_area)
+obs_burned_area <- sum(df$burned_area_km2)
+
+summary_table <- as.data.frame(matrix(c(pred_r_strike, obs_r_strike, pred_strike_count, obs_strike_count, pred_p_ignite, sim_obs_p_ignite, pred_fire_count, obs_fire_count, pred_burned_area, obs_burned_area), ncol=2, byrow=TRUE))
+
+colnames(summary_table) <- c("predicted", "observed")
+
+summary_table <- cbind(model_outpit = c("strike_rate", "strike_count", "p_ignite", "fire_count", "total_burned_area"), summary_table)
+
+summary_table_fmt <- summary_table |>
+  mutate(across(where(is.numeric), ~ formatC(., format = "f", digits = 4, big.mark = ",")))
+
+print(summary_table_fmt)
+
+
+```
+
+
+
+
+```{r}
+
+# create a character vector of column names
+var_list <- c("r_strike_obs", "r_strike", "n_strikes_obs", "n_strikes", 
+              "p_ignite_obs", "p_ignite_rate_cal", "fire_count", 
+              "fire_count_pred", "burned_area_km2", "total_burned_area")
+
+#sum
+total <- sapply(df[var_list], sum)
+
+#mean
+mu <- sapply(df[var_list], mean)
+
+#variance
+variance <- sapply(df[var_list], var)
+
+#dispersion (mu/variance < 1; overdispersion)
+dispersion <- sapply(df[var_list], function(col) {
+  mean(col, na.rm = TRUE) / var(col, na.rm = TRUE)
+})
+
+
+# Combine as rows, then flip (transpose) into columns
+summary_table <- data.frame(cbind(Total=total, Mean=mu, Variance=variance, Dispersion=dispersion))
+
+# Convert to data frame so it is easy to work with
+summary_table <- as.data.frame(summary_table)
+
+summary_table |>
+  mutate(across(where(is.numeric), ~ formatC(., format = "f", digits = 4, big.mark = ",")))
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+# Your summary_table, with model names as rownames or a column
+summary_table <- summary_table |> 
+  rownames_to_column("row_name")
+
+# Explicit mapping: submodel label -> observed row, predicted row
+pairs <- tribble(
+  ~submodel,        ~obs_row,             ~pred_row,
+  "r_strike",       "r_strike_obs",       "r_strike",
+  "n_strikes",      "n_strikes_obs",      "n_strikes",
+  "p_ignite",       "p_ignite_obs",       "p_ignite_rate_cal",
+  "fire_count",     "fire_count",         "fire_count_pred",
+  "burned_area",    "burned_area_km2",    "total_burned_area"
+)
+
+# Long format: one row per (submodel, stat, obs/pred)
+long_tbl <- summary_table |>
+  pivot_longer(cols = c(Total, Mean, Variance, Dispersion),
+               names_to = "stat", values_to = "value")
+
+comparison_table <- pairs |>
+  left_join(long_tbl, by = c("obs_row" = "row_name")) |>
+  rename(observed = value) |>
+  left_join(
+    long_tbl |> select(row_name, stat, predicted = value),
+    by = c("pred_row" = "row_name", "stat")
+  ) |>
+  select(submodel, stat, observed, predicted) |>
+  pivot_wider(
+    names_from = stat,
+    values_from = c(observed, predicted),
+    names_glue = "{stat}_{.value}"
+  ) |>
+  select(submodel,
+         starts_with("Total"), starts_with("Mean"),
+         starts_with("Variance"), starts_with("Dispersion"))
+
+# Format for display
+comparison_table |>
+  mutate(across(where(is.numeric), ~ formatC(., format = "f", digits = 4, big.mark = ",")))
+
+
+
+
+```

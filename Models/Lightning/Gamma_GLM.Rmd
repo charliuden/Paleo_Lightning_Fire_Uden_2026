@@ -1,0 +1,1427 @@
+---
+title: "Lightning Prediction using a Gamma GLM"
+author: "Charlotte Uden"
+date: "2026-06-03"
+output: html_document
+---
+
+```{r, echo=FALSE, include=FALSE}
+library(rstan)
+library(dplyr)
+library(stats)
+library(caret)
+library(tidyr)
+library(patchwork)
+library(ggplot2)
+library(gridExtra)
+library(terra)
+library(lubridate)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+```
+
+Read in drivers
+```{r}
+df <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+head(df)
+```
+
+look at data
+```{r}
+hist(df$strikes)
+summary(df$strikes)
+sum(df$strikes == 0, na.rm = TRUE)
+nrow(df)
+ggplot(data=filter(df, year==2002), aes(x=lon, y=lat, color=strikes)) + geom_point()
+```
+
+The random forest indicated that every variable contributes something to lightning strike rate, nothing is 'hurting' the model.
+However, we'll try testing the Gamma GLM with and without wind (lowest on both %IncMSE and IncNodePurity) to see if excluding it increases model performance. 
+
+Split into training and testing data
+```{r, echo=FALSE}
+## 80% of the sample size
+sample_size <- floor(0.8 * nrow(df))
+
+## set the seed to make partition reproducible
+set.seed(123)
+train_index <- sample(seq_len(nrow(df)), size = sample_size)
+
+train <- df[train_index, ]
+test <- df[-train_index, ]
+```
+
+
+#Standardize the data
+```{r}
+#-----
+mu_precip <- mean(train$precip)
+sigma_precip <- sd(train$precip)
+mu_tair <- mean(train$tair)
+sigma_tair <- sd(train$tair)
+mu_wind <- mean(train$wind)
+sigma_wind <- sd(train$wind)
+mu_swr <- mean(train$swr)
+sigma_swr <- sd(train$swr)
+mu_sp <- mean(train$sp)
+sigma_sp <- sd(train$sp)
+mu_rh <- mean(train$rh)
+sigma_rh <- sd(train$rh)
+
+#store means and sds
+mu <- c(mu_precip, mu_tair, mu_wind, mu_swr, mu_sp, mu_rh)
+sigma <- c(sigma_precip, sigma_tair, sigma_wind, sigma_swr, sigma_sp, sigma_rh)
+var <- c("precip", "tair", "wind", "swr", "sp", "rh")
+mean_sd <- data.frame(cbind(var, mu, sigma))
+write.csv(mean_sd, file.path(mu_sigma_root, "mu_sigma_lightning_predictors.csv"))
+#-----
+
+train <- train %>%
+  mutate(precip = (precip-mu_precip)/sigma_precip) %>%
+  mutate(tair = (tair-mu_tair)/sigma_tair) %>%
+  mutate(wind = (wind-mu_wind)/sigma_wind) %>%
+  mutate(swr = (swr-mu_swr)/sigma_swr) %>%
+  mutate(sp = (sp-mu_sp)/sigma_sp) %>%
+  mutate(rh = (rh-mu_rh)/sigma_rh) 
+
+train <- train[,c("strikes","precip","tair", "wind", "swr", "sp", "rh")]
+head(train)
+
+test <- test %>%
+  mutate(precip = (precip-mu_precip)/sigma_precip) %>%
+  mutate(tair = (tair-mu_tair)/sigma_tair) %>%
+  mutate(wind = (wind-mu_wind)/sigma_wind) %>%
+  mutate(swr = (swr-mu_swr)/sigma_swr) %>%
+  mutate(sp = (sp-mu_sp)/sigma_sp) %>%
+  mutate(rh = (rh-mu_rh)/sigma_rh) %>%
+  mutate(lon = lon) %>%
+  mutate(lat = lat)
+
+test <- test[,c("lon", "lat", "year", "strikes", "precip", "tair", "wind", "swr", "sp", "rh")]
+
+plot(test)
+
+hist(test$strikes)
+```
+
+The gamma distribution cannot handle 0 values. the monthly summaries do have 0's, so we need to add a very small value so that the gamma distribution can handle the data:
+```{r}
+epsilon <- 1e-4  # small value
+train$strikes<- train$strikes + epsilon
+```
+
+Functions for calculating performance metrics
+```{r}
+# ============================================================
+# Bootstrap CI versions of each performance metric
+# Each function returns: estimate, ci_low, ci_high
+# Percentile CI: 2.5% and 97.5% from n_boot bootstrap samples
+# Resampling is done on the TEST SET rows / paired vectors
+# ============================================================
+
+# ---- helpers (small + boring, used by all) ----
+.rmse <- function(obs, pred) {
+  ok <- is.finite(obs) & is.finite(pred)
+  obs <- obs[ok]; pred <- pred[ok]
+  if (length(obs) == 0) return(NA_real_)
+  sqrt(mean((obs - pred)^2))
+}
+
+.safe_cor <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y)
+  x <- x[ok]; y <- y[ok]
+  if (length(x) < 2) return(NA_real_)
+  if (sd(x) == 0 || sd(y) == 0) return(NA_real_)
+  cor(x, y, use = "complete.obs")
+}
+
+.ci_from_boot <- function(boot_vals, conf = 0.95) {
+  alpha <- (1 - conf) / 2
+  boot_vals <- boot_vals[is.finite(boot_vals)]
+  if (length(boot_vals) == 0) {
+    return(list(ci_low = NA_real_, ci_high = NA_real_))
+  }
+  list(
+    ci_low  = as.numeric(stats::quantile(boot_vals, probs = alpha, na.rm = TRUE)),
+    ci_high = as.numeric(stats::quantile(boot_vals, probs = 1 - alpha, na.rm = TRUE))
+  )
+}
+
+# ============================================================
+# 1) Normalized RMSE (normalized by SD of observed)
+# ============================================================
+metric_nrmse_ci <- function(obs, pred, n_boot = 1000, conf = 0.95, seed = 123) {
+  ok <- is.finite(obs) & is.finite(pred)
+  obs <- obs[ok]; pred <- pred[ok]
+  N <- length(obs)
+
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  denom <- sd(obs)
+  est <- if (!is.finite(denom) || denom == 0) NA_real_ else .rmse(obs, pred) / denom
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    o <- obs[idx]; p <- pred[idx]
+    d <- sd(o)
+    if (!is.finite(d) || d == 0) return(NA_real_)
+    .rmse(o, p) / d
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 2) Correlation coefficient (Pearson)
+# ============================================================
+metric_cor_ci <- function(obs, pred, n_boot = 1000, conf = 0.95, seed = 123) {
+  ok <- is.finite(obs) & is.finite(pred)
+  obs <- obs[ok]; pred <- pred[ok]
+  N <- length(obs)
+
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  est <- .safe_cor(obs, pred)
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    .safe_cor(obs[idx], pred[idx])
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 3) Skill score (Perkins S-score)
+# ============================================================
+metric_sscore_ci <- function(obs, pred, nbins = 15,
+                             n_boot = 1000, conf = 0.95, seed = 123) {
+  ok <- is.finite(obs) & is.finite(pred)
+  obs <- obs[ok]; pred <- pred[ok]
+  N <- length(obs)
+
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  calculate_sscore <- function(obs, pred, nbins = 15) {
+    min_val <- min(c(obs, pred))
+    max_val <- max(c(obs, pred))
+    if (!is.finite(min_val) || !is.finite(max_val) || min_val == max_val) return(NA_real_)
+
+    breaks <- seq(min_val, max_val, length.out = nbins + 1)
+    hist_obs  <- hist(obs,  breaks = breaks, plot = FALSE)
+    hist_pred <- hist(pred, breaks = breaks, plot = FALSE)
+
+    prob_obs  <- hist_obs$counts  / sum(hist_obs$counts)
+    prob_pred <- hist_pred$counts / sum(hist_pred$counts)
+
+    sum(pmin(prob_obs, prob_pred))
+  }
+
+  est <- calculate_sscore(obs, pred, nbins = nbins)
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    calculate_sscore(obs[idx], pred[idx], nbins = nbins)
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 4) Spatial correlation
+#    (correlation of gridcell means across space)
+#    test must contain lon, lat, and strikes (obs)
+# ============================================================
+metric_spatial_cor_ci <- function(test, y_pred,
+                                  n_boot = 1000, conf = 0.95, seed = 123) {
+  test <- dplyr::as_tibble(test)
+  test$pred <- y_pred
+
+  test <- test %>% dplyr::filter(is.finite(strikes), is.finite(pred))
+  N <- nrow(test)
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  # point estimate on full test set
+  spatial_means <- test %>%
+    dplyr::group_by(lon, lat) %>%
+    dplyr::summarise(
+      obs_mean  = mean(strikes, na.rm = TRUE),
+      pred_mean = mean(pred,    na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  est <- .safe_cor(spatial_means$obs_mean, spatial_means$pred_mean)
+
+  # bootstrap resampling rows of the test set
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    tb <- test[idx, , drop = FALSE]
+
+    sm <- tb %>%
+      dplyr::group_by(lon, lat) %>%
+      dplyr::summarise(
+        obs_mean  = mean(strikes, na.rm = TRUE),
+        pred_mean = mean(pred,    na.rm = TRUE),
+        .groups = "drop"
+      )
+
+    .safe_cor(sm$obs_mean, sm$pred_mean)
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 5) Anomaly Correlation Coefficient (ACC)
+#    computed from annual means, then anomalies, then correlation
+# ============================================================
+metric_acc_ci <- function(year, obs, pred, n_boot = 1000, conf = 0.95, seed = 123) {
+  df <- dplyr::tibble(year = year, obs = obs, pred = pred) %>%
+    dplyr::filter(is.finite(year), is.finite(obs), is.finite(pred))
+
+  N <- nrow(df)
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  calc_acc_core <- function(df_in) {
+    annual <- df_in %>%
+      dplyr::group_by(year) %>%
+      dplyr::summarise(
+        obs  = mean(obs,  na.rm = TRUE),
+        pred = mean(pred, na.rm = TRUE),
+        .groups = "drop"
+      )
+    obs_anom  <- annual$obs  - mean(annual$obs,  na.rm = TRUE)
+    pred_anom <- annual$pred - mean(annual$pred, na.rm = TRUE)
+    .safe_cor(obs_anom, pred_anom)
+  }
+
+  est <- calc_acc_core(df)
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    calc_acc_core(df[idx, , drop = FALSE])
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# 6) Normalized RMSE of anomalies (nRMSE_anom)
+#    = RMSE(annual anomalies) / SD(observed annual anomalies)
+# ============================================================
+metric_nrmse_anom_ci <- function(year, obs, pred, n_boot = 1000, conf = 0.95, seed = 123) {
+  df <- dplyr::tibble(year = year, obs = obs, pred = pred) %>%
+    dplyr::filter(is.finite(year), is.finite(obs), is.finite(pred))
+
+  N <- nrow(df)
+  if (N == 0) return(list(estimate = NA_real_, ci_low = NA_real_, ci_high = NA_real_))
+
+  calc_nrmse_anom_core <- function(df_in) {
+    annual <- df_in %>%
+      dplyr::group_by(year) %>%
+      dplyr::summarise(
+        obs  = mean(obs,  na.rm = TRUE),
+        pred = mean(pred, na.rm = TRUE),
+        .groups = "drop"
+      )
+    obs_anom  <- annual$obs  - mean(annual$obs,  na.rm = TRUE)
+    pred_anom <- annual$pred - mean(annual$pred, na.rm = TRUE)
+
+    denom <- sd(obs_anom, na.rm = TRUE)
+    if (!is.finite(denom) || denom == 0) return(NA_real_)
+    sqrt(mean((obs_anom - pred_anom)^2, na.rm = TRUE)) / denom
+  }
+
+  est <- calc_nrmse_anom_core(df)
+
+  set.seed(seed)
+  boot <- replicate(n_boot, {
+    idx <- sample.int(N, size = N, replace = TRUE)
+    calc_nrmse_anom_core(df[idx, , drop = FALSE])
+  })
+
+  ci <- .ci_from_boot(boot, conf = conf)
+  list(estimate = est, ci_low = ci$ci_low, ci_high = ci$ci_high)
+}
+
+# ============================================================
+# Example calls
+# ============================================================
+# nrmse_res  <- metric_nrmse_ci(test$strikes, y_pred)
+# cor_res    <- metric_cor_ci(test$strikes, y_pred)
+# sscore_res <- metric_sscore_ci(test$strikes, y_pred, nbins = 15)
+# spcor_res  <- metric_spatial_cor_ci(test, y_pred)
+# acc_res    <- metric_acc_ci(test$year, test$strikes, y_pred)
+# nrmseA_res <- metric_nrmse_anom_ci(test$year, test$strikes, y_pred)
+
+```
+
+Train Gamma GLMs
+```{r}
+#swr + tair + rh + wind + precip +sp
+G13 <- glm(strikes ~ swr + tair + rh + precip + sp + wind,
+                 data = train,
+                 family = Gamma(link =log))
+
+# Save the model
+saveRDS(G13, file.path(rds_root, "G13_gamma_glm_lightning.rds"))
+
+# Verify it saved correctly by reloading and checking
+G13_check <- readRDS(file.path(rds_root, "G13_gamma_glm_lightning.rds"))
+cat("Model class:", class(G13_check), "\n")
+cat("Formula:    ", deparse(formula(G13_check)), "\n")
+cat("Predictors: ", paste(names(coef(G13_check))[-1], collapse = ", "), "\n")
+
+a <- G13$coefficients[1]
+b <- G13$coefficients[2]
+c <- G13$coefficients[3]
+d <- G13$coefficients[4]
+e <- G13$coefficients[5]
+f <- G13$coefficients[6]
+g <- G13$coefficients[7]
+
+G13_coefficients <- c(a, b, c, d, e, f, g)
+
+y_pred_G13 <- exp(a + b*test$swr + c*test$tair + d*test$rh + e*test$precip + f*test$sp + g*test$wind)
+
+nrmse_res_G13  <- metric_nrmse_ci(test$strikes, y_pred_G13)
+cor_res_G13    <- metric_cor_ci(test$strikes, y_pred_G13)
+sscore_res_G13 <- metric_sscore_ci(test$strikes, y_pred_G13, nbins = 15)
+spcor_res_G13  <- metric_spatial_cor_ci(test, y_pred_G13)
+acc_res_G13  <- metric_acc_ci(test$year, test$strikes, y_pred_G13)
+nrmseA_res_G13 <- metric_nrmse_anom_ci(test$year, test$strikes, y_pred_G13)
+
+#EXCLUDE WIND
+
+#swr + tair + rh + precip +sp
+G12 <- glm(strikes ~ swr + tair + rh + precip + sp,
+                 data = train,
+                 family = Gamma(link =log))
+
+a <- G12$coefficients[1]
+b <- G12$coefficients[2]
+c <- G12$coefficients[3]
+d <- G12$coefficients[4]
+e <- G12$coefficients[5]
+f <- G12$coefficients[6]
+
+G12_coefficients <- c(a, b, c, d, e, f)
+
+y_pred_G12 <- exp(a + b*test$swr + c*test$tair + d*test$rh + e*test$precip + f*test$sp)
+
+nrmse_res_G12  <- metric_nrmse_ci(test$strikes, y_pred_G12)
+cor_res_G12    <- metric_cor_ci(test$strikes, y_pred_G12)
+sscore_res_G12 <- metric_sscore_ci(test$strikes, y_pred_G12, nbins = 15)
+spcor_res_G12  <- metric_spatial_cor_ci(test, y_pred_G12)
+acc_res_G12  <- metric_acc_ci(test$year, test$strikes, y_pred_G12)
+nrmseA_res_G12 <- metric_nrmse_anom_ci(test$year, test$strikes, y_pred_G12)
+```
+
+# B13: Short Wave Radiation + Temperature + Precipitation + Wind + Precipitation + Surface Pressure
+
+Lightning strike rate modeled from a gamma distribution where mu and sigma are dependent on climate: shortwave radiation,  temperature, relative humidity, wind, precipitation, and surface pressure
+. 
+    S ~ dgamma( alpha , beta ),
+    alpha <- a_alpha + b_alpha * SWR + c_alpha * T + d_alpha * RH + e_alpha * W + f_alpha * P + g_alpha * SP,
+    beta <- a_beta + b_beta * SWR + c_beta * T + d_beta * RH + e_beta * W + f_beta * P + g_beta * SP,
+    
+```{r, echo=FALSE, results='hide', include=FALSE}
+
+dat <- list(
+  N = nrow(train),
+  S = train$strikes,
+  SWR = train$swr,
+  T = train$tair,
+  RH = train$rh,
+  W = train$wind,
+  P = train$precip,
+  SP = train$sp
+)
+
+
+# Compile and fit the Stan model
+init_list <- function() {
+  list(a_alpha = 1, b_alpha = 0.1, c_alpha = 0.1, d_alpha = 0.1, e_alpha = 0.1, f_alpha = 0.1, g_alpha = 0.1,
+       a_beta = 1, b_beta = 0.1, c_beta = 0.1, d_beta = 0.1, e_beta = 0.1, f_beta = 0.1, g_beta = 0.1)
+}
+
+
+if (!file.exists(file.path(rds_root, "Lightning/B13_gamma_bayes.rds"))) {
+  B13 <- stan(file = "01_gamma_swr_tair_rh_wind_precip_sp.stan", 
+            data = dat,
+            iter = 2000, 
+            chains = 4, 
+            init = init_list,
+            cores = min(parallel::detectCores(), 4))
+    saveRDS(B13, file = file.path(rds_root, "Lightning/B13_gamma_bayes.rds"))
+    } else {
+      B13 <- readRDS(file.path(rds_root, "Lightning/B13_gamma_bayes.rds"))
+    }
+
+
+```
+
+
+```{r}
+
+#print(B13, pars = c("a_alpha", "b_alpha", "c_alpha", "d_alpha", "e_alpha", "f_alpha", "g_alpha", "a_beta", "b_beta", "c_beta", "d_beta", "e_beta", "f_beta", "g_beta"))
+
+traceplot(B13)
+
+parameter_stats <- summary(B13)$summary[, c("mean", "sd")][1:14, 1:2]
+print(parameter_stats)
+
+summary_table <- data.frame(
+  parameter = rownames(parameter_stats),
+  mean = parameter_stats[, "mean"],
+  sd = parameter_stats[, "sd"]
+)
+
+# ggplot(summary_table, aes(x = parameter, y = mean)) +
+#   geom_point(color = "blue", size = 3) +  # Point for the mean
+#   geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.2) +  # Error bars for SD
+#   labs(y = "Parameter Estimate", x = "Parameter") +
+#   theme_minimal() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+#   ggtitle("Parameter Means and SDs from Stan Model")
+
+#store mean posterior sample for coefficient table
+a_alpha <- summary_table["a_alpha", "mean"]
+b_alpha <- summary_table["b_alpha", "mean"]
+c_alpha <- summary_table["c_alpha", "mean"]
+d_alpha <- summary_table["d_alpha", "mean"]
+e_alpha <- summary_table["e_alpha", "mean"]
+f_alpha <- summary_table["f_alpha", "mean"]
+g_alpha <- summary_table["g_alpha", "mean"]
+a_beta <- summary_table["a_beta", "mean"]
+b_beta <- summary_table["b_beta", "mean"]
+c_beta <- summary_table["c_beta", "mean"]
+d_beta <- summary_table["d_beta", "mean"]
+e_beta <- summary_table["e_beta", "mean"]
+f_beta <- summary_table["f_beta", "mean"]
+g_beta <- summary_table["g_beta", "mean"]
+
+B13_alpha_coefficients <- c(a_alpha, b_alpha, c_alpha, d_alpha, e_alpha, f_alpha, g_alpha)
+
+B13_beta_coefficients <- c(a_beta, b_beta, c_beta, d_beta, e_beta, f_beta, g_beta)
+```
+
+Make predictions
+```{r}
+#Extract posterior samples
+posterior_samples <- as.data.frame(B13)
+
+#Extract individual parameters
+a_alpha_samples <- posterior_samples$a_alpha
+b_alpha_samples <- posterior_samples$b_alpha
+c_alpha_samples <- posterior_samples$c_alpha
+d_alpha_samples <- posterior_samples$d_alpha
+e_alpha_samples <- posterior_samples$e_alpha
+f_alpha_samples <- posterior_samples$f_alpha
+g_alpha_samples <- posterior_samples$g_alpha
+a_beta_samples <- posterior_samples$a_beta
+b_beta_samples <- posterior_samples$b_beta
+c_beta_samples <- posterior_samples$c_beta
+d_beta_samples <- posterior_samples$d_beta
+e_beta_samples <- posterior_samples$e_beta
+f_beta_samples <- posterior_samples$f_beta
+g_beta_samples <- posterior_samples$g_beta
+
+#Number of posterior samples
+num_samples <- length(a_alpha_samples)
+
+#Number of test observations
+num_test <- length(test$swr)
+
+#Create vectors to store sampled alpha, beta, and predictions
+sampled_alpha <- numeric(num_test)
+sampled_beta <- numeric(num_test)
+sampled_predictions <- numeric(num_test)
+
+#Randomly select a posterior sample for each test observation
+posterior_index <- sample(1:num_samples, num_test, replace = TRUE)
+
+for (j in 1:num_test) {
+  #Pick a random posterior sample index
+  i <- posterior_index[j]  
+
+  #Compute alpha and beta for the test observation
+  sampled_alpha[j] <- exp(a_alpha_samples[i] + b_alpha_samples[i] * test$swr[j] + c_alpha_samples[i] * test$tair[j] + d_alpha_samples[i] * test$rh[j] + e_alpha_samples[i] * test$wind[j] + f_alpha_samples[i] * test$precip[j] + g_alpha_samples[i] * test$sp[j])
+  sampled_beta[j] <- exp(a_beta_samples[i] + b_beta_samples[i] * test$swr[j] + c_beta_samples[i] * test$tair[j] + d_beta_samples[i] * test$rh[j] + e_beta_samples[i] * test$wind[j] + f_beta_samples[i] * test$precip[j] + g_beta_samples[i] * test$sp[j])
+  
+  #Generate a single prediction from the Gamma distribution
+  sampled_predictions[j] <- rgamma(1, shape = sampled_alpha[j], rate = sampled_beta[j])
+}
+
+#Create a dataframe with observed and predicted values
+predictions_df <- data.frame(
+  actual = test$strikes,      #Observed lightning strikes
+  swr = test$swr,            #Climate predictor
+  tair = test$tair,            #Climate predictor
+  rh = test$rh,            #Climate predictor
+  wind = test$wind,            #Climate predictor
+  precip = test$precip,            #Climate predictor
+  sp = test$sp,            #Climate predictor
+  alpha = sampled_alpha,      #Sampled alpha for each observation
+  beta = sampled_beta,        #Sampled beta for each observation
+  sampled_pred = sampled_predictions  # Sampled prediction
+)
+
+#add small value back 
+predictions_df <- mutate(predictions_df, sampled_pred = sampled_pred + epsilon)
+
+#View predictions
+print(head(predictions_df))
+
+hist(predictions_df$sampled_pred, breaks=30, main = "predictions")
+
+hist(test$strikes, breaks=30, main = "observations")
+
+plot(test$swr, predictions_df$sampled_pred, color=test$sp, main="Lightning Predictions")
+plot(test$swr, test$strikes, color=test$sp, main="Lightning Observations")
+plot(predictions_df$sampled_pred, test$strikes, main="Observed vs. Predicted")
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+#store predictions for figures 
+y_pred_B13 <- predictions_df$sampled_pred
+```
+
+```{r}
+nrmse_res_B13  <- metric_nrmse_ci(test$strikes, y_pred_B13)
+cor_res_B13    <- metric_cor_ci(test$strikes, y_pred_B13)
+sscore_res_B13 <- metric_sscore_ci(test$strikes, y_pred_B13, nbins = 15)
+spcor_res_B13  <- metric_spatial_cor_ci(test, y_pred_B13)
+acc_res_B13  <- metric_acc_ci(test$year, test$strikes, y_pred_B13)
+nrmseA_res_B13 <- metric_nrmse_anom_ci(test$year, test$strikes, y_pred_B13)
+```
+
+```{r, echo=FALSE, results='hide', include=FALSE}
+
+dat <- list(
+  N = nrow(train),
+  S = train$strikes,
+  SWR = train$swr,
+  T = train$tair,
+  RH = train$rh,
+  P = train$precip,
+  SP = train$sp
+)
+
+
+# Compile and fit the Stan model
+init_list <- function() {
+  list(a_alpha = 1, b_alpha = 0.1, c_alpha = 0.1, d_alpha = 0.1, e_alpha = 0.1, f_alpha = 0.1, 
+       a_beta = 1, b_beta = 0.1, c_beta = 0.1, d_beta = 0.1, e_beta = 0.1, f_beta = 0.1)
+}
+
+if (!file.exists(file.path(rds_root, "Lightning/B12_gamma_bayes.rds"))) {
+  B12 <- stan(file = "01_gamma_swr_tair_rh_precip_sp.stan", 
+            data = dat,
+            iter = 2000, 
+            chains = 4, 
+            init = init_list,
+            cores = min(parallel::detectCores(), 4))
+    saveRDS(B12, file = file.path(rds_root, "Lightning/B12_gamma_bayes.rds"))
+    } else {
+      B12 <- readRDS(file.path(rds_root, "Lightning/B12_gamma_bayes.rds"))
+    }
+
+```
+
+
+```{r}
+
+#print(B12, pars = c("a_alpha", "b_alpha", "c_alpha", "d_alpha", "e_alpha", "f_alpha", "g_alpha", "a_beta", "b_beta", "c_beta", "d_beta", "e_beta", "f_beta", "g_beta"))
+
+traceplot(B12)
+
+parameter_stats <- summary(B12)$summary[, c("mean", "sd")][1:14, 1:2]
+print(parameter_stats)
+
+summary_table <- data.frame(
+  parameter = rownames(parameter_stats),
+  mean = parameter_stats[, "mean"],
+  sd = parameter_stats[, "sd"]
+)
+
+ggplot(summary_table, aes(x = parameter, y = mean)) +
+  geom_point(color = "blue", size = 3) +  # Point for the mean
+  geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.2) +  # Error bars for SD
+  labs(y = "Parameter Estimate", x = "Parameter") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Parameter Means and SDs from Stan Model")
+
+#store mean posterior sample for coefficient table
+a_alpha <- summary_table["a_alpha", "mean"]
+b_alpha <- summary_table["b_alpha", "mean"]
+c_alpha <- summary_table["c_alpha", "mean"]
+d_alpha <- summary_table["d_alpha", "mean"]
+e_alpha <- summary_table["e_alpha", "mean"]
+f_alpha <- summary_table["f_alpha", "mean"]
+a_beta <- summary_table["a_beta", "mean"]
+b_beta <- summary_table["b_beta", "mean"]
+c_beta <- summary_table["c_beta", "mean"]
+d_beta <- summary_table["d_beta", "mean"]
+e_beta <- summary_table["e_beta", "mean"]
+f_beta <- summary_table["f_beta", "mean"]
+
+
+B12_alpha_coefficients <- c(a_alpha, b_alpha, c_alpha, d_alpha, e_alpha, f_alpha)
+
+B12_beta_coefficients <- c(a_beta, b_beta, c_beta, d_beta, e_beta, f_beta)
+```
+
+Make predictions
+```{r}
+#Extract posterior samples
+posterior_samples <- as.data.frame(B12)
+
+#Extract individual parameters
+a_alpha_samples <- posterior_samples$a_alpha
+b_alpha_samples <- posterior_samples$b_alpha
+c_alpha_samples <- posterior_samples$c_alpha
+d_alpha_samples <- posterior_samples$d_alpha
+e_alpha_samples <- posterior_samples$e_alpha
+f_alpha_samples <- posterior_samples$f_alpha
+a_beta_samples <- posterior_samples$a_beta
+b_beta_samples <- posterior_samples$b_beta
+c_beta_samples <- posterior_samples$c_beta
+d_beta_samples <- posterior_samples$d_beta
+e_beta_samples <- posterior_samples$e_beta
+f_beta_samples <- posterior_samples$f_beta
+
+
+#Number of posterior samples
+num_samples <- length(a_alpha_samples)
+
+#Number of test observations
+num_test <- length(test$swr)
+
+#Create vectors to store sampled alpha, beta, and predictions
+sampled_alpha <- numeric(num_test)
+sampled_beta <- numeric(num_test)
+sampled_predictions <- numeric(num_test)
+
+#Randomly select a posterior sample for each test observation
+posterior_index <- sample(1:num_samples, num_test, replace = TRUE)
+
+for (j in 1:num_test) {
+  #Pick a random posterior sample index
+  i <- posterior_index[j]  
+
+  #Compute alpha and beta for the test observation
+  sampled_alpha[j] <- exp(a_alpha_samples[i] + b_alpha_samples[i] * test$swr[j] + c_alpha_samples[i] * test$tair[j] + d_alpha_samples[i] * test$rh[j] + e_alpha_samples[i] * test$precip[j] + f_alpha_samples[i] * test$sp[j])
+  sampled_beta[j] <- exp(a_beta_samples[i] + b_beta_samples[i] * test$swr[j] + c_beta_samples[i] * test$tair[j] + d_beta_samples[i] * test$rh[j] + e_beta_samples[i] * test$precip[j] + f_beta_samples[i] * test$sp[j])
+  
+  #Generate a single prediction from the Gamma distribution
+  sampled_predictions[j] <- rgamma(1, shape = sampled_alpha[j], rate = sampled_beta[j])
+}
+
+#Create a dataframe with observed and predicted values
+predictions_df <- data.frame(
+  actual = test$strikes,      #Observed lightning strikes
+  swr = test$swr,            #Climate predictor
+  tair = test$tair,            #Climate predictor
+  rh = test$rh,            #Climate predictor
+  precip = test$precip,            #Climate predictor
+  sp = test$sp,            #Climate predictor
+  alpha = sampled_alpha,      #Sampled alpha for each observation
+  beta = sampled_beta,        #Sampled beta for each observation
+  sampled_pred = sampled_predictions  # Sampled prediction
+)
+
+#add small value back 
+predictions_df <- mutate(predictions_df, sampled_pred = sampled_pred + epsilon)
+
+#View predictions
+print(head(predictions_df))
+
+hist(predictions_df$sampled_pred, breaks=30, main = "predictions")
+
+hist(test$strikes, breaks=30, main = "observations")
+
+plot(test$swr, predictions_df$sampled_pred, color=test$sp, main="Lightning Predictions")
+plot(test$swr, test$strikes, color=test$sp, main="Lightning Observations")
+plot(predictions_df$sampled_pred, test$strikes, main="Observed vs. Predicted")
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+#store predictions for figures 
+y_pred_B12 <- predictions_df$sampled_pred
+```
+
+
+```{r}
+nrmse_res_B12  <- metric_nrmse_ci(test$strikes, y_pred_B12)
+cor_res_B12    <- metric_cor_ci(test$strikes, y_pred_B12)
+sscore_res_B12 <- metric_sscore_ci(test$strikes, y_pred_B12, nbins = 15)
+spcor_res_B12  <- metric_spatial_cor_ci(test, y_pred_B12)
+acc_res_B12  <- metric_acc_ci(test$year, test$strikes, y_pred_B12)
+nrmseA_res_B12 <- metric_nrmse_anom_ci(test$year, test$strikes, y_pred_B12)
+```
+
+
+Put performace metrics together and plot
+```{r}
+
+nrmse <- c(nrmse_res_G13$estimate, nrmse_res_G12$estimate, nrmse_res_B13$estimate, nrmse_res_B12$estimate)
+cor <- c(cor_res_G13$estimate, cor_res_G12$estimate, cor_res_B13$estimate, cor_res_B12$estimate)
+sscore <- c(sscore_res_G13$estimate, sscore_res_G12$estimate, sscore_res_B13$estimate, sscore_res_B12$estimate)
+spcor <- c(spcor_res_G13$estimate, spcor_res_G12$estimate, spcor_res_B13$estimate, spcor_res_B12$estimate)
+acc <- c(acc_res_G13$estimate, acc_res_G12$estimate, acc_res_B13$estimate, acc_res_B12$estimate)
+nrmseA <- c(nrmseA_res_G13$estimate, nrmseA_res_G12$estimate, nrmseA_res_B13$estimate, nrmseA_res_B12$estimate)
+
+nrmse_ci_low <- c(nrmse_res_G13$ci_low, nrmse_res_G12$ci_low, nrmse_res_B13$ci_low, nrmse_res_B12$ci_low)
+cor_ci_low <- c(cor_res_G13$ci_low, cor_res_G12$ci_low, cor_res_B13$ci_low, cor_res_B12$ci_low)
+sscore_ci_low <- c(sscore_res_G13$ci_low, sscore_res_G12$ci_low, sscore_res_B13$ci_low, sscore_res_B12$ci_low)
+spcor_ci_low <- c(spcor_res_G13$ci_low, spcor_res_G12$ci_low, spcor_res_B13$ci_low, spcor_res_B12$ci_low)
+acc_ci_low <- c(acc_res_G13$ci_low, acc_res_G12$ci_low, acc_res_B13$ci_low, acc_res_B12$ci_low)
+nrmseA_ci_low <- c(nrmseA_res_G13$ci_low, nrmseA_res_G12$ci_low, nrmseA_res_B13$ci_low, nrmseA_res_B12$ci_low)
+
+nrmse_ci_high <- c(nrmse_res_G13$ci_high, nrmse_res_G12$ci_high, nrmse_res_B13$ci_high, nrmse_res_B12$ci_high)
+cor_ci_high <- c(cor_res_G13$ci_high, cor_res_G12$ci_high, cor_res_B13$ci_high, cor_res_B12$ci_high)
+sscore_ci_high <- c(sscore_res_G13$ci_high, sscore_res_G12$ci_high, sscore_res_B13$ci_high, sscore_res_B12$ci_high)
+spcor_ci_high <- c(spcor_res_G13$ci_high, spcor_res_G12$ci_high, spcor_res_B13$ci_high, spcor_res_B12$ci_high)
+acc_ci_high <- c(acc_res_G13$ci_high, acc_res_G12$ci_high, acc_res_B13$ci_high, acc_res_B12$ci_high)
+nrmseA_ci_high <- c(nrmseA_res_G13$ci_high, nrmseA_res_G12$ci_high, nrmseA_res_B13$ci_high, nrmseA_res_B12$ci_high)
+
+name <- c("G13", "G12", "B13", "B12")
+
+method <- c("Gamma GLM", "Gamma GLM", "Gamma Bayes", "Gamma Bayes")
+
+predictors <- c("RH + Rsds + T + Ps + Pr + U10", "RH + Rsds + T + Ps + Pr", "RH + Rsds + T + Ps + Pr + U10", "RH + Rsds + T + Ps + Pr")
+
+metrics <- data.frame(cbind(name, method, predictors, nrmse, nrmse_ci_low, nrmse_ci_high, cor, cor_ci_low, cor_ci_high, sscore, sscore_ci_low, sscore_ci_high, spcor, spcor_ci_low, spcor_ci_high, acc, acc_ci_low, acc_ci_high, nrmseA, nrmseA_ci_low, nrmseA_ci_high))
+
+metrics <- metrics |>
+  mutate(across(-c(name, method, predictors), as.numeric))
+
+#export
+write.csv(metrics, file.path(performance_root, "lightning_performance.csv"))
+```
+
+
+
+######
+Try other Priors for the bayes models
+```{r}
+# ── Step 1: Add prior parameters to data list ─────────────────────────────────
+# These will be passed as data so the Stan model can use them
+# without recompilation when changed
+
+make_dat <- function(prior_mu_a_beta, prior_sigma_intercepts, prior_sigma_slopes) {
+  list(
+    N                   = nrow(train),
+    S                   = train$strikes,
+    SWR                 = train$swr,
+    T                   = train$tair,
+    RH                  = train$rh,
+    P                   = train$precip,
+    SP                  = train$sp,
+    mu_a_beta           = prior_mu_a_beta,
+    sigma_intercepts    = prior_sigma_intercepts,
+    sigma_slopes        = prior_sigma_slopes
+  )
+}
+
+
+# ── Step 3: Compile ONCE ──────────────────────────────────────────────────────
+cat("Compiling Stan model...\n")
+sm_compiled <- stan_model(file = "gamma_swr_tair_rh_precip_sp.stan")
+saveRDS(sm_compiled, file.path(rds_root, "Lightning/compiled_gamma_bayes.rds"))
+# Next session: sm_compiled <- readRDS(file.path(rds_root, "Lightning/compiled_gamma_bayes.rds"))
+
+# ── Step 4: Define prior configurations ───────────────────────────────────────
+configs <- list(
+  tight  = list(mu_a_beta = 0, sigma_intercepts = 1, sigma_slopes = 1),  # original
+  medium = list(mu_a_beta = 5, sigma_intercepts = 3, sigma_slopes = 2),
+  wide   = list(mu_a_beta = 5, sigma_intercepts = 5, sigma_slopes = 3)
+)
+
+init_list <- function() {
+  list(
+    a_alpha = 1,   b_alpha = 0.1, c_alpha = 0.1,
+    d_alpha = 0.1, e_alpha = 0.1, f_alpha = 0.1,
+    a_beta  = 4,   b_beta  = 0.1, c_beta  = 0.1,   # initialise a_beta near expected value
+    d_beta  = 0.1, e_beta  = 0.1, f_beta  = 0.1
+  )
+}
+
+# ── Step 5: Fit all configurations ────────────────────────────────────────────
+fits_B12 <- lapply(names(configs), function(cfg_name) {
+
+  rds_path <- file.path(rds_root,
+                         sprintf("Lightning/B12_gamma_bayes_%s.rds", cfg_name))
+
+  if (file.exists(rds_path)) {
+    message("Loading cached model: ", cfg_name)
+    return(readRDS(rds_path))
+  }
+
+  message("Fitting model: ", cfg_name)
+  cfg <- configs[[cfg_name]]
+
+  fit <- sampling(
+    sm_compiled,
+    data    = make_dat(cfg$mu_a_beta,
+                       cfg$sigma_intercepts,
+                       cfg$sigma_slopes),
+    iter    = 2000,
+    chains  = 4,
+    init    = init_list,
+    cores   = min(parallel::detectCores(), 4),
+    seed    = 123,
+    refresh = 200
+  )
+
+  saveRDS(fit, rds_path)
+  fit
+})
+
+names(fits_B12) <- names(configs)
+
+# ── Step 6: Quick coefficient comparison across configurations ────────────────
+lapply(names(fits_B12), function(cfg_name) {
+  fit <- fits_B12[[cfg_name]]
+  summ <- summary(fit, pars = c("a_alpha", "a_beta"))$summary
+  cat(sprintf("\n[%s] a_alpha = %.3f | a_beta = %.3f\n",
+              cfg_name,
+              summ["a_alpha", "mean"],
+              summ["a_beta",  "mean"]))
+})
+
+```
+
+```{r}
+# ── Helper: generate predictions from a fitted Stan model ─────────────────────
+predict_bayes_lightning <- function(fit, test_df, has_wind = FALSE,
+                                    epsilon = 1e-10, seed = 123) {
+  set.seed(seed)
+  posterior_samples <- as.data.frame(fit)
+
+  # Parameter names depend on whether wind (e_alpha/e_beta) is included
+  param_names_alpha <- c("a_alpha", "b_alpha", "c_alpha",
+                          "d_alpha", "e_alpha", "f_alpha")
+  param_names_beta  <- c("a_beta",  "b_beta",  "c_beta",
+                          "d_beta",  "e_beta",  "f_beta")
+  if (has_wind) {
+    param_names_alpha <- c(param_names_alpha, "g_alpha")
+    param_names_beta  <- c(param_names_beta,  "g_beta")
+  }
+
+  num_samples  <- nrow(posterior_samples)
+  num_test     <- nrow(test_df)
+  post_idx     <- sample(seq_len(num_samples), num_test, replace = TRUE)
+
+  sampled_pred <- numeric(num_test)
+
+  for (j in seq_len(num_test)) {
+    i <- post_idx[j]
+
+    # Build linear predictor for alpha
+    lp_alpha <- posterior_samples[i, "a_alpha"] +
+                posterior_samples[i, "b_alpha"] * test_df$swr[j]   +
+                posterior_samples[i, "c_alpha"] * test_df$tair[j]  +
+                posterior_samples[i, "d_alpha"] * test_df$rh[j]    +
+                posterior_samples[i, "e_alpha"] * test_df$precip[j] +
+                posterior_samples[i, "f_alpha"] * test_df$sp[j]
+
+    # Build linear predictor for beta
+    lp_beta  <- posterior_samples[i, "a_beta"]  +
+                posterior_samples[i, "b_beta"]  * test_df$swr[j]   +
+                posterior_samples[i, "c_beta"]  * test_df$tair[j]  +
+                posterior_samples[i, "d_beta"]  * test_df$rh[j]    +
+                posterior_samples[i, "e_beta"]  * test_df$precip[j] +
+                posterior_samples[i, "f_beta"]  * test_df$sp[j]
+
+    if (has_wind) {
+      lp_alpha <- lp_alpha + posterior_samples[i, "g_alpha"] * test_df$wind[j]
+      lp_beta  <- lp_beta  + posterior_samples[i, "g_beta"]  * test_df$wind[j]
+    }
+
+    alpha_j <- exp(lp_alpha)
+    beta_j  <- exp(lp_beta)
+    sampled_pred[j] <- rgamma(1, shape = alpha_j, rate = beta_j) + epsilon
+  }
+
+  sampled_pred
+}
+
+# ── Compute metrics for each configuration in fits_B12 ────────────────────────
+# Assumes fits_B12 is a named list: list(tight = ..., medium = ..., wide = ...)
+# Adjust has_wind = FALSE for B12 (no wind), TRUE for B13
+
+new_rows <- lapply(names(fits_B12), function(cfg_name) {
+
+  cat("Computing metrics for B12 —", cfg_name, "...\n")
+  fit <- fits_B12[[cfg_name]]
+
+  # Generate predictions
+  y_pred <- predict_bayes_lightning(fit, test,
+                                     has_wind = FALSE,  # B12 excludes wind
+                                     seed     = 123)
+
+  # Compute metrics using your existing functions
+  nrmse_res  <- metric_nrmse_ci(test$strikes,  y_pred)
+  cor_res    <- metric_cor_ci(test$strikes,    y_pred)
+  sscore_res <- metric_sscore_ci(test$strikes, y_pred, nbins = 15)
+  spcor_res  <- metric_spatial_cor_ci(test,    y_pred)
+  acc_res    <- metric_acc_ci(test$year, test$strikes, y_pred)
+  nrmseA_res <- metric_nrmse_anom_ci(test$year, test$strikes, y_pred)
+
+  data.frame(
+    name           = paste0("B12_", cfg_name),
+    method         = "Gamma Bayes",
+    predictors     = "RH + Rsds + T + Ps + Pr",
+    nrmse          = nrmse_res$estimate,
+    nrmse_ci_low   = nrmse_res$ci_low[1],
+    nrmse_ci_high  = nrmse_res$ci_high[2],
+    cor            = cor_res$estimate,
+    cor_ci_low     = cor_res$ci_low[1],
+    cor_ci_high    = cor_res$ci_high[2],
+    sscore         = sscore_res$estimate,
+    sscore_ci_low  = sscore_res$ci_low[1],
+    sscore_ci_high = sscore_res$ci_high[2],
+    spcor          = spcor_res$estimate,
+    spcor_ci_low   = spcor_res$ci_low[1],
+    spcor_ci_high  = spcor_res$ci_high[2],
+    acc            = acc_res$estimate,
+    acc_ci_low     = acc_res$ci_low[1],
+    acc_ci_high    = acc_res$ci_high[2],
+    nrmseA         = nrmseA_res$estimate,
+    nrmseA_ci_low  = nrmseA_res$ci_low[1],
+    nrmseA_ci_high = nrmseA_res$ci_high[2],
+    row.names      = NULL
+  )
+})
+
+# ── Append to existing metrics dataframe ──────────────────────────────────────
+metrics <- bind_rows(metrics, new_rows)
+rownames(metrics) <- NULL
+print(metrics)
+
+
+write.csv(metrics, file.path(performance_root, "lightning_performance.csv"))
+```
+
+
+
+```{r}
+p_nrmse <- ggplot(metrics,
+                aes(x = nrmse, y = predictors, color=method, shape=name)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = nrmse_ci_low,
+                     xmax = nrmse_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_x_reverse() +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  labs(
+    x = "nRMSE",
+    y = NULL
+  ) +
+  ggtitle("(a)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
+  theme(legend.position = "none")
+
+p_cor <- ggplot(metrics,
+                aes(x = cor, y = predictors, color=method, shape=name)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = cor_ci_low,
+                     xmax = cor_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  labs(
+    x = "Correlation between Obs and Pred",
+    y = NULL
+  ) +
+  ggtitle("(b)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
+  theme(legend.position = "none")
+
+p_sscore <- ggplot(metrics,
+                aes(x = sscore, y = predictors, color=method, shape=name)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = sscore_ci_low,
+                     xmax = sscore_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  labs(
+    x = "S-score",
+    y = NULL
+  ) +
+  ggtitle("(c)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
+  theme(legend.position = "none")
+
+p_spcor <- ggplot(metrics,
+                aes(x = spcor, y = predictors, color=method, shape=name)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = spcor_ci_low,
+                     xmax = spcor_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  #xlim(0.4, 1) +
+  labs(
+    x = "Spatial Cor",
+    y = NULL
+  ) +
+  ggtitle("(d)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
+  theme(legend.position = "none")
+
+p_acc <- ggplot(metrics,
+                aes(x = acc, y = predictors, color=method, shape=name)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = acc_ci_low,
+                     xmax = acc_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  labs(
+    x = "Anomaly Cor Coeff",
+    y = NULL
+  ) +
+  ggtitle("(e)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) 
+
+p_nrmseA <- ggplot(metrics,
+                aes(x = nrmseA, y = predictors, color=method, shape=name)) +
+  geom_point(size = 2.8, alpha = 0.9,
+                 position = position_dodge(width = 0.6)) +
+  # --- confidence intervals ---
+  geom_errorbarh(aes(xmin = nrmseA_ci_low,
+                     xmax = nrmseA_ci_high),
+                 height = 0.25,
+                 alpha = 0.6,
+                 linewidth = 0.5,
+                 position = position_dodge(width = 0.6)) +
+  scale_x_reverse() +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 15)) +
+  labs(
+    x = "nRMSE of Anomalies",
+    y = NULL,
+  ) +
+  ggtitle("(f)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.margin=ggplot2::margin(t = 10, r =10, b = 10, l = 30)) +
+  theme(legend.position = "none")
+
+legend_plot <- ggplot(data=metrics, aes(x=nrmseA, y=predictors, color=method)) + geom_point()  +
+  theme(
+    legend.position   = "bottom",
+    legend.box        = "horizontal",
+    legend.title      = element_text(size = 10),
+    legend.text       = element_text(size = 9),
+    legend.key.height = unit(0.5, "cm"),
+    legend.key.width  = unit(1.0, "cm"),
+    legend.spacing.x  = unit(2, "cm")
+  )
+
+shared_legend <- ggpubr::get_legend(legend_plot)
+
+blank_plot <- ggplot() + theme_void()
+
+fig_panels <- cowplot::plot_grid(
+  p_nrmse, p_cor, p_sscore, p_spcor, p_acc, p_nrmseA,
+  ncol = 2,
+  align = "h"
+)
+
+plot_grid(
+  fig_panels,
+  shared_legend,
+  ncol = 1,
+  rel_heights = c(1, 0.05)
+)
+
+# grid.arrange(p_nrmse, p_cor, p_sscore, p_spcor, p_acc, p_nrmseA, nrow=3, ncol=2, heights=c(1,1,1), widths=c(1,1), layout_matrix=rbind(c(1, 2), c(3, 4), c(5, 6)))
+```
+
+Map observations and predictions
+
+Alaska polygon
+```{r}
+# Get USA polygon
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+# Filter to Alaska only
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+```
+
+```{r}
+test <- cbind(test, strikes_pred=y_pred_G13)
+hist(test$strikes)
+hist(test$strikes_pred)
+
+```
+
+```{r}
+#calculate bias for lightning prediction
+plot_df <- test %>%
+  group_by(lat, lon) %>%
+  summarise(
+    bias = mean(strikes_pred - strikes, na.rm = TRUE),
+    strikes=mean(strikes),
+    strikes_pred=mean(strikes_pred),
+    .groups = "drop"
+  )
+
+#global min and max strike rates
+min_value_strike <- min(c(plot_df$strikes, plot_df$strikes_pred), na.rm = TRUE)
+max_value_strike <- max(c(plot_df$strikes, plot_df$strikes_pred), na.rm = TRUE)
+```
+
+
+Elevation plot
+```{r}
+library(geodata)
+library(terra)
+
+# Download SRTM elevation data for Alaska
+# Alaska spans multiple tiles so we download by country
+
+# 1. Download and crop
+elev <- geodata::elevation_global(res = 10, path = tempdir())
+alaska_ext <- ext(-170, -130, 51, 72)
+elev_alaska <- crop(elev, alaska_ext)
+
+# 2. Mask to Alaska polygon
+alaska_vect <- terra::vect(alaska)
+elev_masked <- terra::mask(elev_alaska, alaska_vect)
+
+# 3. Convert to data frame — use elev_masked instead of elev_alaska
+elev_df <- as.data.frame(elev_masked, xy = TRUE)
+names(elev_df) <- c("lon", "lat", "elevation")
+elev_df <- elev_df %>% filter(!is.na(elevation), elevation >= 0)
+
+p_elevation <- ggplot() +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250)) +  # contour interval in metres
+  geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) +
+  xlim(-170, -130) +
+  ylim(51, 72) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(h)") +
+  theme_minimal() +
+  theme(
+    axis.title.x     = element_text(size=11),
+    axis.title.y     = element_text(size=11),
+    axis.text.y      = element_text(size=11),
+    axis.text.x      = element_text(size=11),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2),
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2)
+  )
+
+p_elevation
+```
+
+Make maps!
+
+```{r}
+p_strike <- ggplot(plot_df, aes(x = lon, y = lat, fill = strikes_pred)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+    direction = -1,
+    limits = c(min_value_strike, max_value_strike), 
+    name = expression(atop("Predicted lightning", "strikes/month/km"^2)),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(a)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.position = c(0.65, 0.16)) +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250),
+               inherit.aes = FALSE) 
+
+p_strike
+
+p_strike_obs <- ggplot(plot_df, aes(x = lon, y = lat, fill = strikes)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  scale_fill_viridis_c(
+    option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+    direction = -1,
+    limits = c(min_value_strike, max_value_strike), 
+    name = expression(atop("Observed lightning", "strikes/month/km"^2)),
+    guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(d)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.position = c(0.65, 0.16)) +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250),
+               inherit.aes = FALSE)
+
+p_strike_obs
+
+max_abs_bias <- max(abs(plot_df$bias), na.rm = TRUE)
+
+p_strike_bias <- ggplot(plot_df, aes(x = lon, y = lat, fill = bias)) +
+  geom_raster() +
+  xlim(-170, -130) +
+  geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3, inherit.aes = FALSE) +
+  # scale_fill_viridis_c(
+  #   option = "plasma",  # Default Viridis color scale (use "cividis" or "plasma" if needed)
+  #   direction = -1,
+  #   name = expression(atop("Mean Bias", "strikes/month/km"^2)),
+  #   guide = guide_colorbar(direction = "horizontal", title.position = "top"))  +
+   scale_fill_distiller(
+  palette = "PuOr",
+  limits = c(-max_abs_bias, max_abs_bias),
+  name = expression(atop("Mean Bias", "strikes/month/km"^2)),
+  guide = guide_colorbar(direction = "horizontal", title.position = "top")
+) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(g)") +
+  theme_minimal() +
+  theme(legend.position="bottom") +
+  theme(
+    axis.title.x = element_text(size=11),
+    axis.title.y = element_text(size=11),
+    axis.text.y = element_text(size=11),
+    axis.text.x = element_text(size=11),
+    legend.text = element_text(size = 8, angle = 45, hjust = 1),
+    legend.title = element_text(size = 8, hjust = 0),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2), 
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2),
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    legend.position = c(0.65, 0.16)) +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250),
+               inherit.aes = FALSE) 
+
+p_strike_bias
+
+p_strike + p_strike_obs + p_strike_bias
+```
+
+Export predictions
+```{r}
+write.csv(test, file.path(predictions_root, "lightning_predictions.csv"))
+```
+
+
+
+
+
+
+
+
