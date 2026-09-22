@@ -1,0 +1,433 @@
+---
+title: "Paleo comparison with training period"
+author: "Charlotte Uden"
+date: "2026-08-12"
+output: html_document
+---
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(geodata)
+library(terra)
+library(data.table)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+```{r}
+df_paleo <- fread(file.path(base_path, "Paleo_Reconstructions/predictions_paleo_posterior_no_outliers_cap.csv"))
+train_pred_obs <- fread(file.path(base_path, "Models/Pipeline/predictions_training_posterior_bb_no_outliers_cap.csv"))
+```
+
+
+
+
+Strike rate
+Plot total 10 year strike count and compare with modern 10 year total:
+```{r}
+
+ggplot(df_modern, aes(x=r_strike_obs)) + geom_density() + ggtitle("observed 2002-2011")
+ggplot(df_modern, aes(x=r_strike)) + geom_density() + ggtitle("predicted 2002-2011")
+ggplot(df_paleo, aes(x=r_strike)) + geom_density() + ggtitle("predicted paleo")
+
+var_paleo <-  "r_strike"
+y_lable <- "Strike rate" 
+main <- "(a)"
+
+#get 10 year total for modern period
+modern_total <- sum(df_modern$r_strike_obs) 
+#modern_total_area_diff <- modern_total * area_diff
+modern_predicted_total <- sum(df_modern$r_strike)  
+
+#collapse to one Alaska-wide total per summer (year), sum across all gridcells and all three summer months.
+df_year <- df_paleo %>%
+  dplyr::select(year, r_strike) %>%
+  group_by(year) %>%
+  summarise(annual_total = sum(r_strike, na.rm = TRUE), .groups = "drop")
+
+#sum across 10 year bins
+df_summary <- df_year %>%
+  mutate(decade_bin = floor(year / 10) * 10) %>%
+  group_by(decade_bin) %>%
+  summarise(
+    decade_total      = sum(annual_total, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+p1 <- ggplot() +
+  geom_point(data = df_summary, aes(x = as.factor(decade_bin), y = decade_total),
+             size = 3, alpha = 0.6) +
+  scale_x_discrete(breaks = as.character(seq(min(df_summary$decade_bin),
+                                              max(df_summary$decade_bin), by = 500))) +
+  scale_y_log10(breaks = scales::breaks_log(n = 5), labels = scales::label_number()) +
+  geom_hline(
+    aes(yintercept = modern_total, color = "2002-2011 observed"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+  # geom_hline(
+  #   aes(yintercept = modern_total_area_diff, color = "2002-2011 observed area differnece"), 
+  #   linetype = "dashed",
+  #   linewidth = 1) +
+  geom_hline(
+    aes(yintercept = modern_predicted_total, color = "2002-2011 predicted"), 
+    linetype = "dashed",
+    linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year (10-yr bin)", y = y_lable,
+       title = main, color = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+p1
+```
+Gridcell strike rate
+
+```{r}
+# df_modern <- mutate(df_modern, gridcell_r_strike = r_strike_obs*area)
+# df_modern <- mutate(df_modern, gridcell_r_strike_pred = r_strike*area)
+# df_paleo <- mutate(df_paleo, gridcell_r_strike = r_strike*area)
+# 
+# summary(df_modern$gridcell_r_strike)
+# summary(df_modern$gridcell_r_strike_pred)
+# summary(df_paleo$gridcell_r_strike)
+# 
+# ggplot(df_modern, aes(x=gridcell_r_strike)) + geom_density() + ggtitle("observed 2002-2011")
+# ggplot(df_modern, aes(x=gridcell_r_strike_pred)) + geom_density() + ggtitle("predicted 2002-2011")
+# ggplot(df_paleo, aes(x=gridcell_r_strike)) + geom_density() + ggtitle("predicted paleo")
+# 
+# var_paleo <-  "gridcell_r_strike"
+# y_lable <- "Strike rate per gridcell" 
+# main <- "(a)"
+# 
+# #get 10 year total for modern period
+# modern_total <- sum(df_modern$gridcell_r_strike) 
+# modern_total_area_diff <- modern_total * area_diff
+# modern_predicted_total <- sum(df_modern$gridcell_r_strike_pred) 
+# 
+# #collapse to one Alaska-wide total per summer (year), sum across all gridcells and all three summer months.
+# df_year <- df_paleo %>%
+#   dplyr::select(year, gridcell_r_strike) %>%
+#   group_by(year) %>%
+#   summarise(annual_total = sum(gridcell_r_strike, na.rm = TRUE), .groups = "drop")
+# 
+# #sum across 10 year bins
+# df_summary <- df_year %>%
+#   mutate(decade_bin = floor(year / 10) * 10) %>%
+#   group_by(decade_bin) %>%
+#   summarise(
+#     decade_total      = sum(annual_total, na.rm = TRUE),
+#     .groups   = "drop"
+#   )
+# 
+# p1 <- ggplot() +
+#   geom_point(data = df_summary, aes(x = as.factor(decade_bin), y = decade_total),
+#              size = 3, alpha = 0.6) +
+#   scale_x_discrete(breaks = as.character(seq(min(df_summary$decade_bin),
+#                                               max(df_summary$decade_bin), by = 500))) +
+#   scale_y_log10(breaks = scales::breaks_log(n = 5), labels = scales::label_number()) +
+#   geom_hline(
+#     aes(yintercept = modern_total, color = "2002-2011 observed"),  # Horizontal line
+#     linetype = "dashed",
+#     linewidth = 1) +
+#   geom_hline(
+#     aes(yintercept = modern_total_area_diff, color = "2002-2011 observed area differnece"), 
+#     linetype = "dashed",
+#     linewidth = 1) +
+#   geom_hline(
+#     aes(yintercept = modern_predicted_total, color = "2002-2011 predicted"), 
+#     linetype = "dashed",
+#     linewidth = 1) +
+#   theme_minimal() +
+#   labs(x = "Year (10-yr bin)", y = y_lable,
+#        title = main, color = NULL) +
+#   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+# p1
+```
+
+
+
+Strike count
+Plot total 10 year strike count and compare with modern 10 year total:
+```{r}
+var_paleo <-  "n_strikes"
+y_lable <- "Strike count" 
+main <- "(a)"
+
+#get 10 year total for modern period
+modern_total <- sum(df_modern$n_strikes_obs) 
+modern_mean <- mean(df_modern$n_strikes_obs) 
+modern_median <- median(df_modern$n_strikes_obs) 
+modern_max <- max(df_modern$n_strikes_obs) 
+modern_min <- min(df_modern$n_strikes_obs) 
+#modern_total_area_diff <- modern_total * area_diff
+
+#collapse to one Alaska-wide total per summer (year), sum across all gridcells and all three summer months.
+df_year <- df_paleo %>%
+  dplyr::select(year, n_strikes) %>%
+  group_by(year) %>%
+  summarise(annual_total = sum(n_strikes, na.rm = TRUE), .groups = "drop")
+
+#sum across 10 year bins
+df_summary <- df_year %>%
+  mutate(decade_bin = floor(year / 10) * 10) %>%
+  group_by(decade_bin) %>%
+  summarise(
+    decade_total      = sum(annual_total, na.rm = TRUE),
+    decade_mean      = mean(annual_total, na.rm = TRUE),
+    decade_median      = median(annual_total, na.rm = TRUE),
+    decade_max      = max(annual_total, na.rm = TRUE),
+    decade_min      = min(annual_total, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+df_long <- df_summary %>%
+  dplyr::select(decade_bin, decade_total, decade_mean, decade_median, decade_max, decade_min) %>%
+  pivot_longer(
+    cols = c(decade_total, decade_mean, decade_median, decade_max, decade_min),
+    names_to = "metric",
+    values_to = "value"
+  )
+
+p1 <- ggplot() +
+  geom_point(data = df_long, aes(x = as.factor(decade_bin), y = value, color = metric),
+             size = 3, alpha = 0.6) +
+  scale_x_discrete(breaks = as.character(seq(min(df_summary$decade_bin),
+                                              max(df_summary$decade_bin), by = 500))) +
+  scale_y_log10(breaks = scales::breaks_log(n = 5), labels = scales::label_number()) +
+  geom_hline(
+    aes(yintercept = modern_total, color = "2002-2011 total"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+    geom_hline(
+    aes(yintercept = modern_mean, color = "2002-2011 mean"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+      geom_hline(
+    aes(yintercept = modern_median, color = "2002-2011 median"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+        geom_hline(
+    aes(yintercept = modern_max, color = "2002-2011 maximum"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+          geom_hline(
+    aes(yintercept = modern_min, color = "2002-2011 minimum"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+  # geom_hline(
+  #   aes(yintercept = modern_total_area_diff, color = "2002-2011 area differnece"), 
+  #   linetype = "dashed",
+  #   linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year (10-yr bin)", y = y_lable,
+       title = main, color = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+p1
+
+
+p1 <- ggplot() +
+  geom_point(data = filter(df_summary, decade_bin > 1900), aes(x = as.factor(decade_bin), y = decade_total),
+             size = 3, alpha = 0.6) +
+  scale_x_discrete(breaks = as.character(seq(min(df_summary$decade_bin),
+                                              max(df_summary$decade_bin), by = 500))) +
+  scale_y_log10(breaks = scales::breaks_log(n = 5), labels = scales::label_number()) +
+  geom_hline(
+    aes(yintercept = modern_total, color = "2002-2011"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+  # geom_hline(
+  #   aes(yintercept = modern_total_area_diff, color = "2002-2011 area differnece"), 
+  #   linetype = "dashed",
+  #   linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year (10-yr bin)", y = y_lable,
+       title = main, color = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+p1
+```
+
+
+
+
+```{r}
+summary(filter(df_paleo, year > 1980)$n_strikes)
+
+```
+
+Fire Count
+
+```{r}
+var_paleo <-  "fire_count_pred"
+y_lable <- "Fire Count" 
+main <- "(b)"
+
+#get 10 year total for modern period
+modern_total <- sum(df_modern$fire_count) 
+#modern_total_area_diff <- modern_total * area_diff
+
+#collapse to one Alaska-wide total per summer (year), sum across all gridcells and all three summer months.
+df_year <- df_paleo %>%
+  dplyr::select(year, fire_count_pred) %>%
+  group_by(year) %>%
+  summarise(annual_total = sum(fire_count_pred, na.rm = TRUE), .groups = "drop")
+
+#sum across 10 year bins
+df_summary <- df_year %>%
+  mutate(decade_bin = floor(year / 10) * 10) %>%
+  group_by(decade_bin) %>%
+  summarise(
+    decade_total      = sum(annual_total, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+p2 <- ggplot() +
+  geom_point(data = df_summary, aes(x = as.factor(decade_bin), y = decade_total),
+             size = 3, alpha = 0.6) +
+  scale_x_discrete(breaks = as.character(seq(min(df_summary$decade_bin),
+                                              max(df_summary$decade_bin), by = 500))) +
+  scale_y_log10(breaks = scales::breaks_log(n = 5), labels = scales::label_number()) +
+  geom_hline(
+    aes(yintercept = modern_total, color = "2002-2011"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+  # geom_hline(
+  #   aes(yintercept = modern_total_area_diff, color = "2002-2011 area differnece"), 
+  #   linetype = "dashed",
+  #   linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year (10-yr bin)", y = y_lable,
+       title = main, color = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+p2
+
+
+ggplot() +
+  geom_point(data = filter(df_summary, decade_bin>1900), aes(x = as.factor(decade_bin), y = decade_total),
+             size = 3, alpha = 0.6) +
+  scale_x_discrete(breaks = as.character(seq(min(df_summary$decade_bin),
+                                              max(df_summary$decade_bin), by = 500))) +
+  scale_y_log10(breaks = scales::breaks_log(n = 5), labels = scales::label_number()) +
+  geom_hline(
+    aes(yintercept = modern_total, color = "2002-2011"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+  # geom_hline(
+  #   aes(yintercept = modern_total_area_diff, color = "2002-2011 area differnece"), 
+  #   linetype = "dashed",
+  #   linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year (10-yr bin)", y = y_lable,
+       title = main, color = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+Burned Area
+
+```{r}
+var_paleo <-  "total_burned_area"
+y_lable <- "Burned Area" 
+main <- "(b)"
+
+#get 10 year total for modern period
+modern_total <- sum(df_modern$burned_area_km2) 
+#modern_total_area_diff <- modern_total * area_diff
+
+#collapse to one Alaska-wide total per summer (year), sum across all gridcells and all three summer months.
+df_year <- df_paleo %>%
+  dplyr::select(year, total_burned_area) %>%
+  group_by(year) %>%
+  summarise(annual_total = sum(total_burned_area, na.rm = TRUE), .groups = "drop")
+
+#sum across 10 year bins
+df_summary <- df_year %>%
+  mutate(decade_bin = floor(year / 10) * 10) %>%
+  group_by(decade_bin) %>%
+  summarise(
+    decade_total      = sum(annual_total, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+p2 <- ggplot() +
+  geom_point(data = df_summary, aes(x = as.factor(decade_bin), y = decade_total),
+             size = 3, alpha = 0.6) +
+  scale_x_discrete(breaks = as.character(seq(min(df_summary$decade_bin),
+                                              max(df_summary$decade_bin), by = 500))) +
+  scale_y_log10(breaks = scales::breaks_log(n = 5), labels = scales::label_number()) +
+  geom_hline(
+    aes(yintercept = modern_total, color = "2002-2011"), 
+    linetype = "dashed",
+    linewidth = 1) +
+  # geom_hline(
+  #   aes(yintercept = modern_total_area_diff, color = "2002-2011 area differnece"), 
+  #   linetype = "dashed",
+  #   linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year (10-yr bin)", y = y_lable,
+       title = main, color = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+p2
+
+
+ggplot() +
+  geom_point(data = filter(df_summary, decade_bin>1900), aes(x = as.factor(decade_bin), y = decade_total),
+             size = 3, alpha = 0.6) +
+  scale_x_discrete(breaks = as.character(seq(min(df_summary$decade_bin),
+                                              max(df_summary$decade_bin), by = 500))) +
+  scale_y_log10(breaks = scales::breaks_log(n = 5), labels = scales::label_number()) +
+  geom_hline(
+    aes(yintercept = modern_total, color = "2002-2011"),  # Horizontal line
+    linetype = "dashed",
+    linewidth = 1) +
+  # geom_hline(
+  #   aes(yintercept = modern_total_area_diff, color = "2002-2011 area differnece"), 
+  #   linetype = "dashed",
+  #   linewidth = 1) +
+  theme_minimal() +
+  labs(x = "Year (10-yr bin)", y = y_lable,
+       title = main, color = NULL) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+
+

@@ -1,0 +1,391 @@
+---
+title: "Posterior_predictions_paleo"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(maps)
+library(readr)
+library(tidyr)
+library(patchwork)
+library(glmmTMB)
+library(broom.mixed)
+library(purrr)
+library(data.table)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+modern_fire_stats_root <- config[["modern_fire_stats_root"]]
+calibration_thunderstorm <- config[["calibration_thunderstorm"]]
+```
+
+
+```{r}
+df <- fread(file.path(base_path, "Paleo_Reconstructions/predictions_paleo_posterior_no_outliers_cap.csv"))
+str(df)
+```
+
+
+```{r}
+km2_to_acres <- function(km2) km2 / 0.00404686
+
+setDT(df)
+
+# =============================================================================
+# STEP 1: Alaska-wide annual totals, per draw -- burned area now carried in
+# BOTH km^2 and acres from the start, so either can be plotted without
+# recomputing anything downstream.
+# =============================================================================
+paleo_annual_by_draw <- df[, .(
+  strike_rate_mean       = mean(r_strike, na.rm = TRUE),
+  strike_count_total     = sum(n_strikes, na.rm = TRUE),
+  ignition_eff_mean      = mean(p_ignite_rate_cal, na.rm = TRUE),
+  fire_count_total        = sum(fire_count_pred, na.rm = TRUE),
+  burned_area_total_km2   = sum(total_burned_area_capped, na.rm = TRUE)
+), by = .(draw_id, year)]
+
+paleo_annual_by_draw[, burned_area_total_acres := km2_to_acres(burned_area_total_km2)]
+
+# =============================================================================
+# STEP 2: bin + summarize -- draws-only CI, years collapsed within each
+# draw first. Burned area summarized in BOTH units.
+# =============================================================================
+build_binned_summary <- function(dt, bin_width = 100) {
+  d <- copy(dt)
+  d[, year_bin := floor(year / bin_width) * bin_width]
+
+  per_draw_bin <- d[, .(
+    strike_rate_mean          = mean(strike_rate_mean),
+    strike_count_total        = mean(strike_count_total),
+    ignition_eff_mean         = mean(ignition_eff_mean),
+    fire_count_total           = mean(fire_count_total),
+    burned_area_total_km2      = mean(burned_area_total_km2),
+    burned_area_total_acres    = mean(burned_area_total_acres)
+  ), by = .(draw_id, year_bin)]
+
+  per_draw_bin[, .(
+    strike_rate_mean_mean = mean(strike_rate_mean),
+    strike_rate_lower      = quantile(strike_rate_mean, 0.025),
+    strike_rate_upper      = quantile(strike_rate_mean, 0.975),
+
+    strike_count_mean  = mean(strike_count_total),
+    strike_count_lower = quantile(strike_count_total, 0.025),
+    strike_count_upper = quantile(strike_count_total, 0.975),
+
+    ignition_eff_mean_mean = mean(ignition_eff_mean),
+    ignition_eff_lower      = quantile(ignition_eff_mean, 0.025),
+    ignition_eff_upper      = quantile(ignition_eff_mean, 0.975),
+
+    fire_count_mean  = mean(fire_count_total),
+    fire_count_lower = quantile(fire_count_total, 0.025),
+    fire_count_upper = quantile(fire_count_total, 0.975),
+
+    burned_area_mean_km2  = mean(burned_area_total_km2),
+    burned_area_lower_km2 = quantile(burned_area_total_km2, 0.025),
+    burned_area_upper_km2 = quantile(burned_area_total_km2, 0.975),
+
+    burned_area_mean_acres  = mean(burned_area_total_acres),
+    burned_area_lower_acres = quantile(burned_area_total_acres, 0.025),
+    burned_area_upper_acres = quantile(burned_area_total_acres, 0.975)
+  ), by = year_bin][order(year_bin)]
+}
+
+paleo_century <- build_binned_summary(paleo_annual_by_draw, bin_width = 100)
+
+# =============================================================================
+# STEP 3: plotting function -- unchanged from before
+# =============================================================================
+plot_paleo_outcome <- function(binned_dt, mean_col, lower_col, upper_col,
+                                y_label, panel_label, bin_width,
+                                year_interval = 200) {
+
+  year_breaks <- seq(
+    floor(min(binned_dt$year_bin) / year_interval) * year_interval,
+    ceiling(max(binned_dt$year_bin) / year_interval) * year_interval,
+    by = year_interval
+  )
+
+  ggplot(binned_dt, aes(x = year_bin)) +
+    geom_vline(xintercept = year_breaks, color = "grey85", linewidth = 0.3) +
+    geom_ribbon(aes(ymin = .data[[lower_col]], ymax = .data[[upper_col]]),
+                fill = "steelblue", alpha = 0.25) +
+    geom_line(aes(y = .data[[mean_col]]), color = "steelblue", linewidth = 0.6) +
+    scale_x_continuous(breaks = year_breaks) +
+    labs(title = panel_label, x = "Year",
+         y = sprintf("%s\n(%d-yr mean, 95%% CI across draws)", y_label, bin_width)) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6))
+}
+
+# =============================================================================
+# STEP 4: burned-area unit toggle -- set once here, everything below follows
+# =============================================================================
+ba_unit <- "acres"   # switch to "acres" to plot in acres instead
+
+ba_cols <- if (ba_unit == "km2") {
+  list(mean = "burned_area_mean_km2", lower = "burned_area_lower_km2",
+       upper = "burned_area_upper_km2", label = "Total burned area (km\u00b2)")
+} else {
+  list(mean = "burned_area_mean_acres", lower = "burned_area_lower_acres",
+       upper = "burned_area_upper_acres", label = "Total burned area (acres)")
+}
+
+p_strike       <- plot_paleo_outcome(paleo_century, "strike_rate_mean_mean", "strike_rate_lower", "strike_rate_upper",
+                                       "Mean strike rate", "(a)", bin_width = 100, year_interval = 250)
+p_strike_count <- plot_paleo_outcome(paleo_century, "strike_count_mean", "strike_count_lower", "strike_count_upper",
+                                       "Total strike count", "(b)", bin_width = 100, year_interval = 250)
+p_ignition     <- plot_paleo_outcome(paleo_century, "ignition_eff_mean_mean", "ignition_eff_lower", "ignition_eff_upper",
+                                       "Ignition efficiency", "(c)", bin_width = 100, year_interval = 250)
+p_fire         <- plot_paleo_outcome(paleo_century, "fire_count_mean", "fire_count_lower", "fire_count_upper",
+                                       "Total fire count", "(d)", bin_width = 100, year_interval = 250)
+p_ba           <- plot_paleo_outcome(paleo_century, ba_cols$mean, ba_cols$lower, ba_cols$upper,
+                                       ba_cols$label, "(e)", bin_width = 100, year_interval = 250)
+
+final_fig <- (p_strike / p_strike_count / p_ignition / p_fire / p_ba)
+
+ggsave(file.path(base_path, sprintf("Paleo_Reconstructions/Figure_paleo_time_%s.png", ba_unit)),
+       final_fig, width = 12, height = 20, dpi = 300)
+```
+
+```{r}
+km2_to_acres <- function(km2) km2 / 0.00404686
+
+setDT(df)
+
+# =============================================================================
+# STEP 1: Alaska-wide annual totals, per draw -- burned area now carried in
+# BOTH km^2 and acres from the start, so either can be plotted without
+# recomputing anything downstream.
+# =============================================================================
+paleo_annual_by_draw <- df[, .(
+  strike_rate_mean       = mean(r_strike, na.rm = TRUE),
+  strike_count_total     = sum(n_strikes, na.rm = TRUE),
+  ignition_eff_mean      = mean(p_ignite_rate_cal, na.rm = TRUE),
+  fire_count_total        = sum(fire_count_pred, na.rm = TRUE),
+  burned_area_total_km2   = sum(total_burned_area_capped, na.rm = TRUE)
+), by = .(draw_id, year)]
+
+paleo_annual_by_draw[, burned_area_total_acres := km2_to_acres(burned_area_total_km2)]
+
+build_binned_summary_dual <- function(dt, bin_width = 100, iqr_probs = c(0.10, 0.90)) {
+  d <- copy(dt)
+  d[, year_bin := floor(year / bin_width) * bin_width]
+
+  # Per draw, per bin: draw's own century mean + spread of annual values
+  # around that mean, for ALL FIVE outcomes
+  per_draw_bin <- d[, .(
+    draw_mean_strike       = mean(strike_rate_mean),
+    draw_p_lo_strike        = quantile(strike_rate_mean, iqr_probs[1]),
+    draw_p_hi_strike        = quantile(strike_rate_mean, iqr_probs[2]),
+
+    draw_mean_strikecount   = mean(strike_count_total),
+    draw_p_lo_strikecount    = quantile(strike_count_total, iqr_probs[1]),
+    draw_p_hi_strikecount    = quantile(strike_count_total, iqr_probs[2]),
+
+    draw_mean_ignition      = mean(ignition_eff_mean),
+    draw_p_lo_ignition       = quantile(ignition_eff_mean, iqr_probs[1]),
+    draw_p_hi_ignition       = quantile(ignition_eff_mean, iqr_probs[2]),
+
+    draw_mean_fire          = mean(fire_count_total),
+    draw_p_lo_fire           = quantile(fire_count_total, iqr_probs[1]),
+    draw_p_hi_fire           = quantile(fire_count_total, iqr_probs[2]),
+
+    draw_mean_ba_km2        = mean(burned_area_total_km2),
+    draw_p_lo_ba_km2         = quantile(burned_area_total_km2, iqr_probs[1]),
+    draw_p_hi_ba_km2         = quantile(burned_area_total_km2, iqr_probs[2]),
+
+    draw_mean_ba_acres      = mean(burned_area_total_acres),
+    draw_p_lo_ba_acres       = quantile(burned_area_total_acres, iqr_probs[1]),
+    draw_p_hi_ba_acres       = quantile(burned_area_total_acres, iqr_probs[2])
+  ), by = .(draw_id, year_bin)]
+
+  # Offsets from each draw's OWN mean
+  per_draw_bin[, `:=`(
+    offset_lo_strike = draw_p_lo_strike - draw_mean_strike,
+    offset_hi_strike = draw_p_hi_strike - draw_mean_strike,
+
+    offset_lo_strikecount = draw_p_lo_strikecount - draw_mean_strikecount,
+    offset_hi_strikecount = draw_p_hi_strikecount - draw_mean_strikecount,
+
+    offset_lo_ignition = draw_p_lo_ignition - draw_mean_ignition,
+    offset_hi_ignition = draw_p_hi_ignition - draw_mean_ignition,
+
+    offset_lo_fire = draw_p_lo_fire - draw_mean_fire,
+    offset_hi_fire = draw_p_hi_fire - draw_mean_fire,
+
+    offset_lo_ba_km2 = draw_p_lo_ba_km2 - draw_mean_ba_km2,
+    offset_hi_ba_km2 = draw_p_hi_ba_km2 - draw_mean_ba_km2,
+
+    offset_lo_ba_acres = draw_p_lo_ba_acres - draw_mean_ba_acres,
+    offset_hi_ba_acres = draw_p_hi_ba_acres - draw_mean_ba_acres
+  )]
+
+  per_draw_bin[, .(
+    post_mean_strike  = mean(draw_mean_strike),
+    post_lower_strike = quantile(draw_mean_strike, 0.025),
+    post_upper_strike = quantile(draw_mean_strike, 0.975),
+    interannual_lower_strike = mean(draw_mean_strike) + mean(offset_lo_strike),
+    interannual_upper_strike = mean(draw_mean_strike) + mean(offset_hi_strike),
+
+    post_mean_strikecount  = mean(draw_mean_strikecount),
+    post_lower_strikecount = quantile(draw_mean_strikecount, 0.025),
+    post_upper_strikecount = quantile(draw_mean_strikecount, 0.975),
+    interannual_lower_strikecount = mean(draw_mean_strikecount) + mean(offset_lo_strikecount),
+    interannual_upper_strikecount = mean(draw_mean_strikecount) + mean(offset_hi_strikecount),
+
+    post_mean_ignition  = mean(draw_mean_ignition),
+    post_lower_ignition = quantile(draw_mean_ignition, 0.025),
+    post_upper_ignition = quantile(draw_mean_ignition, 0.975),
+    interannual_lower_ignition = mean(draw_mean_ignition) + mean(offset_lo_ignition),
+    interannual_upper_ignition = mean(draw_mean_ignition) + mean(offset_hi_ignition),
+
+    post_mean_fire  = mean(draw_mean_fire),
+    post_lower_fire = quantile(draw_mean_fire, 0.025),
+    post_upper_fire = quantile(draw_mean_fire, 0.975),
+    interannual_lower_fire = mean(draw_mean_fire) + mean(offset_lo_fire),
+    interannual_upper_fire = mean(draw_mean_fire) + mean(offset_hi_fire),
+
+    post_mean_ba_km2  = mean(draw_mean_ba_km2),
+    post_lower_ba_km2 = quantile(draw_mean_ba_km2, 0.025),
+    post_upper_ba_km2 = quantile(draw_mean_ba_km2, 0.975),
+    interannual_lower_ba_km2 = mean(draw_mean_ba_km2) + mean(offset_lo_ba_km2),
+    interannual_upper_ba_km2 = mean(draw_mean_ba_km2) + mean(offset_hi_ba_km2),
+
+    post_mean_ba_acres  = mean(draw_mean_ba_acres),
+    post_lower_ba_acres = quantile(draw_mean_ba_acres, 0.025),
+    post_upper_ba_acres = quantile(draw_mean_ba_acres, 0.975),
+    interannual_lower_ba_acres = mean(draw_mean_ba_acres) + mean(offset_lo_ba_acres),
+    interannual_upper_ba_acres = mean(draw_mean_ba_acres) + mean(offset_hi_ba_acres)
+  ), by = year_bin][order(year_bin)]
+}
+
+paleo_century_dual <- build_binned_summary_dual(paleo_annual_by_draw, bin_width = 100)
+
+# ---- ba_unit toggle, same pattern as before ----
+ba_unit <- "acres"   #  "acres" or "km2
+ba_prefix <- if (ba_unit == "km2") "ba_km2" else "ba_acres"
+ba_label  <- if (ba_unit == "km2") "Total burned area (km\u00b2)" else "Total burned area (acres)"
+
+p_strike       <- plot_paleo_dual(paleo_century_dual, "strike",       "Mean strike rate",     "(a)", bin_width = 100, year_interval = 250)
+p_strike_count <- plot_paleo_dual(paleo_century_dual, "strikecount",  "Total strike count",   "(b)", bin_width = 100, year_interval = 250)
+p_ignition     <- plot_paleo_dual(paleo_century_dual, "ignition",     "Ignition efficiency",  "(c)", bin_width = 100, year_interval = 250)
+p_fire         <- plot_paleo_dual(paleo_century_dual, "fire",         "Total fire count",     "(d)", bin_width = 100, year_interval = 250)
+p_ba           <- plot_paleo_dual(paleo_century_dual, ba_prefix,      ba_label,               "(e)", bin_width = 100, year_interval = 250)
+
+final_fig <- (p_strike / p_strike_count / p_ignition / p_fire / p_ba)
+final_fig
+
+ggsave(file.path(base_path, sprintf("Paleo_Reconstructions/Figure_paleo_time_dual_intervals_%s.png", ba_unit)),
+       final_fig, width = 12, height = 20, dpi = 300)
+```
+
+Burned Area Cap
+
+```{r}
+library(data.table)
+
+# Re-implementation of apply_area_cap(), identical logic, but also
+# returning WHICH year each trigger actually occurred in -- this is the
+# information the original function computes internally but never exposes.
+diagnose_area_cap <- function(df, raw_col = "total_burned_area", recovery_years = 12) {
+  n <- nrow(df)
+  area <- df$area[1]
+  capped <- numeric(n)
+  is_trigger_year <- logical(n)
+  cumulative <- 0
+  recovery_until_year <- -Inf
+
+  for (i in seq_len(n)) {
+    this_year <- df$year[i]
+    raw_val <- df[[raw_col]][i]
+
+    if (this_year < recovery_until_year || (area - cumulative) <= 0) {
+      capped[i] <- 0
+      next
+    }
+
+    applied_val <- min(raw_val, area - cumulative)
+    capped[i] <- applied_val
+    cumulative <- cumulative + applied_val
+
+    if (cumulative >= area) {
+      cumulative <- 0
+      recovery_until_year <- this_year + recovery_years
+      is_trigger_year[i] <- TRUE   # <-- the ONLY thing added: flag the true trigger
+    }
+  }
+
+  df$total_burned_area_capped_check <- capped
+  df$is_trigger_year <- is_trigger_year
+  df
+}
+
+# ---- Rebuild the annual gridcell-draw series (raw, not yet capped) ----
+setDT(df)
+area_lookup_dt <- as.data.table(area_lookup)  # your existing area_lookup, lat/lon/area
+
+annual_raw <- df[, .(total_burned_area = sum(total_burned_area, na.rm = TRUE)), by = .(draw_id, lat, lon, year)]
+annual_raw <- merge(annual_raw, area_lookup_dt, by = c("lat", "lon"))
+setorder(annual_raw, draw_id, lat, lon, year)
+
+# ---- Apply the diagnostic version, per gridcell-draw ----
+diagnosed <- annual_raw[, diagnose_area_cap(.SD, recovery_years = 12), by = .(draw_id, lat, lon)]
+
+# ---- Now find gaps ONLY between true trigger years ----
+trigger_events <- diagnosed[is_trigger_year == TRUE]
+
+fire_years_only <- diagnosed[total_burned_area_capped_check > 0,
+                               .(draw_id, lat, lon, year, total_burned_area_capped_check)][
+                               order(draw_id, lat, lon, year)]
+
+find_next_fire_year <- function(d_id, la, lo, yr) {
+  candidates <- fire_years_only[draw_id == d_id & lat == la & lon == lo]
+  after <- candidates[year > yr][order(year)]
+  if (nrow(after) == 0) return(list(next_fire_year = NA_integer_, gap_years = NA_integer_))
+  list(next_fire_year = after$year[1], gap_years = after$year[1] - yr)
+}
+
+trigger_events[, c("next_fire_year", "gap_years") :=
+                 find_next_fire_year(draw_id, lat, lon, year), by = seq_len(nrow(trigger_events))]
+
+summary(trigger_events$gap_years)
+table(trigger_events$gap_years[trigger_events$gap_years < 12])
+```
+
+
+

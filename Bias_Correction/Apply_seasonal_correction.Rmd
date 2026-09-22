@@ -1,0 +1,968 @@
+---
+title: "Correct full trace dataset"
+author: "Charlotte Uden"
+date: "2026-08-03"
+output: html_document
+---
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(arrow)
+library(geodata)
+library(terra)
+library(rnaturalearth)
+library(sf)
+library(patchwork)
+library(purrr)
+library(qmap)
+library(FNN)  
+library(rlang) 
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+From python file that converted netcdf to parquet:
+Note: TraCE model years are offset from BP/CE. Year 0 in the model = 22000 BP.
+   convert to approximate CE year: ce_year = model_year - 21950
+    (where 1950 CE = 0 BP = model year 21950)
+
+```{r}
+#read the parquet - full range, no ce_year filter this time
+trace_raw_full <- read_parquet(file.path(paleoclimate_data_root, "trace21ka_processed/trace_lightning_model.parquet"))
+trace_raw_full <- trace_raw_full %>% mutate(year = ce_year + 1900)
+
+range(trace_raw_full$ce_year)  # confirm this covers the full -15949 to 90 range
+```
+
+Clip to Alaska
+```{r}
+
+#alaska polygon:
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+
+trace_points <- filter(trace_raw_full, year==1989)
+
+trace_points <- trace_points %>%
+  mutate(lon = ifelse(lon > 180, lon - 360, lon))
+
+#plot before clipping
+ggplot() + geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) +
+  geom_point(data=trace_points, aes(x=lon, y=lat)) +
+  xlab("Lon") +
+  ylab("Lat") +
+    xlim(-170, -130) +
+  ylim(51, 72) +
+    theme_minimal()
+
+# Convert trace_points to sf points (using the already-corrected -180/180 lon)
+trace_points_sf <- st_as_sf(trace_points, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+# Keep only points that fall inside the Alaska polygon
+trace_points_clipped <- st_filter(trace_points_sf, alaska)
+
+ggplot() + geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) +
+  geom_point(aes(x = lon, y = lat, size = 1), data = trace_points_clipped) +
+    xlab("Lon") +
+  ylab("Lat") +
+    xlim(-170, -130) +
+  ylim(51, 72) +
+    theme_minimal()
+
+#Filter df to clipped points
+
+# Get unique lat/lon pairs from the clipped sf object (drop geometry, keep plain columns)
+alaska_coords <- trace_points_clipped %>%
+  st_drop_geometry() %>%
+  distinct(lat, lon)
+
+# Make sure the full trace dataframe's lon is in the same -180/180 convention
+# before joining (since your clipped points already got the -360 correction)
+trace_raw_full <- trace_raw_full %>%
+  mutate(lon_corrected = ifelse(lon > 180, lon - 360, lon))
+
+# Filter the full dataframe to only the Alaska-clipped locations, across all years
+trace_raw_full <- trace_raw_full %>%
+  semi_join(alaska_coords, by = c("lon_corrected" = "lon", "lat" = "lat"))
+
+nrow(trace_raw_full)
+nrow(alaska_coords)
+```
+
+
+Read in models, elevation lookup, and alaska coordinates
+```{r}
+bias_correction_models <- readRDS(file.path(rds_root, "sp_bias_correction_models.rds"))
+trace_elev_lookup <- readRDS(file.path(rds_root, "trace_elev_lookup.rds"))
+trace_cells <- readRDS(file.path(rds_root, "trace_cells.rds"))
+```
+
+Function that applies the full pipeline to the raw TraCE dataframe
+```{r}
+apply_bias_correction <- function(raw_trace, models, elev_lookup, alaska_coords) {
+  
+  df <- raw_trace %>%
+    mutate(lon = ifelse(lon > 180, lon - 360, lon)) %>%
+    semi_join(alaska_coords, by = c("lon", "lat")) %>%
+    left_join(elev_lookup, by = c("lat", "lon"))
+  
+  # tair: global affine correction (mean + variance only)
+  df$tair_corrected <- models$tair$affine$era_mean + 
+    (df$tair - models$tair$affine$calib_mean) * (models$tair$affine$era_sd / models$tair$affine$calib_sd)
+  
+  # sp: mean regression + variance rescaling (unchanged)
+  df$sp_predicted_bias <- predict(models$sp$mean_model, newdata = df)
+  df$sp_corrected <- df$sp - df$sp_predicted_bias
+  df$sp_var_ratio_pred <- predict(models$sp$var_ratio_model, newdata = df)
+  df <- df %>%
+    group_by(lat, lon) %>%
+    mutate(sp_cell_mean = mean(sp_corrected, na.rm = TRUE),
+           sp_final = sp_cell_mean + (sp_corrected - sp_cell_mean) / sp_var_ratio_pred) %>%
+    ungroup()
+  
+  # wind: mean regression + variance rescaling, NO QM
+  df$wind_predicted_bias <- predict(models$wind$mean_model, newdata = df)
+  df$wind_corrected <- df$wind - df$wind_predicted_bias
+  df$wind_var_ratio_pred <- predict(models$wind$var_ratio_model, newdata = df)
+  df <- df %>%
+    group_by(lat, lon) %>%
+    mutate(wind_cell_mean = mean(wind_corrected, na.rm = TRUE),
+           wind_final = wind_cell_mean + (wind_corrected - wind_cell_mean) / wind_var_ratio_pred) %>%
+    ungroup()
+  
+  # swr: mean regression only (variance rescaling dropped - Younger Dryas regime-shift artifact)
+  df$swr_predicted_bias <- predict(models$swr$mean_model, newdata = df)
+  df$swr_final <- df$swr - df$swr_predicted_bias
+  
+  # precip: mean regression + QM (kept - dry-day structure matters)
+  df$precip_predicted_bias <- predict(models$precip$mean_model, newdata = df)
+  df$precip_corrected <- df$precip - df$precip_predicted_bias
+  df$precip_final <- doQmap(df$precip_corrected, models$precip$qm)
+  
+  # rh: mean regression + variance rescaling, NO QM
+  df$rh_predicted_bias <- predict(models$rh$mean_model, newdata = df)
+  df$rh_corrected <- df$rh - df$rh_predicted_bias
+  df$rh_var_ratio_pred <- predict(models$rh$var_ratio_model, newdata = df)
+  df <- df %>%
+    group_by(lat, lon) %>%
+    mutate(rh_cell_mean = mean(rh_corrected, na.rm = TRUE),
+           rh_final = rh_cell_mean + (rh_corrected - rh_cell_mean) / rh_var_ratio_pred) %>%
+    ungroup()
+  
+  # Light physical-bound safety net (NOT the correction mechanism itself - just clip impossible values
+  # that pure linear extrapolation can produce, e.g. negative wind or rh > 100)
+  df$wind_final <- pmax(df$wind_final, 0)
+  df$rh_final <- pmin(pmax(df$rh_final, 0), 100)
+  df$swr_final <- pmax(df$swr_final, 0)
+  
+  df
+}
+```
+
+```{r}
+trace_full_corrected <- apply_bias_correction(
+  raw_trace = trace_raw_full,
+  models = bias_correction_models,
+  elev_lookup = trace_elev_lookup,
+  alaska_coords = trace_cells
+)
+
+# Sanity checks before saving
+nrow(trace_full_corrected)                    # should be 23 cells x 16,040 years
+range(trace_full_corrected$year)               # should span the full paleoclimate period
+sum(is.na(trace_full_corrected$sp_final))      # spot-check for unexpected NAs
+sum(is.na(trace_full_corrected$wind_final))
+```
+--variable--	      --final corrected column--	  --correction applied--
+air temperature	    tair_corrected	              global quantile mapping only
+surface pressure	  sp_final	                    elevation+lon mean regression, lon+lat variance rescaling (no QM)
+wind	              wind_final	                  lat+lon mean regression, loess(lon) variance rescaling, QM
+shortwave radiation	swr_final	                    lat+lon mean regression, lat+lon variance rescaling, QM
+precipitation	      precip_final	                lon mean regression, global QM (no variance rescaling)
+relative humidity	  rh_final	                    lat+lon mean regression, lat variance rescaling, QM
+
+Compare with data period used to calibrate the trace data (1950-1989)
+```{r}
+# Read the TRACE parquet file
+trace <- read_parquet(file.path(paleoclimate_data_root,"trace21ka_processed/trace_lightning_model.parquet"))
+### adjust years and filter to calibration period ###
+trace %>% filter(ce_year %in% c(49, 90)) %>% distinct(ce_year)
+trace <- trace %>% filter(ce_year >= 46, ce_year <= 89)
+trace <- trace %>%
+  mutate(year = ce_year + 1900)
+
+### clip to alaska ###
+
+#alaska polygon:
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+
+trace_points <- filter(trace, year==1989)
+
+trace_points <- trace_points %>%
+  mutate(lon = ifelse(lon > 180, lon - 360, lon))
+
+# Convert trace_points to sf points (using the already-corrected -180/180 lon)
+trace_points_sf <- st_as_sf(trace_points, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+# Keep only points that fall inside the Alaska polygon
+trace_points_clipped <- st_filter(trace_points_sf, alaska)
+
+#Filter df to clipped points
+
+# Get unique lat/lon pairs from the clipped sf object (drop geometry, keep plain columns)
+alaska_coords <- trace_points_clipped %>%
+  st_drop_geometry() %>%
+  distinct(lat, lon)
+
+# Make sure the full trace dataframe's lon is in the same -180/180 convention
+# before joining (since your clipped points already got the -360 correction)
+trace <- trace %>%
+  mutate(lon_corrected = ifelse(lon > 180, lon - 360, lon))
+
+# Filter the full dataframe to only the Alaska-clipped locations, across all years
+trace <- trace %>%
+  semi_join(alaska_coords, by = c("lon_corrected" = "lon", "lat" = "lat"))
+
+ggplot() + geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) + 
+  geom_point(aes(x = lon, y = lat, alpha=0.001), data = filter(trace, year==1989)) +
+  xlim(-170, -130) +
+  ylim(51, 72) +
+    theme_minimal()
+
+nrow(trace)
+nrow(alaska_coords)
+```
+
+Apply corrections to trace data for calibration period:
+```{r}
+trace_corrected <- apply_bias_correction(
+  raw_trace = trace,
+  models = bias_correction_models,
+  elev_lookup = trace_elev_lookup,
+  alaska_coords = trace_cells
+)
+```
+
+ERA5 data used for calibration
+```{r}
+era <- read_parquet(file.path(era5_data_root,"bias_correction/processed_parquet/era5_lightning_model_1946_1990.parquet"))
+
+#clip to alaska
+plot_df <- filter(era, year==1989)
+
+# Convert plot_df to sf points (using the already-corrected -180/180 lon)
+plot_df_sf <- st_as_sf(plot_df, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+# Keep only points that fall inside the Alaska polygon
+plot_df_clipped <- st_filter(plot_df_sf, alaska)
+
+### PLOT! ###
+ggplot() + geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) + 
+  geom_point(aes(x = lon, y = lat, alpha=0.001), data = plot_df_clipped) + 
+  xlim(-170, -130) +
+  ylim(51, 72) +
+    theme_minimal()
+
+
+### Filter df to clipped points ###
+
+# Get unique lat/lon pairs from the clipped sf object (drop geometry, keep plain columns)
+alaska_coords <- plot_df_clipped %>%
+  st_drop_geometry() %>%
+  distinct(lat, lon)
+
+# Make sure the full trace dataframe's lon is in the same -180/180 convention
+# before joining (since your clipped points already got the -360 correction)
+era <- era %>%
+  mutate(lon_corrected = ifelse(lon > 180, lon - 360, lon))
+
+# Filter the full dataframe to only the Alaska-clipped locations, across all years
+era <- era %>%
+  semi_join(alaska_coords, by = c("lon_corrected" = "lon", "lat" = "lat"))
+
+nrow(era)
+nrow(alaska_coords)
+
+#ERA5 data not yet aggregated to the coarse trace grid will give a better view of the full spread of cliamte values. this can be helpful for final checks
+era_no_agg <- era
+
+### aggregate to trace grid ###
+
+#get spatial matching - aggregate to coarser trace gridcells
+trace <- trace %>%
+  mutate(lon = ifelse(lon > 180, lon - 360, lon))
+
+# Get TraCE's 23 unique grid cells with an assumed cell width (check your actual grid spacing)
+trace_cells <- trace %>% distinct(lat, lon)
+
+# Build grid cell polygons around each TraCE point (adjust half-width to actual grid resolution)
+# TraCE-21ka is ~3.75° resolution - confirm by checking spacing in your data:
+sort(unique(trace$lat)) %>% diff()
+sort(unique(trace$lon)) %>% diff()
+
+# Match each ERA5 point to nearest TraCE grid cell
+nn <- get.knnx(data = trace_cells[, c("lon", "lat")],
+               query = era[, c("lon", "lat")], k = 1)
+
+era$trace_lon <- trace_cells$lon[nn$nn.index]
+era$trace_lat <- trace_cells$lat[nn$nn.index]
+
+# Aggregate ERA5 to TraCE grid cells, by year
+era <- era %>%
+  group_by(trace_lat, trace_lon, year) %>%
+  summarise(across(c(tair, precip, rh, wind, swr, sp), mean, na.rm = TRUE),
+            .groups = "drop") %>%
+  rename(lat = trace_lat, lon = trace_lon)
+
+ggplot() + geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) + 
+  geom_point(aes(x = lon, y = lat, alpha=0.001), data = filter(era, year==1989)) +
+  xlim(-170, -130) +
+  ylim(51, 72) +
+    theme_minimal()
+
+
+```
+
+
+
+```{r}
+
+var_config_density <- tibble::tribble(
+  ~var,     ~label,      ~raw_col,   ~corrected_col,
+  "tair",   "Air Temp",  "tair",     "tair_corrected",
+  "sp",     "Surf Pres", "sp",       "sp_final",
+  "wind",   "Wind",      "wind",     "wind_final",
+  "swr",    "SW Rad",    "swr",      "swr_final",
+  "precip", "Precip",    "precip",   "precip_final",
+  "rh",     "RH",        "rh",       "rh_final"
+)
+
+plot_density_comparison <- function(var_label, trace_col, era_col, raw_col, corrected_col,
+                                     trace_calib, era_calib, trace_full, trace_full_corrected) {
+  
+  df_long <- bind_rows(
+    tibble(value = trace_calib[[trace_col]], source = "TraCE (calibration period)"),
+    tibble(value = era_calib[[era_col]], source = "ERA5 (calibration period)"),
+    tibble(value = trace_full[[raw_col]], source = "TraCE (full, uncorrected)"),
+    tibble(value = trace_full_corrected[[corrected_col]], source = "TraCE (full, corrected)")
+  ) %>%
+    mutate(source = factor(source, levels = c(
+      "TraCE (calibration period)",
+      "ERA5 (calibration period)",
+      "TraCE (full, uncorrected)",
+      "TraCE (full, corrected)"
+    )))
+  
+  ggplot(df_long, aes(x = value, color = source, linetype = source)) +
+    geom_density(linewidth = 0.9, fill = NA, adjust = 1.5) +  # or 2, for smoother curves
+    scale_color_manual(values = c(
+      "TraCE (calibration period)" = "#E74C3C",
+      "ERA5 (calibration period)" = "black",
+      "TraCE (full, uncorrected)" = "#F5B041",
+      "TraCE (full, corrected)" = "#2E86C1"
+    )) +
+    scale_linetype_manual(values = c(
+      "TraCE (calibration period)" = "dashed",
+      "ERA5 (calibration period)" = "solid",
+      "TraCE (full, uncorrected)" = "dotted",
+      "TraCE (full, corrected)" = "solid"
+    )) +
+    labs(title = var_label, x = var_label, y = "Density", color = NULL, linetype = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom")
+}
+
+
+density_plots <- pmap(var_config_density, function(var, label, raw_col, corrected_col) {
+  plot_density_comparison(
+    var_label = label,
+    trace_col = raw_col,          # trace$<raw_col>
+    era_col = raw_col,             # era$<raw_col> - same name in your era dataframe
+    raw_col = raw_col,             # trace_full_corrected$<raw_col>
+    corrected_col = corrected_col, # trace_full_corrected$<corrected_col>
+    trace_calib = trace,
+    era_calib = era,
+    trace_full = trace_full_corrected,
+    trace_full_corrected = trace_full_corrected
+  )
+})
+
+# Combine, one shared legend at the bottom
+combined_density <- wrap_plots(density_plots, ncol = 2) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+combined_density
+
+#ggsave("density_comparison_all_vars.png", combined_density, width = 12, height = 14, dpi = 200)
+
+```
+
+#table to look at 
+```{r}
+quantile(trace$wind, c(0.90, 0.95, 0.99), na.rm = TRUE) 
+quantile(era$wind, c(0.90, 0.95, 0.99), na.rm = TRUE) 
+quantile(trace_full_corrected$wind, c(0.90, 0.95, 0.99), na.rm = TRUE) 
+quantile(trace_full_corrected$wind_final, c(0.90, 0.95, 0.99), na.rm = TRUE)
+quantile(era_no_agg$wind, c(0.90, 0.95, 0.99), na.rm = TRUE) 
+
+range(trace_full_corrected$wind)
+range(trace_full_corrected$wind_final)
+range(trace$wind)
+range(era$wind)
+range(compare_df$wind_final)
+range(era_no_agg$wind)
+```
+
+```{r}
+
+# Compute every requested stat for one numeric vector
+compute_stats <- function(x) {
+  q <- quantile(x, c(0.01, 0.05, 0.10, 0.90, 0.95, 0.99), na.rm = TRUE)
+  r <- range(x, na.rm = TRUE)
+  tibble(
+    metric = c("q01", "q05", "q10", "q90", "q95", "q99",
+               "min", "max", "mean", "variance", "sd"),
+    value = c(q, r, mean(x, na.rm = TRUE), var(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+  )
+}
+
+vars <- c("tair", "sp", "wind", "swr", "precip", "rh")
+
+# Column name lookup per dataset/variable combo
+col_lookup <- function(dataset, var) {
+  switch(dataset,
+    "ERA5 (calibration)"            = paste0(var, ""),        # from era
+    "TraCE raw (calibration)"       = paste0(var, ""),      # from trace_corrected
+    "TraCE corrected (calibration)" = if (var == "tair") "tair_corrected" else paste0(var, "_final"),  # from trace_corrected
+    "TraCE raw (full paleo)"        = var,                         # from trace_full_corrected
+    "TraCE corrected (full paleo)"  = if (var == "tair") "tair_corrected" else paste0(var, "_final")   # from trace_full_corrected
+  )
+}
+
+dataset_source <- function(dataset) {
+  switch(dataset,
+    "ERA5 (calibration)"            = era,
+    "TraCE raw (calibration)"       = trace_corrected,
+    "TraCE corrected (calibration)" = trace_corrected,
+    "TraCE raw (full paleo)"        = trace_full_corrected,
+    "TraCE corrected (full paleo)"  = trace_full_corrected
+  )
+}
+
+datasets <- c("ERA5 (calibration)", "TraCE raw (calibration)", "TraCE corrected (calibration)",
+              "TraCE raw (full paleo)", "TraCE corrected (full paleo)")
+
+summary_long <- expand_grid(dataset = datasets, var = vars) %>%
+  pmap_dfr(function(dataset, var) {
+    df <- dataset_source(dataset)
+    col <- col_lookup(dataset, var)
+    if (!col %in% names(df)) {
+      return(tibble(dataset = dataset, var = var, metric = "ERROR_missing_column", value = NA_real_))
+    }
+    compute_stats(df[[col]]) %>%
+      mutate(dataset = dataset, var = var, .before = 1)
+  })
+
+summary_table <- summary_long %>%
+  pivot_wider(names_from = var, values_from = value) %>%
+  mutate(
+    dataset = factor(dataset, levels = datasets),
+    metric = factor(metric, levels = c("q01","q05","q10","min","mean","sd","variance","max","q90","q95","q99"))
+  ) %>%
+  arrange(metric, dataset)
+
+print(summary_table, n = Inf)
+```
+
+```{r}
+sum(trace_full_corrected$swr_final == 0, na.rm = TRUE)
+mean(trace_full_corrected$swr_final == 0, na.rm = TRUE)  # what fraction?
+
+# Check the pre-clip distribution if you still have swr_rescaled or an unclipped version available
+range(trace_full_corrected$swr_corrected, na.rm = TRUE)  # pre-rescale, if this still reflects the current pipeline
+```
+
+Tair has extreme values:
+```{r}
+extreme_tair <- trace_full_corrected %>% filter(tair_corrected > 300) %>% arrange(desc(tair_corrected))
+nrow(extreme_tair)
+extreme_tair %>% dplyr::select(year, lat, lon, tair, tair_corrected) %>% head(10)
+range(extreme_tair$year)
+
+df_summary <- trace_full_corrected %>%
+  dplyr::select(year, tair_corrected) %>%
+  mutate(century_bin = floor(year / 100) * 100) %>%   # bin into 100-year windows
+  group_by(century_bin) %>%
+  summarise(
+    mean_tair_corrected = mean(tair_corrected, na.rm = TRUE),
+    ci_low   = quantile(tair_corrected, 0.025, na.rm = TRUE),
+    ci_high  = quantile(tair_corrected, 0.975, na.rm = TRUE),
+    n_obs    = n(),
+    .groups  = "drop"
+  )
+
+# Compute 10-year observed mean 
+era5_40yr_mean <- era %>%
+  group_by(year, lat, lon) %>%
+  summarise(mean_obs = mean(tair, na.rm = TRUE)) %>%
+  pull(mean_obs)
+era5_40yr_mean <- mean(era5_40yr_mean)
+
+trace_corrected_40yr_mean <- trace_corrected %>%
+  group_by(year, lat, lon) %>%
+  summarise(mean_obs = mean(tair_corrected, na.rm = TRUE)) %>%
+  pull(mean_obs)
+trace_corrected_40yr_mean <- mean(trace_corrected_40yr_mean)
+
+ggplot(df_summary, aes(x = as.factor(century_bin), y = mean_tair_corrected)) +
+  geom_point(size = 3, alpha=0.2) +
+  geom_errorbar(aes(ymin = ci_low,
+                    ymax = ci_high),
+                width = 0.1, alpha=0.2) +
+  geom_hline(yintercept = era5_40yr_mean, linetype = "dotted", color = "red", linewidth = 0.5) +
+  geom_hline(yintercept = trace_corrected_40yr_mean, linetype = "dotted", color = "blue", linewidth = 0.5) +
+  scale_x_discrete(breaks = as.character(seq(min(df_summary$century_bin), 
+                                              max(df_summary$century_bin), by = 500))) +
+  theme_minimal() + 
+  labs(x = "Year (100-yr bin)", y = "Corrected 2m air temperature",
+       title = "") +
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    theme(legend.title = element_blank())
+```
+~12,000 BCE was a period of warming in Alaska, so while temperatures are very high compared withthe correction period, they reflect a real phenomenon that was happening at the time. 
+
+SWR:
+standard deviation is much larger than the era5 correction period. Might be to do with negative predictions being assigned 0, pulling the mean down and increasing the spread.
+```{r}
+sum(trace_full_corrected$swr_final == 0, na.rm = TRUE)
+mean(trace_full_corrected$swr_final == 0, na.rm = TRUE)  # what fraction?
+
+# Check the pre-clip distribution if you still have swr_rescaled or an unclipped version available
+range(trace_full_corrected$swr, na.rm = TRUE) #raw full period of trace data
+range(trace_full_corrected$swr_corrected, na.rm = TRUE)  # pre-rescale, if this still reflects the current pipeline
+range(trace_full_corrected$swr_final, na.rm = TRUE) # after rescale, if this still reflects the current pipeline
+range(trace_corrected$swr, na.rm = TRUE) #raw calibration period
+range(trace_corrected$swr_corrected, na.rm = TRUE) # pre-rescale calibration period
+range(trace_corrected$swr_final, na.rm = TRUE) # after rescale calibration period
+range(era$swr, na.rm = TRUE) #era5 calibration period
+range(era_no_agg$swr, na.rm = TRUE) #era5 calibration period, NOT aggregated to trace points
+
+sd(trace_full_corrected$swr, na.rm = TRUE) #raw full period of trace data
+sd(trace_full_corrected$swr_corrected, na.rm = TRUE)  # pre-rescale, if this still reflects the current pipeline
+sd(trace_full_corrected$swr_final, na.rm = TRUE) # after rescale, if this still reflects the current pipeline
+sd(trace_corrected$swr, na.rm = TRUE) #raw calibration period
+sd(trace_corrected$swr_corrected, na.rm = TRUE) # pre-rescale calibration period
+sd(trace_corrected$swr_final, na.rm = TRUE) # after rescale calibration period
+sd(era$swr, na.rm = TRUE) #era5 calibration period
+sd(era_no_agg$swr, na.rm = TRUE) #era5 calibration period, NOT aggregated to trace points
+```
+
+```{r}
+# Which cells actually contain the collapsed/extreme values?
+trace_full_corrected %>%
+     filter(swr_final <= 5 | swr_corrected < 60) %>%
+     count(lat, lon, sort = TRUE)
+
+one_cell <- trace_full_corrected %>%
+  filter(swr_final <= 5) %>%
+  count(lat, lon, sort = TRUE) %>%
+  slice(1)
+
+trace_full_corrected %>%
+  filter(lat == one_cell$lat, lon == one_cell$lon) %>%
+  arrange(year) %>%
+  mutate(rolling_mean = rollmean(swr_corrected, k = 200, fill = NA)) %>%
+  dplyr::select(year, swr_corrected, swr_final, rolling_mean) %>%
+  filter(swr_final <= 5 | swr_corrected < 60)
+
+swr_zero_collapsed_years <- trace_full_corrected %>%
+    filter(swr_final <= 5) %>%
+    dplyr::select(year)
+
+range(swr_zero_collapsed_years$year)
+```
+ swr change for one cell - where do values start to collapse
+ 
+This is a nothern cell, where the drop in swr ~11,000 BCE is more extreme, and therefor more occurrances of a collapsed correction. 
+```{r}
+polar_cell <- trace_full_corrected %>%
+    filter(lat == one_cell$lat, lon == one_cell$lon) %>%
+    arrange(year)
+
+# How does swr_final (post-clip) trend across the WHOLE record for this cell, no threshold at all?
+ggplot(polar_cell, aes(x = year, y = swr_final)) +
+    geom_line(alpha = 0.4) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    theme_minimal()
+
+# And the pre-clip version, if you still have it - this shows how far below 0 it actually goes,
+# which the clip is currently hiding
+ggplot(polar_cell, aes(x = year, y = swr_cell_mean + (swr_corrected - swr_cell_mean) / swr_var_ratio_pred)) +
+    geom_line(alpha = 0.4) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    theme_minimal()
+
+ggplot(polar_cell, aes(x = year, y = swr_corrected)) +
+    geom_line(alpha = 0.4) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = mean(era$swr), color = "blue", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace$swr), color = "green", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace$swr_corrected), color = "yellow", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace_full_corrected$swr), color = "orange", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace_full_corrected$swr_corrected), color = "purple", linetype = "dashed") +
+  
+    theme_minimal()
+
+
+#does raw (uncorrected) swr also show this same step, confirming it's in TraCE's own simulation output rather than something introduced by mean-bias correction step?
+ggplot(polar_cell, aes(x = year, y = swr)) +   # RAW trace, not corrected
+  geom_line(alpha = 0.4) +
+      geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = mean(era$swr), color = "blue", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace$swr), color = "green", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace$swr_corrected), color = "yellow", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace_full_corrected$swr), color = "orange", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace_full_corrected$swr_corrected), color = "purple", linetype = "dashed") +
+  theme_minimal()
+```
+~11,700 years BP is the end of the Younger Dryas, an abrupt deglaciation transition (rapid ice-sheet retreat, associated shifts in cloud cover/albedo) that TraCE-21ka is simmulating as a sharp step in several variables, not a gradual trend. So this step is a real feature of the underlying TraCE simulation, not a bug in the correction. but it's now interacting badly with how the rescaling step works.
+
+Rescaling (adjusting the variance ratio) applies a single number averaged across the entire 15,040 year record, whcih sits inbeween the two periods before and acter deglaciation. so deviation from the mean is ingladted by the mean genuinely pulling ipward bu a post transition period, and already large deviations get multiplied by the predicted variabnce ratio fit to the modern period. This pushes swr early in the paleo period below values that are realsitic (negative or 0). 
+
+Fix: Apply regime-based rescaling: split the record at the climate transition, rescale each climate regime around its own mean
+```{r}
+#every cell shows a similar step, and around the same year:
+trace_full_corrected %>%
+  group_by(lat, lon) %>%
+  arrange(year) %>%
+  mutate(rolling = zoo::rollmean(swr, k = 100, fill = NA)) %>%
+  ggplot(aes(x = year, y = rolling, group = interaction(lat, lon))) +
+  geom_line(alpha = 0.3) +
+  theme_minimal()
+
+#keep variance correction, but rescale around separate regimes mean, rather than blending ht emean across the entire period.
+transition_year <- -10984  # or refine this using the actual TraCE step-change year
+
+trace_full_corrected <- trace_full_corrected %>%
+  mutate(swr_regime = if_else(year < transition_year, "pre_transition", "post_transition")) %>%
+  group_by(lat, lon, swr_regime) %>%
+  mutate(
+    swr_regime_mean = mean(swr_corrected, na.rm = TRUE),
+    swr_final = swr_regime_mean + (swr_corrected - swr_regime_mean) / swr_var_ratio_pred
+  ) %>%
+  ungroup()
+
+range(trace_full_corrected$swr_final, na.rm = TRUE)
+sum(trace_full_corrected$swr_final < 0, na.rm = TRUE)
+
+polar_cell <- trace_full_corrected %>%
+    filter(lat == one_cell$lat, lon == one_cell$lon) %>%
+    arrange(year)
+
+ggplot(polar_cell, aes(x = year, y = swr_final)) +   # RAW trace, not corrected
+  geom_line(alpha = 0.4) +
+      geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    geom_hline(yintercept = mean(era$swr), color = "blue", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace$swr), color = "green", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace$swr_corrected), color = "yellow", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace_full_corrected$swr), color = "orange", linetype = "dashed") +
+  geom_hline(yintercept = mean(trace_full_corrected$swr_corrected), color = "purple", linetype = "dashed") +
+  theme_minimal()
+```
+
+Just kidding, this looks just as bad. Instead, I'm going to drop rescaling for swr, keep mean-correction only across the full record. 
+
+```{r}
+trace_full_corrected$swr_final <- trace_full_corrected$swr_corrected
+
+trace_corrected$swr_final <- trace_corrected$swr_corrected
+
+# Confirm this resolves the physical-impossibility issue
+range(trace_full_corrected$swr_final, na.rm = TRUE)
+range(trace_full_corrected$swr, na.rm = TRUE)
+range(era$swr, na.rm = TRUE) #upper range looks good, minumum is much smaller due to geniune climate regime change post glaciation. 
+
+sum(trace_full_corrected$swr_final < 0, na.rm = TRUE)
+sum(trace_full_corrected$swr < 0, na.rm = TRUE)
+
+sd(trace_full_corrected$swr_final, na.rm = TRUE)
+sd(trace_full_corrected$swr, na.rm = TRUE)
+```
+
+--variable--            --final corrected column--    --correction applied--
+air temperature         tair_corrected                global affine correction (mean + variance scaling only)
+surface pressure        sp_final                      elevation+lon mean regression, lon+lat variance rescaling (no QM)
+wind                    wind_final                    lat+lon mean regression, lat+lon variance rescaling
+shortwave radiation     swr_final                     lat+lon mean regression
+precipitation           precip_final                  lon mean regression, global QM (no variance rescaling)
+relative humidity       rh_final                      lat+lon mean regression, lat variance rescaling
+
+Final funciton for implementing correction models:
+```{r}
+apply_bias_correction <- function(raw_trace, models, elev_lookup, alaska_coords) {
+  
+  df <- raw_trace %>%
+    mutate(lon = ifelse(lon > 180, lon - 360, lon)) %>%
+    semi_join(alaska_coords, by = c("lon", "lat")) %>%
+    left_join(elev_lookup, by = c("lat", "lon"))
+  
+  # tair: global affine correction (mean + variance only)
+  df$tair_corrected <- models$tair$affine$era_mean + 
+    (df$tair - models$tair$affine$calib_mean) * (models$tair$affine$era_sd / models$tair$affine$calib_sd)
+  
+  # sp: mean regression + variance rescaling (unchanged)
+  df$sp_predicted_bias <- predict(models$sp$mean_model, newdata = df)
+  df$sp_corrected <- df$sp - df$sp_predicted_bias
+  df$sp_var_ratio_pred <- predict(models$sp$var_ratio_model, newdata = df)
+  df <- df %>%
+    group_by(lat, lon) %>%
+    mutate(sp_cell_mean = mean(sp_corrected, na.rm = TRUE),
+           sp_final = sp_cell_mean + (sp_corrected - sp_cell_mean) / sp_var_ratio_pred) %>%
+    ungroup()
+  
+  # wind: mean regression + variance rescaling, NO QM
+  df$wind_predicted_bias <- predict(models$wind$mean_model, newdata = df)
+  df$wind_corrected <- df$wind - df$wind_predicted_bias
+  df$wind_var_ratio_pred <- predict(models$wind$var_ratio_model, newdata = df)
+  df <- df %>%
+    group_by(lat, lon) %>%
+    mutate(wind_cell_mean = mean(wind_corrected, na.rm = TRUE),
+           wind_final = wind_cell_mean + (wind_corrected - wind_cell_mean) / wind_var_ratio_pred) %>%
+    ungroup()
+  
+  # swr: mean regression only (variance rescaling dropped - Younger Dryas regime-shift artifact)
+  df$swr_predicted_bias <- predict(models$swr$mean_model, newdata = df)
+  df$swr_final <- df$swr - df$swr_predicted_bias
+  
+  # precip: mean regression + QM (kept - dry-day structure matters)
+  df$precip_predicted_bias <- predict(models$precip$mean_model, newdata = df)
+  df$precip_corrected <- df$precip - df$precip_predicted_bias
+  df$precip_final <- doQmap(df$precip_corrected, models$precip$qm)
+  
+  # rh: mean regression + variance rescaling, NO QM
+  df$rh_predicted_bias <- predict(models$rh$mean_model, newdata = df)
+  df$rh_corrected <- df$rh - df$rh_predicted_bias
+  df$rh_var_ratio_pred <- predict(models$rh$var_ratio_model, newdata = df)
+  df <- df %>%
+    group_by(lat, lon) %>%
+    mutate(rh_cell_mean = mean(rh_corrected, na.rm = TRUE),
+           rh_final = rh_cell_mean + (rh_corrected - rh_cell_mean) / rh_var_ratio_pred) %>%
+    ungroup()
+  
+  # Light physical-bound safety net (NOT the correction mechanism itself - just clip impossible values
+  # that pure linear extrapolation can produce, e.g. negative wind or rh > 100)
+  df$wind_final <- pmax(df$wind_final, 0)
+  df$rh_final <- pmin(pmax(df$rh_final, 0), 100)
+  df$swr_final <- pmax(df$swr_final, 0)
+  
+  df
+}
+```
+
+Make corrections
+```{r}
+trace_full_corrected <- apply_bias_correction(
+  raw_trace = trace_raw_full,
+  models = bias_correction_models,
+  elev_lookup = trace_elev_lookup,
+  alaska_coords = trace_cells
+)
+
+# Sanity checks before saving
+nrow(trace_full_corrected)                    # should be 23 cells x 16,040 years
+range(trace_full_corrected$year)               # should span the full paleoclimate period
+sum(is.na(trace_full_corrected$sp_final))      # spot-check for unexpected NAs
+sum(is.na(trace_full_corrected$wind_final))
+```
+
+
+Time plots
+```{r}
+
+plot_century_trend <- function(full_data, var_col,
+                                era_data, era_col,
+                                calib_data, calib_col,
+                                var_label = var_col,
+                                bin_width = 100) {
+  
+  # Bin the full corrected record into century windows
+  df_summary <- full_data %>%
+    dplyr::select(year, all_of(var_col)) %>%
+    mutate(century_bin = floor(year / bin_width) * bin_width) %>%
+    group_by(century_bin) %>%
+    summarise(
+      mean_val = mean(.data[[var_col]], na.rm = TRUE),
+      ci_low   = quantile(.data[[var_col]], 0.025, na.rm = TRUE),
+      ci_high  = quantile(.data[[var_col]], 0.975, na.rm = TRUE),
+      n_obs    = n(),
+      .groups  = "drop"
+    )
+  
+  # ERA5 calibration-period reference mean
+  era5_mean <- era_data %>%
+    group_by(year, lat, lon) %>%
+    summarise(mean_obs = mean(.data[[era_col]], na.rm = TRUE), .groups = "drop") %>%
+    pull(mean_obs) %>%
+    mean(na.rm = TRUE)
+  
+  # TraCE corrected calibration-period reference mean
+  trace_calib_mean <- calib_data %>%
+    group_by(year, lat, lon) %>%
+    summarise(mean_obs = mean(.data[[calib_col]], na.rm = TRUE), .groups = "drop") %>%
+    pull(mean_obs) %>%
+    mean(na.rm = TRUE)
+  
+  breaks_seq <- as.character(seq(min(df_summary$century_bin), max(df_summary$century_bin), by = 500))
+  
+  ggplot(df_summary, aes(x = as.factor(century_bin), y = mean_val)) +
+    geom_point(size = 3, alpha = 0.2) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.1, alpha = 0.2) +
+    geom_hline(yintercept = era5_mean, linetype = "dotted", color = "red", linewidth = 0.5) +
+    geom_hline(yintercept = trace_calib_mean, linetype = "dotted", color = "blue", linewidth = 0.5) +
+    scale_x_discrete(breaks = breaks_seq) +
+    theme_minimal() +
+    labs(x = paste0("Year (", bin_width, "-yr bin)"), y = var_label, title = "") +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      legend.title = element_blank()
+    )
+}
+
+plot_century_trend(
+  full_data = trace_full_corrected, var_col = "tair_corrected",
+  era_data = era, era_col = "tair",
+  calib_data = trace_corrected, calib_col = "tair_corrected",
+  var_label = "Corrected 2m air temperature"
+)
+
+plot_century_trend(
+  full_data = trace_full_corrected, var_col = "sp_final",
+  era_data = era, era_col = "sp",
+  calib_data = trace_corrected, calib_col = "sp_final",
+  var_label = "Corrected surface pressure"
+)
+
+plot_century_trend(
+  full_data = trace_full_corrected, var_col = "wind_final",
+  era_data = era, era_col = "wind",
+  calib_data = trace_corrected, calib_col = "wind_final",
+  var_label = "Corrected wind speed"
+)
+
+plot_century_trend(
+  full_data = trace_full_corrected, var_col = "swr_final",
+  era_data = era, era_col = "swr",
+  calib_data = trace_corrected, calib_col = "swr_final",
+  var_label = "Corrected shortwave radiation"
+)
+
+plot_century_trend(
+  full_data = trace_full_corrected, var_col = "precip_final",
+  era_data = era, era_col = "precip",
+  calib_data = trace_corrected, calib_col = "precip_final",
+  var_label = "Corrected precipitation"
+)
+
+plot_century_trend(
+  full_data = trace_full_corrected, var_col = "rh_final",
+  era_data = era, era_col = "rh",
+  calib_data = trace_corrected, calib_col = "rh_final",
+  var_label = "Corrected relative humidity"
+)
+```
+Desnity plots with final corrections
+```{r}
+density_plots <- pmap(var_config_density, function(var, label, raw_col, corrected_col) {
+  plot_density_comparison(
+    var_label = label,
+    trace_col = raw_col,          # trace$<raw_col>
+    era_col = raw_col,             # era$<raw_col> - same name in your era dataframe
+    raw_col = raw_col,             # trace_full_corrected$<raw_col>
+    corrected_col = corrected_col, # trace_full_corrected$<corrected_col>
+    trace_calib = trace,
+    era_calib = era,
+    trace_full = trace_full_corrected,
+    trace_full_corrected = trace_full_corrected
+  )
+})
+
+# Combine, one shared legend at the bottom
+combined_density <- wrap_plots(density_plots, ncol = 2) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+combined_density
+
+```
+Final check for relative humidity, which doesnt look perfect:
+```{r}
+quantile(era$rh, c(0.01, 0.05, 0.10), na.rm = TRUE)
+quantile(trace_full_corrected$rh_final, c(0.01, 0.05, 0.10), na.rm = TRUE)
+
+```
+corrected TraCE's driest years are a bit less dry than ERA5's actual driest years. Not perfect, but in the same ballpark as wind's equivalent gap, and nowhere near the kind of severe tail collapse the wet.day bug for QM-extrapolation produced.
+
+Save
+```{r}
+trace_full_corrected <- trace_full_corrected %>%
+  dplyr::select(lat, lon, year, ce_year,
+         tair = tair_corrected,
+         sp = sp_final,
+         wind = wind_final,
+         swr = swr_final,
+         precip = precip_final,
+         rh = rh_final)
+
+write_parquet(trace_full_corrected, file.path(paleocliamte_data_root, "trace21ka_processed/trace_bias_corrected_lightning_model.parquet"))
+```
+

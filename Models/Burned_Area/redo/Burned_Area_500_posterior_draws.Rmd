@@ -1,0 +1,214 @@
+---
+title: "Burned_Area_500_posterior_draws"
+output: html_document
+---
+
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+config <- read_properties(config_file_path)
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+
+rds_root <- file.path(rds_root, "Burned_Area/redo")
+
+```
+
+```{r}
+df <- read.csv(file.path(drivers_root, "burned_area_jja_2002_2011_new.csv")) %>%
+  dplyr::select(-starts_with("X"))
+
+df <- df %>% mutate(
+  road_proximity_binary  = if_else(dist_road  >= 30, 0, 1),
+  urban_proximity_binary = if_else(dist_urban >= 40, 0, 1),
+  river_proximity_binary = if_else(dist_river >= 30, 0, 1)
+)
+nrow(df)
+df <- na.omit(df)
+nrow(df)
+
+# read in rows with fire count exceeding strike count and compare with burned area
+null_rows <- read.csv(file.path(drivers_root, "null_ignition_rows_training_data_2002-2011.csv")) %>%
+  dplyr::select(-X)
+
+null_rows <- null_rows %>%
+  dplyr::select(year, lat, lon, month, fire_count) %>%
+  rename(fire_count_null = fire_count) %>%
+  mutate(null_row = 1)
+
+df_nulls <- df %>%
+  full_join(null_rows, by = c("lon", "lat", "year", "month")) %>%
+  mutate(null_row = replace_na(null_row, 0))
+
+filter(df_nulls, null_row == 1) %>%
+  group_by(year, month, lat, lon) %>%
+  summarise(total_burned_area = sum(burned_area_km2_total), n_fires = n(), .groups = "drop")
+
+#these null rows need to be dropped. 
+
+df_nulls <- filter(df_nulls, null_row == 0) 
+summary(df_nulls$burned_area_km2_total)
+
+df <- df_nulls
+```
+```{r}
+# 1. Recreate the EXACT same df that was originally split
+# all training sets used the same seed, just need to make sure to use a
+# training set that includes month (ie. not lightning strike rate drivers)
+df_train <- read.csv(file.path(drivers_root, "lightning_ignition_jja_2002_2011_new.csv"))
+
+sample_size <- floor(0.8 * nrow(df_train))
+set.seed(123)
+train_index <- sample(seq_len(nrow(df_train)), size = sample_size)
+
+# 2. Extract identifying keys, not the data itself
+train_keys <- unique(df_train[train_index, c("lat", "lon", "year", "month")])
+test_keys  <- unique(df_train[-train_index, c("lat", "lon", "year", "month")])
+
+setDT(train_keys); setDT(test_keys)
+train_keys[, split := "train"]
+test_keys[,  split := "test"]
+split_lookup <- rbind(train_keys, test_keys)
+
+df <- df %>%
+  left_join(split_lookup, by = c("lat", "lon", "year", "month"))
+
+# Confirm every fire successfully matched a split label -- any NA here
+# means some fires are being silently dropped from both train and test
+cat(sprintf("Fires with no split match: %d of %d\n", sum(is.na(df$split)), nrow(df)))
+
+train <- df %>% filter(split == "train")
+test  <- df %>% filter(split == "test")
+
+# Sanity check: train + test should account for every row (given the check above)
+nrow(train) + nrow(test) == nrow(df)
+```
+
+
+```{r}
+library(rstan)
+library(dplyr)
+
+#read in the mixture model
+mixture_obj  <- readRDS(file.path(rds_root, "m3_bayes_mixture_custom.rds"))
+
+#Reload the raw test-set predictors (same object the training
+# script used) and the burned-area mu/sigma standardization table ----
+# EDIT this path to wherever your training script's `test` object was saved
+# (or re-run the same train/test split + predictor prep from that script
+# if it wasn't separately exported)
+
+burned_area_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_burned_area_predictors.csv"))
+
+get_mu    <- function(var) burned_area_mu_sigma$mu[burned_area_mu_sigma$var == var]
+get_sigma <- function(var) burned_area_mu_sigma$sigma[burned_area_mu_sigma$var == var]
+
+preds_classifier <- mixture_obj$preds_classifier   # c("urban_proximity_binary","rh","tair","precip","tair_5y")
+preds_extreme    <- mixture_obj$preds_extreme      # c("U","tair")
+preds_typical    <- mixture_obj$preds_typical      # c("urban_proximity_binary","tair_2m","tair")
+
+test_scaled <- test %>%
+  mutate(
+    rh      = (rh      - get_mu("rh"))      / get_sigma("rh"),
+    tair    = (tair    - get_mu("tair"))    / get_sigma("tair"),
+    precip  = (precip  - get_mu("precip"))  / get_sigma("precip"),
+    tair_2m = (tair_2m - get_mu("tair_2m")) / get_sigma("tair_2m"),
+    tair_5y = (tair_5y - get_mu("tair_5y")) / get_sigma("tair_5y"),
+    U       = (U       - get_mu("U"))       / get_sigma("U")
+    # urban_proximity_binary is a 0/1 flag -- not standardized, matching
+    # how the unified pipeline treats it
+  )
+
+X_test_clf <- as.matrix(test_scaled[, preds_classifier])
+X_test_ext <- as.matrix(test_scaled[, preds_extreme])
+X_test_typ <- as.matrix(test_scaled[, preds_typical])
+
+# ---- 2. Extract posterior draws and rebuild the SAME per-draw blend the
+# training script used internally (expectation blend, not a stochastic
+# is_extreme/rgamma sample) -- this keeps the new per-draw table
+# consistent with the p_hat/p_low/p_high already saved in mixture_obj ----
+post_logit   <- rstan::extract(mixture_obj$fit_logit)
+post_extreme <- rstan::extract(mixture_obj$fit_extreme)
+post_normal  <- rstan::extract(mixture_obj$fit_normal)
+
+N_DRAWS <- 500
+n_avail <- min(length(post_logit$alpha), length(post_extreme$alpha), length(post_normal$alpha))
+if (N_DRAWS > n_avail) {
+  warning(sprintf("Only %d posterior draws available; using all of them instead of %d.", n_avail, N_DRAWS))
+  N_DRAWS <- n_avail
+}
+draw_idx <- sample(n_avail, N_DRAWS)
+
+pred_draws <- matrix(NA_real_, nrow = nrow(test_scaled), ncol = N_DRAWS)
+
+for (i in seq_len(N_DRAWS)) {
+  d <- draw_idx[i]
+  p_ext_d  <- plogis(post_logit$alpha[d]   + X_test_clf %*% post_logit$beta[d, ])
+  mu_ext_d <- exp(post_extreme$alpha[d]    + X_test_ext %*% post_extreme$beta[d, ])
+  mu_typ_d <- exp(post_normal$alpha[d]     + X_test_typ %*% post_normal$beta[d, ])
+  pred_draws[, i] <- p_ext_d * mu_ext_d + (1 - p_ext_d) * mu_typ_d
+}
+
+# ---- 3. Long-format table: one row per fire per draw, ready for the same
+# per-draw metric functions used elsewhere (compute_overall, compute_sscore) ----
+ba_model_draws <- data.table(
+  draw_id = rep(seq_len(N_DRAWS), each = nrow(test_scaled)),
+  lat  = rep(test$lat,  N_DRAWS),
+  lon  = rep(test$lon,  N_DRAWS),
+  year = rep(test$year, N_DRAWS),
+  burned_area_km2_total = rep(test$burned_area_km2_total, N_DRAWS),
+  burned_area_pred      = as.vector(pred_draws)
+)
+
+# Sanity check: per-draw mean should be close to (not identical to) the
+# saved p_hat median, and draw-to-draw spread should roughly match the
+# already-saved pred_low/pred_high interval
+ba_model_draws[, .(mean_pred = mean(burned_area_pred)), by = draw_id][, summary(mean_pred)]
+quantile(rowMeans(pred_draws), c(0.025, 0.5, 0.975))
+```
+
+```{r}
+saveRDS(ba_model_draws, file.path(rds_root, "ba_model_500_draws_test.rds"))
+```
+

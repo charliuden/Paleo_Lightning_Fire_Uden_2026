@@ -669,76 +669,109 @@ burned_area_scaled <- df |>
     U     = (U     - get_mu("U"))     / get_sigma("U")
   ) #no scaling for binary urban and road data.
 
+# ── Predictor sets, one per sub-model (from mixture_gamma_custom fit) ──
 
-# preds_final <- c("rh", "tair", "precip", "wind",
-#                  "precip_1m", "precip_3m", "precip_5y",
-#                  "tair_2m", "tair_5y",
-#                  "road_proximity_binary",
-#                  "urban_proximity_binary")
+preds_classifier <- c("urban_proximity_binary", "rh", "tair", "precip", "tair_5y")
+preds_extreme     <- c("U", "tair")
+preds_typical     <- c("urban_proximity_binary", "tair_2m", "tair")
 
-preds_final <- c("rh", "tair", "precip", "wind",
-                  "precip_1m", "precip_3m", "precip_5y",
-                  "tair_2m", "tair_5y", 
-                  "C", "U", 
-                  "urban_proximity_binary")
+# ── Load the fitted mixture model ────────────────────────────────────────────
 
+mixture_obj <- readRDS(file.path(rds_root, "Burned_Area/redo/m3_bayes_mixture_custom.rds"))
 
-# ── Load model and extract posterior parameters ───────────────────────────────
-# m6_obj     <- readRDS(file.path(rds_root, "Burned_Area/m6_bayes_gamma_re.rds"))
-# m6_fit     <- m6_obj$fit           # stanfit object
-# coef_means <- m6_obj$coef_means    # list: alpha, beta, alpha_year
+fit_logit   <- mixture_obj$fit_logit
+fit_extreme <- mixture_obj$fit_extreme
+fit_normal  <- mixture_obj$fit_normal
 
-m1_obj     <- readRDS(file.path(rds_root, "Burned_Area/redo/m1_bayes_gamma_re.rds"))
-m1_fit     <- m1_obj$fit           # stanfit object
-coef_means <- m1_obj$coef_means    # list: alpha, beta, alpha_year
+# ── Posterior means for each component (analogous to old alpha_mean/beta_means) ──
 
-alpha_mean <- coef_means$alpha
-beta_means <- coef_means$beta
+summ_logit   <- rstan::summary(fit_logit,   pars = c("alpha", "beta"))$summary
+summ_extreme <- rstan::summary(fit_extreme, pars = c("alpha", "beta", "phi"))$summary
+summ_normal  <- rstan::summary(fit_normal,  pars = c("alpha", "beta", "phi"))$summary
 
-cat("Global intercept (alpha):", round(alpha_mean, 3), "\n")
-cat("Year random effects:\n")
-print(round(coef_means$alpha_year, 3))
+alpha_logit_mean <- summ_logit["alpha", "mean"]
+beta_logit_mean  <- summ_logit[grep("^beta\\[", rownames(summ_logit)), "mean"]
 
-# ── Build predictor matrix ────────────────────────────────────────────────────
-X_new <- model.matrix(
-  as.formula(paste("~", paste(preds_final, collapse = " + "), "- 1")),
+alpha_extreme_mean <- summ_extreme["alpha", "mean"]
+beta_extreme_mean  <- summ_extreme[grep("^beta\\[", rownames(summ_extreme)), "mean"]
+phi_extreme_mean   <- summ_extreme["phi", "mean"]
+
+alpha_typical_mean <- summ_normal["alpha", "mean"]
+beta_typical_mean  <- summ_normal[grep("^beta\\[", rownames(summ_normal)), "mean"]
+phi_typical_mean   <- summ_normal["phi", "mean"]
+
+cat("Classifier intercept (alpha):", round(alpha_logit_mean, 3), "\n")
+cat("Extreme-Gamma shape (phi):   ", round(phi_extreme_mean, 3), "\n")
+cat("Typical-Gamma shape (phi):   ", round(phi_typical_mean, 3), "\n")
+
+# ── Build predictor matrices — three separate ones, one per sub-model ───────
+
+X_classifier <- model.matrix(
+  as.formula(paste("~", paste(preds_classifier, collapse = " + "), "- 1")),
+  data = burned_area_scaled
+)
+X_extreme <- model.matrix(
+  as.formula(paste("~", paste(preds_extreme, collapse = " + "), "- 1")),
+  data = burned_area_scaled
+)
+X_typical <- model.matrix(
+  as.formula(paste("~", paste(preds_typical, collapse = " + "), "- 1")),
   data = burned_area_scaled
 )
 
-# ── Generate predictions ──────────────────────────────────────────────────────
-# Year random effects set to ZERO for new data (paleo or ERA5 application)
-# This represents "climatologically average year" — variation comes from
-# climate predictors only, not year-specific synoptic noise
+# ── Generate predictions (posterior mean, point-estimate — same approach
+# as "Option A" in your original code) ───────────────────────────────────────
 
-# ── Option A: posterior mean prediction (fast, point estimate) ────────────────
-linpred <- as.numeric(alpha_mean + X_new %*% beta_means)
-# alpha_year term is omitted — equivalent to setting it to 0
+p_extreme_linpred <- as.numeric(alpha_logit_mean + X_classifier %*% beta_logit_mean)
+p_extreme         <- plogis(p_extreme_linpred)
 
-burned_area_scaled <- burned_area_scaled |>
-  mutate(burned_area_pred = exp(linpred))
+mu_extreme <- as.numeric(exp(alpha_extreme_mean + X_extreme %*% beta_extreme_mean))
+mu_typical <- as.numeric(exp(alpha_typical_mean + X_typical %*% beta_typical_mean))
 
-# Extract posterior draws
-post <- rstan::extract(m1_fit)
+# The blended MEAN (for reporting / a point prediction) is a valid weighted average -
+# this is fine to report as expected burned area, but is NOT itself a Gamma mean,
+# so it should NOT be paired with a single shape parameter for sampling purposes.
+# ie. this is expected mean fire size in a gridcell-month given | 1 fire
+burned_area_pred <- p_extreme * mu_extreme + (1 - p_extreme) * mu_typical
 
-# ── Extract shape parameter (phi) from posterior ───────────────────────────────
-phi_mean <- mean(post$phi)
-phi_sd   <- sd(post$phi)
-
-cat("Gamma shape (phi) posterior mean:", round(phi_mean, 3), "\n")
-cat("Gamma shape (phi) posterior sd:  ", round(phi_sd, 3), "\n")
-
-# ── Add gamma_mean and gamma_shape columns to burned_area_scaled ──────────────
 burned_area_scaled <- burned_area_scaled |>
   mutate(
-    gamma_mean  = burned_area_pred,   # mean (mu) per gridcell-month
-    gamma_shape = phi_mean             # shape (phi) — constant across rows
+    p_extreme        = p_extreme,
+    mu_extreme       = mu_extreme,
+    mu_typical       = mu_typical,
+    phi_extreme      = phi_extreme_mean,   # constant across rows, like old phi_mean
+    phi_typical      = phi_typical_mean,   # constant across rows
+    burned_area_pred = burned_area_pred    # blended point estimate, for reference/plots only
   )
 
-# rgamma requires rate, not the mean. calculate this as:
-# rgamma(n, shape, rate) where rate = shape / mean
-burned_area_scaled$gamma_rate <- burned_area_scaled$gamma_shape / burned_area_scaled$gamma_mean
+# rate = shape / mean, computed PER COMPONENT (not a single blended rate)
+burned_area_scaled <- burned_area_scaled |>
+  mutate(
+    rate_extreme = phi_extreme / mu_extreme,
+    rate_typical = phi_typical / mu_typical
+  )
 
+################################################
+## Logit-space calibration shift on p_extreme 
+################################################
+#Apply the pre-fit p_extreme calibration shift to a new period's data 
+
+extreme_cal_params <- readRDS(file.path(rds_root, "Burned_Area/extreme_cal_shift.rds"))
+
+extreme_cal_shift <- extreme_cal_params$extreme_cal_shift
+eps               <- extreme_cal_params$eps
+
+cat("Applying extreme calibration shift:", round(extreme_cal_shift, 3),
+    "(fitted on", extreme_cal_params$fitted_on, ")\n")
+
+burned_area_scaled <- burned_area_scaled %>%
+  mutate(
+    p_extreme_cal = plogis(pmin(pmax(qlogis(pmin(pmax(p_extreme, eps), 1 - eps)) + extreme_cal_shift,
+                                       qlogis(eps)), qlogis(1 - eps)))
+  )
 ```
+
+
 Mean Burned area | 1 ignition over time
 ```{r}
 hist(burned_area_scaled$burned_area_pred, main="Holocene ignition efficiency")
@@ -795,8 +828,10 @@ df$fire_count_pred <- mapply(
 
 Mean fire count over time
 ```{r}
-hist(df$fire_count_pred, main="Holocene ignition efficiency")
+hist(filter(df, fire_count_pred>0)$fire_count_pred, main="Holocene fire count")
 
+summary(filter(df, fire_count_pred>0)$fire_count_pred)
+     
 df_summary <- df %>%
   dplyr::select(year, fire_count_pred) %>%
   #filter(year > -10600) %>%
@@ -831,24 +866,40 @@ ggplot(df_summary, aes(x = as.factor(century_bin), y = mean_fire_count)) +
 total_burned = rgamma(fire_count, burned_area_shape, burned_area_rate)
 
 ```{r}
-#add monthly burned area gamma parameters to fire df
 df <- df %>%
   left_join(
-    burned_area_scaled %>% dplyr::select(lat, lon, year, month, gamma_shape, gamma_rate),
+    burned_area_scaled %>% dplyr::select(lat, lon, year, month, p_extreme, p_extreme_cal,
+                                          mu_extreme, mu_typical, rate_extreme, rate_typical,
+                                          phi_extreme, phi_typical),
     by = c("lat", "lon", "year", "month")
   )
 
-#Use fire_count and burned area shape and rate estimates to simulate total burned area from the gamma distribution
-df$total_burned_area <- mapply(
-  function(fire_count, BA_shape, BA_rate) {
-    if (fire_count == 0 || is.na(fire_count)) return(0)
-    sum(rgamma(n = fire_count, shape = BA_shape, rate = BA_rate))
-  },
-  df$fire_count_pred,
-  df$gamma_shape,
-  df$gamma_rate
+n_rows <- nrow(df)
+fc <- df$fire_count_pred
+
+# ── Sampling ──────────────────────────────────────────────────────────────────
+# Uses p_extreme_cal for classification, but the ORIGINAL (uncalibrated)
+# rate_extreme/rate_typical for magnitude - no post-hoc magnitude shift
+
+valid_idx <- which(!is.na(fc) & fc > 0)
+rep_idx   <- rep(valid_idx, times = fc[valid_idx])
+
+rep_p_extreme <- rep(df$p_extreme_cal[valid_idx], times = fc[valid_idx])
+rep_rate_ext  <- rep(df$rate_extreme[valid_idx], times = fc[valid_idx])
+rep_rate_typ  <- rep(df$rate_typical[valid_idx], times = fc[valid_idx])
+
+is_extreme_draw <- rbinom(length(rep_idx), size = 1, prob = rep_p_extreme)
+
+samples <- ifelse(
+  is_extreme_draw == 1,
+  rgamma(length(rep_idx), shape = df$phi_extreme[1], rate = rep_rate_ext),
+  rgamma(length(rep_idx), shape = df$phi_typical[1], rate = rep_rate_typ)
 )
 
+row_sums <- tapply(samples, rep_idx, sum)
+total_burned_area <- rep(0, n_rows)
+total_burned_area[as.integer(names(row_sums))] <- row_sums
+df$total_burned_area <- total_burned_area
 
 ```
 
@@ -885,8 +936,10 @@ ggplot(df_summary, aes(x = as.factor(century_bin), y = mean_total_ba)) +
 
 Apply burn area cap (limits burn size to gridcell size):
 ```{r}
-# Extend apply_area_cap() to record reset years, so you can compute actual
-# time-between-resets per gridcell and compare against the literature FRI range
+
+# ── Per-gridcell engine: processes ONE gridcell's chronologically-sorted
+# time series at a time. Never call this directly on a multi-gridcell
+# dataframe - use apply_cap_to_dataset() below instead. ─────────────────────
 
 apply_area_cap <- function(df, raw_col = "total_burned_area", recovery_years = Inf) {
   n <- nrow(df)
@@ -894,7 +947,7 @@ apply_area_cap <- function(df, raw_col = "total_burned_area", recovery_years = I
 
   capped_burned_area <- numeric(n)
   was_capped         <- logical(n)
-  reset_year         <- rep(NA_real_, n)   # NEW: records the year a reset occurred
+  reset_year         <- rep(NA_real_, n)
 
   cumulative <- 0
   recovery_until_year <- -Inf
@@ -924,7 +977,7 @@ apply_area_cap <- function(df, raw_col = "total_burned_area", recovery_years = I
     if (cumulative >= area) {
       cumulative <- 0
       recovery_until_year <- this_year + recovery_years
-      reset_year[i] <- this_year   # log it
+      reset_year[i] <- this_year
     }
   }
 
@@ -934,8 +987,70 @@ apply_area_cap <- function(df, raw_col = "total_burned_area", recovery_years = I
   df
 }
 
-# After re-running apply_cap_to_dataset() with the updated function:
-emergent_fri <- fire_paleo_capped %>%
+# ── Wrapper: joins the correct per-gridcell area, validates it, sorts
+# chronologically WITHIN each gridcell, then applies apply_area_cap()
+# separately to each gridcell's own rows. THIS is the function to call. ─────
+
+apply_cap_to_dataset <- function(data, area_lookup, recovery_years = Inf,
+                                  lat_round = 4, lon_round = 4) {
+
+  # Drop any pre-existing area column from `data` BEFORE joining, so there's
+  # no ambiguity/suffix collision with area_lookup's own `area` column
+  if ("area" %in% names(data)) {
+    data <- data %>% dplyr::select(-area)
+  }
+
+  data <- data %>% mutate(lat = round(lat, lat_round), lon = round(lon, lon_round))
+  area_lookup <- area_lookup %>%
+    mutate(lat = round(lat, lat_round), lon = round(lon, lon_round)) %>%
+    dplyr::select(lat, lon, area) %>%
+    distinct(lat, lon, .keep_all = TRUE)
+
+  data <- data %>%
+    left_join(area_lookup, by = c("lat", "lon"))
+
+  n_missing <- sum(is.na(data$area))
+  if (n_missing > 0) {
+    warning(sprintf(
+      "%d rows (%.2f%%) had no matching area after the join - these will be excluded from capping.",
+      n_missing, 100 * n_missing / nrow(data)
+    ))
+  }
+
+  area_check <- data %>%
+    filter(!is.na(area)) %>%
+    group_by(lat, lon) %>%
+    summarise(n_distinct_area = n_distinct(area), .groups = "drop") %>%
+    filter(n_distinct_area > 1)
+
+  if (nrow(area_check) > 0) {
+    stop(sprintf(
+      "%d gridcells have more than one distinct area value - fix area_lookup before proceeding.",
+      nrow(area_check)
+    ))
+  }
+
+  data %>%
+    filter(!is.na(area)) %>%
+    arrange(lat, lon, year, month) %>%
+    group_by(lat, lon) %>%
+    group_modify(~ apply_area_cap(.x, recovery_years = recovery_years)) %>%
+    ungroup()
+}
+```
+
+```{r}
+area <- read.csv(file.path(paleoclimate_data_root, "TraCE_21ka_gridcell_area.csv")) %>% dplyr::select(lat, lon, area_clipped_km2)  %>% rename(area = area_clipped_km2)
+
+df_capped <- apply_cap_to_dataset(
+  df, area_lookup = area, recovery_years = 20
+)
+
+```
+
+
+```{r}
+emergent_fri <- df_capped %>%
   filter(!is.na(reset_year)) %>%
   distinct(lat, lon, reset_year) %>%
   arrange(lat, lon, reset_year) %>%
@@ -945,20 +1060,96 @@ emergent_fri <- fire_paleo_capped %>%
   filter(!is.na(interval))
 
 summary(emergent_fri$interval)
+
 hist(emergent_fri$interval, breaks = 30,
      main = "Emergent simulated fire return interval",
      xlab = "Years between full-burn resets")
+
+nrow(filter(emergent_fri, interval<50))
 ```
 
+```{r}
 
+# ── Per-gridcell: for each row, find the YEAR and BURNED AREA of the next
+# fire STRICTLY AFTER that row (not including the row itself). A single
+# backward pass, so it's fast even across the full paleo record. ────────────
 
+add_next_fire_info <- function(df) {
+  n <- nrow(df)
+  next_fire_year <- rep(NA_real_, n)
+  next_fire_area <- rep(NA_real_, n)
 
+  carry_year <- NA_real_
+  carry_area <- NA_real_
 
+  for (i in seq(n, 1, by = -1)) {
+    # Assign BEFORE updating carry, so a fire row never "sees" itself
+    next_fire_year[i] <- carry_year
+    next_fire_area[i] <- carry_area
 
-COnvert km2 to acres:
+    if (df$total_burned_area_capped[i] > 0) {
+      carry_year <- df$year[i]
+      carry_area <- df$total_burned_area_capped[i]
+    }
+  }
+
+  df$next_fire_year          <- next_fire_year
+  df$next_fire_burned_area   <- next_fire_area
+  df
+}
+
+# ── Apply per gridcell, same chronological-sort pattern as before ───────────
+
+df_capped_with_next_fire <- df_capped %>%
+  arrange(lat, lon, year, month) %>%
+  group_by(lat, lon) %>%
+  group_modify(~ add_next_fire_info(.x)) %>%
+  ungroup()
+
+# ── Build emergent_fri, now including burned area of the first fire post-reset ──
+
+emergent_fri <- df_capped_with_next_fire %>%
+  filter(!is.na(reset_year)) %>%
+  distinct(lat, lon, reset_year, .keep_all = TRUE) %>%   # keep_all so next_fire_* columns survive
+  arrange(lat, lon, reset_year) %>%
+  group_by(lat, lon) %>%
+  mutate(interval = reset_year - lag(reset_year)) %>%
+  ungroup() %>%
+  filter(!is.na(interval)) %>%
+  dplyr::select(lat, lon, reset_year, interval,
+                first_fire_after_reset_year = next_fire_year,
+                first_fire_after_reset_burned_area = next_fire_burned_area)%>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  left_join(
+    area %>% mutate(lat = round(lat, 4), lon = round(lon, 4)),
+    by = c("lat", "lon")) %>% mutate(pct_first_fire_of_gridcell = (first_fire_after_reset_burned_area/area)*100)
+
+filter(emergent_fri, interval<50)
+
+filter(emergent_fri, interval<100 & first_fire_after_reset_burned_area>100)
+
+ggplot(filter(emergent_fri, interval < 500),
+       aes(x = interval, y = first_fire_after_reset_burned_area,
+           size = pct_first_fire_of_gridcell, color = pct_first_fire_of_gridcell)) +
+  geom_point(alpha = 0.7) +
+  scale_color_gradient(low = "#556B2F", high = "firebrick") +
+  guides(
+    color = guide_legend(title = "% of gridcell burned\nby first fire"),
+    size  = guide_legend(title = "% of gridcell burned\nby first fire")
+  ) +
+  theme_minimal() +
+  ggtitle("Simulated fire return time") +
+  ylab("First fire burned area (km²)") +
+  xlab("Fire return interval (years)")
+
+summary(filter(emergent_fri, interval < 500)$pct_first_fire_of_gridcell)
+```
+
+Convert km2 to acres:
 ```{r}
 df <- df %>%
-  mutate(total_burned_area_acres = total_burned_area * 247.105)
+  mutate(total_burned_area_acres = total_burned_area * 247.105,
+         total_burned_area_acres_capped = total_burned_area_capped * 247.105)
 ```
 
 ```{r}
@@ -1347,17 +1538,17 @@ hline_df <- tibble::tibble(
 )
 
 #convert trace burned area km to acres
-df <- df %>%
-  mutate(total_burned_area_acres = total_burned_area * 247.105)
+df_capped <- df_capped %>%
+  mutate(total_burned_area_acres_capped = total_burned_area_capped * 247.105)
 
 var <-  "total_burned_area_acres"
 y_lable <- "Burned area (acres)" # (Alaska-wide annual total)" # (100-yr summary, log scale)"
 main <- "(c)"
 
 #collapse to one Alaska-wide total per summer (year), sum across all gridcells and all three summer months.
-df_year <- df %>%
-  dplyr::select(year, total_burned_area_acres) %>%
-  rename(prediction = total_burned_area_acres) %>%
+df_year <- df_capped %>%
+  dplyr::select(year, total_burned_area_acres_capped) %>%
+  rename(prediction = total_burned_area_acres_capped) %>%
   group_by(year) %>%
   summarise(annual_total = sum(prediction, na.rm = TRUE), .groups = "drop")
 

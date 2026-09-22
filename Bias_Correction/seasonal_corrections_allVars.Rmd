@@ -1,0 +1,2464 @@
+---
+title: "Streamlined seasonal correction"
+author: "Charlotte Uden"
+date: "2026-08-09"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(arrow)
+library(geodata)
+library(terra)
+library(rnaturalearth)
+library(sf)
+library(patchwork)
+library(purrr)
+library(qmap)
+library(FNN)  
+library(rlang) 
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+
+Read in elvation and trace points:
+```{r}
+trace_elev_lookup <- readRDS(file.path(rds_root, "trace_elev_lookup.rds"))
+trace_cells <- readRDS(file.path(rds_root, "trace_cells.rds"))
+```
+
+From python file that converted netcdf to parquet:
+Note: TraCE model years are offset from BP/CE. Year 0 in the model = 22000 BP.
+    We convert to approximate CE year: ce_year = model_year - 21950
+    (where 1950 CE = 0 BP = model year 21950)
+
+```{r}
+# Read the TRACE parquet file
+#read the parquet - full range, no ce_year filter this time
+trace_seasonal_full <- read_parquet(file.path(paleoclimate_data_root, "trace21ka_processed/trace_lightning_model.parquet"))
+trace_seasonal_full <- trace_seasonal_full %>% mutate(year = ce_year + 1900)
+
+range(trace_seasonal_full$ce_year)  # confirm this covers the full -15949 to 90 range
+
+trace_seasonal <- trace_seasonal_full %>% filter(ce_year >= 46, ce_year <= 89)
+
+#make year match conventional dating
+trace_seasonal <- trace_seasonal %>%
+  mutate(year = ce_year + 1900)
+
+trace_seasonal_full <- trace_seasonal_full %>%
+  mutate(year = ce_year + 1900)
+
+# Sanity check
+range(trace_seasonal$year)
+range(trace_seasonal_full$year)
+```
+
+Spatial clip to Alaska
+```{r}
+trace_seasonal_full <- trace_seasonal_full %>%
+  mutate(lon = ifelse(lon > 180, lon - 360, lon)) %>%   # match trace_cells' -180/180 convention
+  semi_join(trace_cells, by = c("lat", "lon")) %>%
+  left_join(trace_elev_lookup, by = c("lat", "lon"))
+
+trace_seasonal <- trace_seasonal %>%
+  mutate(lon = ifelse(lon > 180, lon - 360, lon)) %>%   # match trace_cells' -180/180 convention
+  semi_join(trace_cells, by = c("lat", "lon")) %>%
+  left_join(trace_elev_lookup, by = c("lat", "lon"))
+
+# Sanity checks
+nrow(trace_seasonal_full)
+n_distinct(trace_seasonal_full$lat, trace_seasonal_full$lon)   # should be 23
+sum(is.na(trace_seasonal_full$elevation))                      # should be 0
+names(trace_seasonal_full)
+# Sanity checks
+nrow(trace_seasonal)
+n_distinct(trace_seasonal$lat, trace_seasonal$lon)   # should be 23
+sum(is.na(trace_seasonal$elevation))                      # should be 0
+names(trace_seasonal)
+
+ggplot(filter(trace_seasonal, year==1946), aes(x=lon, y=lat)) + geom_point()
+```
+
+
+Read in ERA5 seasonal data for correction period:
+```{r}
+era_seasonal <- read_parquet(file.path(era5_data_root,"bias_correction/processed_parquet/era5_lightning_model_1946_1990.parquet"))
+range(era_seasonal$year)
+names(era_seasonal)
+```
+
+
+A spatial mis match: Aggregate ERA5 up to TraCE's grid by veraging all ERA5 points that fall within each TraCE grid cell. This maintains TraCE's actual physical resolution and avoids inventing false precision (interpolating trace down to era5 grid). 
+
+```{r}
+#save unaggregated ERA5 data:
+era_seasonal_pre_aggregation <- era_seasonal
+# Match each ERA5 point to nearest TraCE grid cell
+nn <- get.knnx(data = trace_cells[, c("lon", "lat")],
+               query = era_seasonal[, c("lon", "lat")], k = 1)
+
+era_seasonal$trace_lon <- trace_cells$lon[nn$nn.index]
+era_seasonal$trace_lat <- trace_cells$lat[nn$nn.index]
+
+# Aggregate ERA5 to TraCE grid cells, by year
+era_seasonal<- era_seasonal %>%
+  dplyr::select(-lat, -lon) %>%
+  rename(lat = trace_lat, lon = trace_lon)
+
+era_seasonal <- era_seasonal %>%
+  group_by(lat, lon, year) %>%
+  summarise(across(where(is.numeric), \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+ggplot(filter(era_seasonal, year==1946), aes(x=lon, y=lat)) + geom_point()
+```
+
+
+# ========================================================================================================================
+# ==========================================    TEMPERATURE       ============================================================
+# ========================================================================================================================
+
+# ============================================================
+# DEFINE VARIABLE + MONTH FOR THIS RUN
+# Change these two lines and re-run top to bottom, once per month (6, 7, 8)
+# ============================================================
+```{r}
+var_name  <- "tair"
+month_val <- NULL  
+
+era_col   <- var_name
+trace_col <- var_name
+
+# Filter to this var only, right at the source - everything downstream inherits this scope
+era_calib   <- era_seasonal  %>% dplyr::select(lat, lon, year, era_col)
+trace_calib <- trace_seasonal %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+trace_full  <- trace_seasonal_full  %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+
+# Dynamically-named output columns (unchanged across months - the month scoping lives in the data, not the names)
+bias_col      <- paste0(var_name, "_predicted_bias")
+corrected_col <- paste0(var_name, "_corrected")
+var_ratio_col <- paste0(var_name, "_var_ratio_pred")
+cell_mean_col <- paste0(var_name, "_cell_mean")
+rescaled_col  <- paste0(var_name, "_rescaled")
+final_col     <- paste0(var_name, "_final")
+```
+
+# ============================================================
+# Small reusable plotting helpers (pure boilerplate — logic stays inline below)
+# ============================================================
+```{r}
+plot_density_compare <- function(df_list, value_cols, labels, var_label, month_label = NULL) {
+  df_long <- purrr::map2_dfr(df_list, seq_along(df_list), function(df, i) {
+    tibble(value = df[[value_cols[i]]], source = labels[i])
+  })
+  title <- if (!is.null(month_label)) paste0(var_label, " — month ", month_label) else var_label
+  ggplot(df_long, aes(x = value, color = source)) +
+    geom_density(linewidth = 0.9, fill = NA) +
+    labs(title = title, x = var_label, y = "Density", color = NULL) +
+    theme_minimal() + theme(legend.position = "bottom")
+}
+
+plot_timeseries_compare <- function(df_list, year_cols, value_cols, labels, var_label, month_label = NULL) {
+  df_long <- purrr::pmap_dfr(list(df_list, year_cols, value_cols, labels),
+                              function(df, yc, vc, lab) {
+    df %>% group_by(year = .data[[yc]]) %>%
+      summarise(mean_val = mean(.data[[vc]], na.rm = TRUE), .groups = "drop") %>%
+      mutate(source = lab)
+  })
+  title <- if (!is.null(month_label)) paste0(var_label, " — month ", month_label) else var_label
+  ggplot(df_long, aes(x = year, y = mean_val, color = source)) +
+    geom_line(alpha = 0.7) +
+    labs(title = title, y = paste("Mean", var_label), color = NULL) +
+    theme_minimal()
+}
+
+plot_timeseries_calib <- function(era_df, era_year_col, era_value_col,
+                                   trace_df, trace_year_col, trace_value_col,
+                                   var_label, month_label = NULL) {
+  
+  era_summary <- era_df %>%
+    group_by(year = .data[[era_year_col]]) %>%
+    summarise(mean_val = mean(.data[[era_value_col]], na.rm = TRUE), .groups = "drop") %>%
+    mutate(source = "ERA5 (calib)")
+  
+  trace_summary <- trace_df %>%
+    group_by(year = .data[[trace_year_col]]) %>%
+    summarise(mean_val = mean(.data[[trace_value_col]], na.rm = TRUE), .groups = "drop") %>%
+    mutate(source = "TraCE (calib)")
+  
+  df_long <- bind_rows(era_summary, trace_summary)
+  
+  title <- if (!is.null(month_label)) paste0(var_label, " — month ", month_label) else var_label
+  
+  ggplot(df_long, aes(x = year, y = mean_val, color = source)) +
+    geom_line(alpha = 0.7) +
+    scale_color_manual(values = c("ERA5 (calib)" = "black", "TraCE (calib)" = "#2E86C1")) +
+    labs(title = title, y = paste("Mean", var_label), color = NULL) +
+    theme_minimal()
+}
+
+quantile_compare_table <- function(df_list, value_cols, labels,
+                                    probs = c(0.01, 0.05, 0.10, 0.90, 0.95, 0.99)) {
+  purrr::pmap_dfr(list(df_list, value_cols, labels), function(df, vc, lab) {
+    q <- quantile(df[[vc]], probs, na.rm = TRUE)
+    tibble(source = lab, prob = names(q), value = q)
+  }) %>% pivot_wider(names_from = source, values_from = value)
+}
+```
+# ============================================================
+# STEP 1: Compare ERA5 calib / TraCE calib / TraCE full RAW — this month only
+# Does the full paleo record fall outside the calibration TraCE range?
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_compare(
+  list(era_calib, trace_calib, trace_full),
+  c("year", "year", "year"),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = trace_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)")
+)
+
+range(trace_calib[[trace_col]], na.rm = TRUE)
+range(trace_full[[trace_col]], na.rm = TRUE)
+# If trace_full's range is meaningfully wider than trace_calib's -> QM will extrapolate -> flag for Step 7
+```
+# ============================================================
+# STEP 2: Calculate bias for the calibration period — this month only
+# ============================================================
+```{r}
+compare_df_m <- era_calib %>%
+  inner_join(trace_calib, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+  # adjust join columns if your seasonal frames key differently
+
+bias_summary_m <- tibble(
+  variable = var_name, month = month_val,
+  mean_bias = mean(compare_df_m[[paste0(var_name, "_trace")]] -
+                    compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  correlation = cor(compare_df_m[[paste0(var_name, "_trace")]],
+                     compare_df_m[[paste0(var_name, "_era")]], use = "complete.obs"),
+  era_sd = sd(compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  trace_sd = sd(compare_df_m[[paste0(var_name, "_trace")]], na.rm = TRUE)
+)
+bias_summary_m
+
+cellwise_bias_m <- compare_df_m %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    bias = mean(.data[[paste0(var_name, "_trace")]] - .data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    .groups = "drop"
+  )
+cellwise_bias_m
+
+ggplot(cellwise_bias_m, aes(x=lon, y=lat, color=bias)) + geom_point()
+
+cor(cellwise_bias_m$bias, cellwise_bias_m$lon)
+cor(cellwise_bias_m$bias, cellwise_bias_m$lat)
+cor(cellwise_bias_m$bias, cellwise_bias_m$lon)
+```
+# ============================================================
+# STEP 3: Fit candidate mean-bias models — this month only
+# Fully manual, same as every variable so far — inspect, then assign the winner explicitly
+# ============================================================
+```{r}
+m_elev   <- lm(bias ~ elevation, data = cellwise_bias_m)
+m_lat    <- lm(bias ~ lat, data = cellwise_bias_m)
+m_lon    <- lm(bias ~ lon, data = cellwise_bias_m)
+m_latlon <- lm(bias ~ lat + lon, data = cellwise_bias_m)
+m_full   <- lm(bias ~ elevation + lat + lon, data = cellwise_bias_m)
+m_flat <- lm(bias ~ 1, data = cellwise_bias_m) 
+
+summary(m_elev); summary(m_lat); summary(m_lon); summary(m_latlon); summary(m_full); summary(m_flat)
+anova(m_lat, m_latlon)
+anova(m_latlon, m_full)
+anova(m_latlon, m_flat)
+anova(m_full, m_flat)
+AIC(m_elev, m_lat, m_lon, m_latlon, m_full, m_flat)
+
+cellwise_bias_m$resid_check <- residuals(m_latlon)  # swap in whichever you're evaluating
+cor(cellwise_bias_m$resid_check, cellwise_bias_m$elevation)
+```
+
+No predicotr of mean bias stands out- likely because therea are only 23 gridcells being used to find a patter. Apply a flat bias correction regardless of elvation or locaiton:
+```{r}
+# ---- Set explicitly once you've reviewed the output above ----
+mean_bias_model <- m_flat
+
+trace_calib[[bias_col]] <- predict(mean_bias_model, newdata = trace_calib)
+trace_calib[[corrected_col]] <- trace_calib[[trace_col]] - trace_calib[[bias_col]]
+
+trace_full[[bias_col]] <- predict(mean_bias_model, newdata = trace_full)
+trace_full[[corrected_col]] <- trace_full[[trace_col]] - trace_full[[bias_col]]
+```
+# ============================================================
+# STEP 4: Check corrected mean — this month only
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = corrected_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)")
+)
+
+cellwise_variance_m <- compare_df_m %>%
+  mutate(!!corrected_col := .data[[paste0(var_name, "_trace")]] -
+           predict(mean_bias_model, newdata = compare_df_m)) %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    sd_corrected = sd(.data[[corrected_col]], na.rm = TRUE),
+    var_ratio = sd_corrected / sd_era,
+    .groups = "drop"
+  )
+cellwise_variance_m %>% arrange(desc(abs(var_ratio - 1)))
+summary(cellwise_variance_m$var_ratio)
+```
+# ============================================================
+# STEP 5: Decide if variance needs correcting — this month only
+# ============================================================
+```{r}
+vr_elev   <- lm(var_ratio ~ elevation, data = cellwise_variance_m)
+vr_lat    <- lm(var_ratio ~ lat, data = cellwise_variance_m)
+vr_lon    <- lm(var_ratio ~ lon, data = cellwise_variance_m)
+vr_latlon <- lm(var_ratio ~ lat + lon, data = cellwise_variance_m)
+vr_full   <- lm(var_ratio ~ elevation + lat + lon, data = cellwise_variance_m)
+vr_lonelev   <- lm(var_ratio ~ elevation + lon, data = cellwise_variance_m)
+vr_flat <- lm(var_ratio ~ 1, data=cellwise_variance_m)
+
+summary(vr_elev); summary(vr_lat); summary(vr_lon); summary(vr_latlon); summary(vr_full); summary(vr_lonelev); summary(vr_flat)
+anova(vr_lat, vr_latlon)
+anova(vr_lon, vr_elev)
+anova(vr_lon, vr_lonelev)
+AIC(vr_elev, vr_lat, vr_lon, vr_latlon, vr_full, vr_lonelev, vr_flat)
+```
+
+```{r}
+# ---- Set explicitly, or skip Step 5 entirely if var_ratio was already close to 1 ----
+var_ratio_model <- vr_lat
+
+trace_calib[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_calib)
+trace_calib <- trace_calib %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+
+trace_full[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_full)
+trace_full <- trace_full %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+```
+# ============================================================
+# STEP 6: Check rescaled values 
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, rescaled_col, rescaled_col),
+  c("ERA5 (calib)", "TraCE (calib, rescaled)", "TraCE (full, rescaled)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = rescaled_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, rescaled_col, rescaled_col),
+  c("ERA5 (calib)", "TraCE (calib, rescaled)", "TraCE (full, rescaled)")
+)
+
+
+cellwise_check_m <- trace_calib %>%
+  left_join(
+    era_calib %>% dplyr::select(lat, lon, year, !!paste0(era_col, "_era_ref") := all_of(era_col)),
+    by = c("lat", "lon", "year")
+  ) %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(era_col, "_era_ref")]], na.rm = TRUE),
+    sd_rescaled = sd(.data[[rescaled_col]], na.rm = TRUE),
+    var_ratio_after = sd_rescaled / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_check_m %>% arrange(desc(abs(var_ratio_after - 1)))
+
+range(cellwise_check_m$var_ratio_after)
+
+ggplot(cellwise_check_m, aes(x=lon, y=lat, color=var_ratio_after, size=var_ratio_after)) + geom_point()
+```
+
+
+
+```{r}
+plot_century_trend <- function(full_data, var_col,
+                                era_data, era_col,
+                                calib_data, calib_col,
+                                var_label = var_col,
+                                bin_width = 100) {
+  
+  # Bin the full corrected record into century windows
+  df_summary <- full_data %>%
+    dplyr::select(year, all_of(var_col)) %>%
+    mutate(century_bin = floor(year / bin_width) * bin_width) %>%
+    group_by(century_bin) %>%
+    summarise(
+      mean_val = mean(.data[[var_col]], na.rm = TRUE),
+      ci_low   = quantile(.data[[var_col]], 0.025, na.rm = TRUE),
+      ci_high  = quantile(.data[[var_col]], 0.975, na.rm = TRUE),
+      n_obs    = n(),
+      .groups  = "drop"
+    )
+  
+  # ERA5 calibration-period reference mean
+  era5_mean <- era_data %>%
+    group_by(year, lat, lon) %>%
+    summarise(mean_obs = mean(.data[[era_col]], na.rm = TRUE), .groups = "drop") %>%
+    pull(mean_obs) %>%
+    mean(na.rm = TRUE)
+  
+  breaks_seq <- as.character(seq(min(df_summary$century_bin), max(df_summary$century_bin), by = 500))
+  
+  ggplot(df_summary, aes(x = as.factor(century_bin), y = mean_val)) +
+    geom_point(size = 3, alpha = 0.2) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.1, alpha = 0.2) +
+    geom_hline(yintercept = era5_mean, linetype = "dotted", color = "red", linewidth = 0.5) +
+    scale_x_discrete(breaks = breaks_seq) +
+    theme_minimal() +
+    labs(x = paste0("Year (", bin_width, "-yr bin)"), y = var_label, title = "") +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      legend.title = element_blank()
+    )
+}
+
+#plot corrected full trace for all months:
+plot_century_trend(
+  full_data = trace_full, var_col = "tair_corrected",
+  era_data = era_seasonal, era_col = "tair",
+  var_label = "Corrected temperature"
+)
+
+plot_century_trend(
+  full_data = trace_full, var_col = "tair_rescaled",
+  era_data = era_seasonal, era_col = "tair",
+  var_label = "Rescaled temperature"
+)
+```
+```{r}
+# trace_calib[[final_col]] <- trace_calib[[rescaled_col]]
+# trace_full[[final_col]]  <- trace_full[[rescaled_col]]
+```
+
+# ============================================================
+# STEP 7: Apply QM if Step 1 showed it's viable; otherwise finalize as-is
+# ============================================================
+
+
+```{r}
+# ── Fit QM on corrected_col (calibration period only) ────────────────────────
+qm_model_rquant <- fitQmap(
+  compare_df_m[[paste0(var_name, "_era")]],
+  trace_calib[[corrected_col]],
+  method = "RQUANT",
+  qstep = 0.01,
+  wet.day = FALSE
+)
+
+# ── Apply QM to BOTH trace_calib and trace_full ───────────────────────────────
+trace_calib[[final_col]] <- doQmap(trace_calib[[corrected_col]], qm_model_rquant, slope = TRUE)
+trace_full[[final_col]]  <- doQmap(trace_full[[corrected_col]],  qm_model_rquant, slope = TRUE)
+
+# ── Replace the flattened tail with a linear ramp between the QM boundary
+# and a conservative floor (natural calib-vs-full gap), instead of clamping ──
+
+floor_val   <- min(trace_calib[[corrected_col]], na.rm = TRUE)   # QM's fitted input floor
+boundary_out <- doQmap(floor_val, qm_model_rquant, slope = TRUE) # QM's output AT that floor
+
+natural_gap <- min(trace_calib$tair, na.rm = TRUE) - min(trace_full$tair, na.rm = TRUE)
+conservative_floor <- boundary_out - natural_gap
+
+min_corrected_full <- min(trace_full[[corrected_col]], na.rm = TRUE)
+
+cat("QM input floor:", floor_val, "  QM output at floor:", boundary_out, "\n")
+cat("Conservative output floor:", conservative_floor, "\n")
+cat("Most extreme trace_full corrected input:", min_corrected_full, "\n")
+
+trace_full <- trace_full %>%
+  mutate(
+    !!final_col := ifelse(
+      .data[[corrected_col]] < floor_val,
+      # Linear ramp: boundary_out at floor_val, conservative_floor at min_corrected_full
+      boundary_out + (.data[[corrected_col]] - floor_val) *
+        (conservative_floor - boundary_out) / (min_corrected_full - floor_val),
+      .data[[final_col]]
+    )
+  )
+
+n_ramped <- sum(trace_full[[corrected_col]] < floor_val, na.rm = TRUE)
+cat("Rows replaced with ramped extrapolation:", n_ramped,
+    sprintf("(%.3f%%)\n", 100 * n_ramped / nrow(trace_full)))
+
+summary(trace_full[[final_col]])
+n_distinct(trace_full %>% filter(.data[[corrected_col]] < floor_val) %>% pull(!!final_col))
+```
+
+
+
+
+After qm, minimum tair value is stretched quite low, making the differnec ebetween min tair calib period and min tair full period much larger: 1.7 to 4.5 degrees. 
+Add a clamp, which stops final tair values from exceeding this 1.7 degree difference between min calibration period temp and min paleo period temp. 
+
+
+```{r}
+
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, final_col, final_col),
+  c("ERA5 (calib)", "TraCE (calib, final)", "TraCE (full, final)"),
+  var_name, month_val
+ )
+
+plot_century_trend(
+  full_data = trace_full, var_col = final_col,
+  era_data = era_seasonal, era_col = "tair",
+  var_label = "QM temperature"
+)
+
+summary(era_calib$tair)
+summary(trace_calib$tair)
+summary(trace_full$tair)
+summary(trace_calib$tair_corrected)
+summary(trace_full$tair_corrected)
+summary(trace_calib$tair_rescaled)
+summary(trace_full$tair_rescaled)
+summary(trace_calib$tair_final)
+summary(trace_full$tair_final)
+```
+
+
+Final calibration steps: bias correction with QM. Rescaling pulls trace full values too far left and right. Clamping addresses this, but results in a high peak where the calmp is applie. Abandon this. Final: mean bias correction + quantil mapping. 
+# ============================================================
+# STORE this month's results and models before moving to the next month
+# ============================================================
+```{r}
+if (!exists("seasonal_models")) seasonal_models <- list()
+if (!exists("seasonal_results_calib")) seasonal_results_calib <- list()
+if (!exists("seasonal_results_full")) seasonal_results_full <- list()
+
+# Bundle the ramp parameters only if a ramp was actually applied this run;
+# NULL otherwise, so the stored record accurately reflects what happened
+ramp_params <- if (exists("n_distinct_below") && n_distinct_below <= 1 && n_below > 0) {
+  list(
+    floor_val           = floor_val,
+    boundary_out        = boundary_out,
+    natural_gap         = natural_gap,
+    conservative_floor  = conservative_floor,
+    min_corrected_full  = min_corrected_full
+  )
+} else {
+  NULL
+}
+
+seasonal_models[[as.character(var_name)]] <- list(
+  mean_model      = mean_bias_model,
+  var_ratio_model = NULL,             # rescaling was computed but NOT used in final_col - see note below
+  qm_model        = qm_model_rquant,  # the RQUANT model actually applied
+  ramp_params     = ramp_params
+)
+
+seasonal_results_calib[[as.character(var_name)]] <- trace_calib
+seasonal_results_full[[as.character(var_name)]]  <- trace_full
+
+# Sanity check before moving on - confirms what actually got stored for this variable
+cat("Stored for", var_name, ":\n")
+cat("  mean_model:", class(seasonal_models[[var_name]]$mean_model)[1], "\n")
+cat("  var_ratio_model:", ifelse(is.null(seasonal_models[[var_name]]$var_ratio_model), "NULL", "set"), "\n")
+cat("  qm_model class:", class(seasonal_models[[var_name]]$qm_model)[1], "\n")
+cat("  ramp applied:", !is.null(seasonal_models[[var_name]]$ramp_params), "\n")
+```
+
+
+# ============================================================
+# DEFINE VARIABLE + MONTH FOR THIS RUN
+# Change these two lines and re-run top to bottom, once per month (6, 7, 8)
+# ============================================================
+
+# =======================================================================================================================
+# ======================================    PRECIPITATION
+# =======================================================================================================================
+```{r}
+var_name  <- "precip"
+month_val <- NULL   # 6 = June, 7 = July, 8 = August
+
+era_col   <- var_name
+trace_col <- var_name
+
+# Filter to this var only, right at the source - everything downstream inherits this scope
+era_calib   <- era_seasonal  %>% dplyr::select(lat, lon, year, era_col)
+trace_calib <- trace_seasonal %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+trace_full  <- trace_seasonal_full  %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+
+# Dynamically-named output columns (unchanged across months - the month scoping lives in the data, not the names)
+bias_col      <- paste0(var_name, "_predicted_bias")
+corrected_col <- paste0(var_name, "_corrected")
+var_ratio_col <- paste0(var_name, "_var_ratio_pred")
+cell_mean_col <- paste0(var_name, "_cell_mean")
+rescaled_col  <- paste0(var_name, "_rescaled")
+final_col     <- paste0(var_name, "_final")
+```
+
+
+# ============================================================
+# STEP 1: Compare ERA5 calib / TraCE calib / TraCE full RAW — this month only
+# Does the full paleo record fall outside the calibration TraCE range?
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_compare(
+  list(era_calib, trace_calib, trace_full),
+  c("year", "year", "year"),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = trace_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)")
+)
+
+range(trace_calib[[trace_col]], na.rm = TRUE)
+range(trace_full[[trace_col]], na.rm = TRUE)
+# If trace_full's range is meaningfully wider than trace_calib's -> QM will extrapolate -> flag for Step 7
+```
+# ============================================================
+# STEP 2: Calculate bias for the calibration period — this month only
+# ============================================================
+```{r}
+compare_df_m <- era_calib %>%
+  inner_join(trace_calib, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+  # adjust join columns if your seasonal frames key differently
+
+bias_summary_m <- tibble(
+  variable = var_name, month = month_val,
+  mean_bias = mean(compare_df_m[[paste0(var_name, "_trace")]] -
+                    compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  correlation = cor(compare_df_m[[paste0(var_name, "_trace")]],
+                     compare_df_m[[paste0(var_name, "_era")]], use = "complete.obs"),
+  era_sd = sd(compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  trace_sd = sd(compare_df_m[[paste0(var_name, "_trace")]], na.rm = TRUE)
+)
+bias_summary_m
+
+cellwise_bias_m <- compare_df_m %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    bias = mean(.data[[paste0(var_name, "_trace")]] - .data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    .groups = "drop"
+  )
+cellwise_bias_m
+
+```
+# ============================================================
+# STEP 3: Fit candidate mean-bias models — this month only
+# Fully manual, same as every variable so far — inspect, then assign the winner explicitly
+# ============================================================
+```{r}
+m_elev   <- lm(bias ~ elevation, data = cellwise_bias_m)
+m_lat    <- lm(bias ~ lat, data = cellwise_bias_m)
+m_lon    <- lm(bias ~ lon, data = cellwise_bias_m)
+m_latlon <- lm(bias ~ lat + lon, data = cellwise_bias_m)
+m_full   <- lm(bias ~ elevation + lat + lon, data = cellwise_bias_m)
+m_flat <- lm(bias ~ 1, data = cellwise_bias_m) 
+
+summary(m_elev); summary(m_lat); summary(m_lon); summary(m_latlon); summary(m_full); summary(m_flat)
+anova(m_lat, m_latlon)
+anova(m_lon, m_flat)
+AIC(m_elev, m_lat, m_lon, m_latlon, m_full, m_flat)
+
+cellwise_bias_m$resid_check <- residuals(m_latlon)  # swap in whichever you're evaluating
+cor(cellwise_bias_m$resid_check, cellwise_bias_m$elevation)
+```
+
+No predicotr of mean bias stands out. Apply a flat bias correction regardless of elvation or locaiton:
+```{r}
+# ---- Set explicitly once you've reviewed the output above ----
+mean_bias_model <- m_flat
+
+trace_calib[[bias_col]] <- predict(mean_bias_model, newdata = trace_calib)
+trace_calib[[corrected_col]] <- trace_calib[[trace_col]] - trace_calib[[bias_col]]
+
+trace_full[[bias_col]] <- predict(mean_bias_model, newdata = trace_full)
+trace_full[[corrected_col]] <- trace_full[[trace_col]] - trace_full[[bias_col]]
+```
+
+
+# ============================================================
+# STEP 4: Check corrected mean — this month only
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)"),
+  var_name, month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)")
+)
+
+cellwise_variance_m <- compare_df_m %>%
+  mutate(!!corrected_col := .data[[paste0(var_name, "_trace")]] -
+           predict(mean_bias_model, newdata = compare_df_m)) %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    sd_corrected = sd(.data[[corrected_col]], na.rm = TRUE),
+    var_ratio = sd_corrected / sd_era,
+    .groups = "drop"
+  )
+cellwise_variance_m %>% arrange(desc(abs(var_ratio - 1)))
+summary(cellwise_variance_m$var_ratio)
+```
+# ============================================================
+# STEP 5: Decide if variance needs correcting — this month only
+# ============================================================
+```{r}
+vr_elev   <- lm(var_ratio ~ elevation, data = cellwise_variance_m)
+vr_lat    <- lm(var_ratio ~ lat, data = cellwise_variance_m)
+vr_lon    <- lm(var_ratio ~ lon, data = cellwise_variance_m)
+vr_latlon <- lm(var_ratio ~ lat + lon, data = cellwise_variance_m)
+vr_full   <- lm(var_ratio ~ elevation + lat + lon, data = cellwise_variance_m)
+vr_flat <- lm(var_ratio ~ 1, data = cellwise_variance_m)
+
+summary(vr_elev); summary(vr_lat); summary(vr_lon); summary(vr_latlon); summary(vr_full); summary(vr_flat)
+
+anova(vr_latlon, vr_flat)
+anova(vr_lat, vr_latlon)
+AIC(vr_elev, vr_lat, vr_lon, vr_latlon, vr_full, vr_flat)
+```
+
+```{r}
+# ---- Set explicitly, or skip Step 5 entirely if var_ratio was already close to 1 ----
+var_ratio_model <- vr_latlon
+
+trace_calib[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_calib)
+trace_calib <- trace_calib %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+
+trace_full[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_full)
+trace_full <- trace_full %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+```
+# ============================================================
+# STEP 6: Check rescaled values — this month only
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, rescaled_col, rescaled_col),
+  c("ERA5 (calib)", "TraCE (calib, rescaled)", "TraCE (full, rescaled)"),
+  var_name, month_val
+)
+
+cellwise_check_m <- trace_calib %>%
+  left_join(
+    era_calib %>% dplyr::select(lat, lon, year, !!paste0(era_col, "_era_ref") := all_of(era_col)),
+    by = c("lat", "lon", "year")
+  ) %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(era_col, "_era_ref")]], na.rm = TRUE),
+    sd_rescaled = sd(.data[[rescaled_col]], na.rm = TRUE),
+    var_ratio_after = sd_rescaled / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_check_m %>% arrange(desc(abs(var_ratio_after - 1)))
+
+range(cellwise_check_m$var_ratio_after)
+
+cellwise_check_full <- trace_full %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_rescaled_full = sd(.data[[rescaled_col]], na.rm = TRUE),
+    min_rescaled = min(.data[[rescaled_col]], na.rm = TRUE),
+    max_rescaled = max(.data[[rescaled_col]], na.rm = TRUE),
+    n_negative = sum(.data[[rescaled_col]] < 0, na.rm = TRUE),
+    n_over_1   = sum(.data[[rescaled_col]] > 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_over_1))
+
+cellwise_check_full
+```
+# ============================================================
+# STEP 7: Apply QM if Step 1 showed it's viable; otherwise finalize as-is
+# ============================================================
+```{r}
+# ---- if QM viable ----
+qm_model <- fitQmap(compare_df_m[[paste0(var_name, "_era")]],
+                     trace_calib[[rescaled_col]],   
+                     method = "QUANT", qstep = 0.01, wet.day = FALSE)
+
+trace_calib[[final_col]] <- doQmap(trace_calib[[rescaled_col]], qm_model)
+trace_full[[final_col]]  <- doQmap(trace_full[[rescaled_col]], qm_model)
+
+# then clamp at the physical floor (precip can't be negative, no upper bound)
+sum(trace_full[[final_col]] < 0, na.rm = TRUE)
+trace_full[[final_col]]  <- pmax(trace_full[[final_col]], 0)
+trace_calib[[final_col]] <- pmax(trace_calib[[final_col]], 0)
+
+
+
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, final_col, final_col),
+  c("ERA5 (calib)", "TraCE (calib, final)", "TraCE (full, final)"),
+  var_name, month_val
+)
+```
+# ============================================================
+# STORE precip's results and models before moving to the next month
+# ============================================================
+```{r}
+if (!exists("seasonal_models")) seasonal_models <- list()
+if (!exists("seasonal_results_calib")) seasonal_results_calib <- list()
+if (!exists("seasonal_results_full")) seasonal_results_full <- list()
+
+# Bundle the ramp parameters only if a ramp was actually applied this run;
+# NULL otherwise, so the stored record accurately reflects what happened
+ramp_params <- if (exists("n_distinct_below") && n_distinct_below <= 1 && n_below > 0) {
+  list(
+    floor_val           = floor_val,
+    boundary_out        = boundary_out,
+    natural_gap         = natural_gap,
+    conservative_floor  = conservative_floor,
+    min_corrected_full  = min_corrected_full
+  )
+} else {
+  NULL
+}
+
+seasonal_models[[as.character(var_name)]] <- list(
+  mean_model      = mean_bias_model,
+  var_ratio_model = var_ratio_model,         
+  qm_model        = qm_model, 
+  ramp_params     = NULL
+)
+
+seasonal_results_calib[[as.character(var_name)]] <- trace_calib
+seasonal_results_full[[as.character(var_name)]]  <- trace_full
+
+# Sanity check before moving on - confirms what actually got stored for this variable
+cat("Stored for", var_name, ":\n")
+cat("  mean_model:", class(seasonal_models[[var_name]]$mean_model)[1], "\n")
+cat("  var_ratio_model:", ifelse(is.null(seasonal_models[[var_name]]$var_ratio_model), "NULL", "set"), "\n")
+cat("  qm_model class:", class(seasonal_models[[var_name]]$qm_model)[1], "\n")
+cat("  ramp applied:", !is.null(seasonal_models[[var_name]]$ramp_params), "\n")
+
+```
+
+
+# ========================================================================================================================
+# ==========================================    SURFACE PRESURE          ============================================================
+# ========================================================================================================================
+
+
+# ============================================================
+# DEFINE VARIABLE + MONTH FOR THIS RUN
+# Change these two lines and re-run top to bottom, once per month (6, 7, 8)
+# ============================================================
+```{r}
+var_name  <- "sp"
+month_val <- NULL
+
+era_col   <- var_name
+trace_col <- var_name
+
+# Filter to this var only, right at the source - everything downstream inherits this scope
+era_calib   <- era_seasonal  %>% dplyr::select(lat, lon, year, era_col)
+trace_calib <- trace_seasonal %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+trace_full  <- trace_seasonal_full  %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+
+# Dynamically-named output columns (unchanged across months - the month scoping lives in the data, not the names)
+bias_col      <- paste0(var_name, "_predicted_bias")
+corrected_col <- paste0(var_name, "_corrected")
+var_ratio_col <- paste0(var_name, "_var_ratio_pred")
+cell_mean_col <- paste0(var_name, "_cell_mean")
+rescaled_col  <- paste0(var_name, "_rescaled")
+final_col     <- paste0(var_name, "_final")
+```
+
+
+# ============================================================
+# STEP 1: Compare ERA5 calib / TraCE calib / TraCE full RAW — this month only
+# Does the full paleo record fall outside the calibration TraCE range?
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_compare(
+  list(era_calib, trace_calib, trace_full),
+  c("year", "year", "year"),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = trace_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)")
+)
+
+range(trace_calib[[trace_col]], na.rm = TRUE)
+range(trace_full[[trace_col]], na.rm = TRUE)
+# If trace_full's range is meaningfully wider than trace_calib's -> QM will extrapolate -> flag for Step 7
+```
+# ============================================================
+# STEP 2: Calculate bias for the calibration period — this month only
+# ============================================================
+```{r}
+compare_df_m <- era_calib %>%
+  inner_join(trace_calib, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+  # adjust join columns if your seasonal frames key differently
+
+bias_summary_m <- tibble(
+  variable = var_name, month = month_val,
+  mean_bias = mean(compare_df_m[[paste0(var_name, "_trace")]] -
+                    compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  correlation = cor(compare_df_m[[paste0(var_name, "_trace")]],
+                     compare_df_m[[paste0(var_name, "_era")]], use = "complete.obs"),
+  era_sd = sd(compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  trace_sd = sd(compare_df_m[[paste0(var_name, "_trace")]], na.rm = TRUE)
+)
+bias_summary_m
+
+cellwise_bias_m <- compare_df_m %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    bias = mean(.data[[paste0(var_name, "_trace")]] - .data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    .groups = "drop"
+  )
+cellwise_bias_m
+
+ggplot(cellwise_bias_m, aes(x=lon, y=lat, size=abs(bias), color=bias)) + geom_point()
+
+
+cor(cellwise_bias_m$bias, cellwise_bias_m$lon)
+cor(cellwise_bias_m$bias, cellwise_bias_m$lat)
+cor(cellwise_bias_m$bias, cellwise_bias_m$lon)
+```
+# ============================================================
+# STEP 3: Fit candidate mean-bias models — this month only
+# Fully manual, same as every variable so far — inspect, then assign the winner explicitly
+# ============================================================
+```{r}
+m_elev   <- lm(bias ~ elevation, data = cellwise_bias_m)
+m_lat    <- lm(bias ~ lat, data = cellwise_bias_m)
+m_lon    <- lm(bias ~ lon, data = cellwise_bias_m)
+m_latlon <- lm(bias ~ lat + lon, data = cellwise_bias_m)
+m_full   <- lm(bias ~ elevation + lat + lon, data = cellwise_bias_m)
+m_flat <- lm(bias ~ 1, data = cellwise_bias_m)
+
+summary(m_elev); summary(m_lat); summary(m_lon); summary(m_latlon); summary(m_full); summary(m_flat)
+anova(m_lat, m_latlon)
+anova(m_latlon, m_full)
+anova(m_lat, m_flat)
+AIC(m_elev, m_lat, m_lon, m_latlon, m_full, m_flat)
+
+cellwise_bias_m$resid_check <- residuals(m_latlon)  # swap in whichever you're evaluating
+cor(cellwise_bias_m$resid_check, cellwise_bias_m$elevation)
+
+cor(cellwise_bias_m$bias, cellwise_bias_m$elevation)
+plot(cellwise_bias_m$elevation, cellwise_bias_m$bias)
+```
+Strange that elevation doesnt stant out. Maybe it will for variance ratio. Use flat bias correction. 
+```{r}
+# ---- Set explicitly once you've reviewed the output above ----
+mean_bias_model <- m_flat
+
+trace_calib[[bias_col]] <- predict(mean_bias_model, newdata = trace_calib)
+trace_calib[[corrected_col]] <- trace_calib[[trace_col]] - trace_calib[[bias_col]]
+
+trace_full[[bias_col]] <- predict(mean_bias_model, newdata = trace_full)
+trace_full[[corrected_col]] <- trace_full[[trace_col]] - trace_full[[bias_col]]
+```
+
+# ============================================================
+# STEP 4: Check corrected mean — this month only
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = corrected_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)")
+)
+
+cellwise_variance_m <- compare_df_m %>%
+  mutate(!!corrected_col := .data[[paste0(var_name, "_trace")]] -
+           predict(mean_bias_model, newdata = compare_df_m)) %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    sd_corrected = sd(.data[[corrected_col]], na.rm = TRUE),
+    var_ratio = sd_corrected / sd_era,
+    .groups = "drop"
+  )
+cellwise_variance_m %>% arrange(desc(abs(var_ratio - 1)))
+summary(cellwise_variance_m$var_ratio)
+
+plot(cellwise_variance_m$elevation, cellwise_variance_m$var_ratio)
+```
+# ============================================================
+# STEP 5: Decide if variance needs correcting — this month only
+# ============================================================
+```{r}
+vr_elev   <- lm(var_ratio ~ elevation, data = cellwise_variance_m)
+vr_lat    <- lm(var_ratio ~ lat, data = cellwise_variance_m)
+vr_lon    <- lm(var_ratio ~ lon, data = cellwise_variance_m)
+vr_latlon <- lm(var_ratio ~ lat + lon, data = cellwise_variance_m)
+vr_full   <- lm(var_ratio ~ elevation + lat + lon, data = cellwise_variance_m)
+vr_lonelev   <- lm(var_ratio ~ elevation + lon, data = cellwise_variance_m)
+vr_flat <- lm(var_ratio ~ 1, data = cellwise_variance_m)
+
+summary(vr_elev); summary(vr_lat); summary(vr_lon); summary(vr_latlon); summary(vr_full); summary(vr_flat); summary(vr_lonelev)
+
+anova(vr_lat, vr_latlon)
+anova(vr_full, vr_latlon)
+anova(vr_full, vr_lat)
+anova(vr_flat, vr_latlon)
+
+AIC(vr_elev, vr_lat, vr_lon, vr_latlon, vr_full, vr_flat, vr_lonelev)
+
+```
+
+
+Go with vr_latlon:
+```{r}
+# ---- Set explicitly, or skip Step 5 entirely if var_ratio was already close to 1 ----
+var_ratio_model <- vr_latlon
+
+trace_calib[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_calib)
+trace_calib <- trace_calib %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+
+trace_full[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_full)
+trace_full <- trace_full %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+```
+# ============================================================
+# STEP 6: Check rescaled values — this month only
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, rescaled_col, rescaled_col),
+  c("ERA5 (calib)", "TraCE (calib, rescaled)", "TraCE (full, rescaled)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = rescaled_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, rescaled_col, rescaled_col),
+  c("ERA5 (calib)", "TraCE (calib, rescaled)", "TraCE (full, rescaled)")
+)
+
+
+cellwise_check_m <- trace_calib %>%
+  left_join(
+    era_calib %>% dplyr::select(lat, lon, year, !!paste0(era_col, "_era_ref") := all_of(era_col)),
+    by = c("lat", "lon", "year")
+  ) %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(era_col, "_era_ref")]], na.rm = TRUE),
+    sd_rescaled = sd(.data[[rescaled_col]], na.rm = TRUE),
+    var_ratio_after = sd_rescaled / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_check_m %>% arrange(desc(abs(var_ratio_after - 1)))
+
+range(cellwise_check_m$var_ratio_after)
+
+#variance ratio still doesnt 
+#how does rescaling change varaince ratio?
+summary(cellwise_variance_m$var_ratio) #corrected
+summary(cellwise_check_m$var_ratio_after) #rescaled
+
+summary(era_calib$sp) 
+summary(trace_calib$sp) 
+summary(trace_full$sp) 
+summary(trace_calib$sp_corrected) 
+summary(trace_full$sp_corrected) 
+summary(trace_calib$sp_rescaled)
+summary(trace_full$sp_rescaled)
+
+```
+
+Plot century trend for sp
+```{r}
+plot_century_trend <- function(full_data, var_col,
+                                era_data, era_col,
+                                calib_data, calib_col,
+                                var_label = var_col,
+                                bin_width = 100) {
+  
+  # Bin the full corrected record into century spows
+  df_summary <- full_data %>%
+    dplyr::select(year, all_of(var_col)) %>%
+    mutate(century_bin = floor(year / bin_width) * bin_width) %>%
+    group_by(century_bin) %>%
+    summarise(
+      mean_val = mean(.data[[var_col]], na.rm = TRUE),
+      ci_low   = quantile(.data[[var_col]], 0.025, na.rm = TRUE),
+      ci_high  = quantile(.data[[var_col]], 0.975, na.rm = TRUE),
+      n_obs    = n(),
+      .groups  = "drop"
+    )
+  
+  # ERA5 calibration-period reference mean
+  era5_mean <- era_data %>%
+    group_by(year, lat, lon) %>%
+    summarise(mean_obs = mean(.data[[era_col]], na.rm = TRUE), .groups = "drop") %>%
+    pull(mean_obs) %>%
+    mean(na.rm = TRUE)
+  
+  breaks_seq <- as.character(seq(min(df_summary$century_bin), max(df_summary$century_bin), by = 500))
+  
+  ggplot(df_summary, aes(x = as.factor(century_bin), y = mean_val)) +
+    geom_point(size = 3, alpha = 0.2) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.1, alpha = 0.2) +
+    geom_hline(yintercept = era5_mean, linetype = "dotted", color = "red", linewidth = 0.5) +
+    scale_x_discrete(breaks = breaks_seq) +
+    theme_minimal() +
+    labs(x = paste0("Year (", bin_width, "-yr bin)"), y = var_label, title = "") +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      legend.title = element_blank()
+    )
+}
+
+#plot corrected full trace for all months:
+plot_century_trend(
+  full_data = trace_full, var_col = "sp_corrected",
+  era_data = era_seasonal, era_col = "sp",
+  var_label = "Corrected sp"
+)
+
+#plot corrected full trace for all months:
+plot_century_trend(
+  full_data = trace_full, var_col = "sp_rescaled",
+  era_data = era_seasonal, era_col = "sp",
+  var_label = "Rescaled sp"
+)
+```
+Rescaling produces negative surface pressure values. BUt also, cannot use QM because trace full period values fall outside the calibration range. So, accept final values are just mean bias corrected
+
+```{r}
+trace_calib[[final_col]] <- trace_calib[[rescaled_col]]
+trace_full[[final_col]]  <- trace_full[[rescaled_col]]
+```
+
+# ============================================================
+# STEP 7: Apply QM if Step 1 showed it's viable; otherwise finalize as-is
+# ============================================================
+```{r}
+# # ---- OPTION A: QM viable ----
+# qm_model <- fitQmap(compare_df_m[[paste0(var_name, "_era")]],
+#                      trace_calib[[rescaled_col]],  # or [[corrected_col]] if Step 5 was skipped
+#                      method = "QUANT", qstep = 0.01, wet.day = FALSE)
+# 
+# trace_calib[[final_col]] <- doQmap(trace_calib[[rescaled_col]], qm_model)
+# trace_full[[final_col]]  <- doQmap(trace_full[[rescaled_col]], qm_model)
+# 
+# # ---- OPTION B: QM excluded ----
+# # trace_calib[[final_col]] <- trace_calib[[rescaled_col]]
+# # trace_full[[final_col]]  <- trace_full[[rescaled_col]]
+# 
+# plot_density_compare(
+#   list(era_calib, trace_calib, trace_full),
+#   c(era_col, final_col, final_col),
+#   c("ERA5 (calib)", "TraCE (calib, final)", "TraCE (full, final)"),
+#   var_name, month_val
+# )
+```
+
+# ============================================================
+# STORE sp's results and models before moving to the next month
+# ============================================================
+```{r}
+if (!exists("seasonal_models")) seasonal_models <- list()
+if (!exists("seasonal_results_calib")) seasonal_results_calib <- list()
+if (!exists("seasonal_results_full")) seasonal_results_full <- list()
+
+# Bundle the ramp parameters only if a ramp was actually applied this run;
+# NULL otherwise, so the stored record accurately reflects what happened
+ramp_params <- if (exists("n_distinct_below") && n_distinct_below <= 1 && n_below > 0) {
+  list(
+    floor_val           = floor_val,
+    boundary_out        = boundary_out,
+    natural_gap         = natural_gap,
+    conservative_floor  = conservative_floor,
+    min_corrected_full  = min_corrected_full
+  )
+} else {
+  NULL
+}
+
+seasonal_models[[as.character(var_name)]] <- list(
+  mean_model      = mean_bias_model,
+  var_ratio_model = var_ratio_model,         
+  qm_model        = NULL, 
+  ramp_params     = NULL
+)
+
+seasonal_results_calib[[as.character(var_name)]] <- trace_calib
+seasonal_results_full[[as.character(var_name)]]  <- trace_full
+
+# Sanity check before moving on - confirms what actually got stored for this variable
+cat("Stored for", var_name, ":\n")
+cat("  mean_model:", class(seasonal_models[[var_name]]$mean_model)[1], "\n")
+cat("  var_ratio_model:", ifelse(is.null(seasonal_models[[var_name]]$var_ratio_model), "NULL", "set"), "\n")
+cat("  qm_model class:", class(seasonal_models[[var_name]]$qm_model)[1], "\n")
+cat("  ramp applied:", !is.null(seasonal_models[[var_name]]$ramp_params), "\n")
+
+```
+
+# ========================================================================================================================
+# ==========================================    SHORTWAVE RADIATION          =============================================
+# ========================================================================================================================
+
+
+# ============================================================
+# DEFINE VARIABLE + MONTH FOR THIS RUN
+# Change these two lines and re-run top to bottom, once per month (6, 7, 8)
+# ============================================================
+```{r}
+var_name  <- "swr"
+month_val <- NULL
+
+era_col   <- var_name
+trace_col <- var_name
+
+# Filter to this var only, right at the source - everything downstream inherits this scope
+era_calib   <- era_seasonal  %>% dplyr::select(lat, lon, year, era_col)
+trace_calib <- trace_seasonal %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+trace_full  <- trace_seasonal_full  %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+
+# Dynamically-named output columns (unchanged across months - the month scoping lives in the data, not the names)
+bias_col      <- paste0(var_name, "_predicted_bias")
+corrected_col <- paste0(var_name, "_corrected")
+var_ratio_col <- paste0(var_name, "_var_ratio_pred")
+cell_mean_col <- paste0(var_name, "_cell_mean")
+rescaled_col  <- paste0(var_name, "_rescaled")
+final_col     <- paste0(var_name, "_final")
+```
+
+
+# ============================================================
+# STEP 1: Compare ERA5 calib / TraCE calib / TraCE full RAW — this month only
+# Does the full paleo record fall outside the calibration TraCE range?
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_compare(
+  list(era_calib, trace_calib, trace_full),
+  c("year", "year", "year"),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = trace_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)")
+)
+
+range(trace_calib[[trace_col]], na.rm = TRUE)
+range(trace_full[[trace_col]], na.rm = TRUE)
+# If trace_full's range is meaningfully wider than trace_calib's -> QM will extrapolate -> flag for Step 7
+```
+# ============================================================
+# STEP 2: Calculate bias for the calibration period — this month only
+# ============================================================
+```{r}
+compare_df_m <- era_calib %>%
+  inner_join(trace_calib, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+  # adjust join columns if your seasonal frames key differently
+
+bias_summary_m <- tibble(
+  variable = var_name, month = month_val,
+  mean_bias = mean(compare_df_m[[paste0(var_name, "_trace")]] -
+                    compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  correlation = cor(compare_df_m[[paste0(var_name, "_trace")]],
+                     compare_df_m[[paste0(var_name, "_era")]], use = "complete.obs"),
+  era_sd = sd(compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  trace_sd = sd(compare_df_m[[paste0(var_name, "_trace")]], na.rm = TRUE)
+)
+bias_summary_m
+
+cellwise_bias_m <- compare_df_m %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    bias = mean(.data[[paste0(var_name, "_trace")]] - .data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    .groups = "drop"
+  )
+cellwise_bias_m
+
+ggplot(cellwise_bias_m, aes(x=lon, y=lat, size=abs(bias), color=bias)) + geom_point()
+
+cor(cellwise_bias_m$bias, cellwise_bias_m$lon)
+cor(cellwise_bias_m$bias, cellwise_bias_m$lat)
+cor(cellwise_bias_m$bias, cellwise_bias_m$lon)
+```
+# ============================================================
+# STEP 3: Fit candidate mean-bias models — this month only
+# Fully manual, same as every variable so far — inspect, then assign the winner explicitly
+# ============================================================
+```{r}
+m_elev   <- lm(bias ~ elevation, data = cellwise_bias_m)
+m_lat    <- lm(bias ~ lat, data = cellwise_bias_m)
+m_lon    <- lm(bias ~ lon, data = cellwise_bias_m)
+m_latlon <- lm(bias ~ lat + lon, data = cellwise_bias_m)
+m_full   <- lm(bias ~ elevation + lat + lon, data = cellwise_bias_m)
+m_flat <- lm(bias ~ 1, data = cellwise_bias_m) 
+
+summary(m_elev); summary(m_lat); summary(m_lon); summary(m_latlon); summary(m_full); summary(m_flat)
+
+anova(m_lat, m_latlon)
+anova(m_latlon, m_full)
+anova(m_latlon, m_flat)
+
+AIC(m_elev, m_lat, m_lon, m_latlon, m_full, m_flat)
+
+cellwise_bias_m$resid_check <- residuals(m_lat)  # swap in whichever you're evaluating
+cor(cellwise_bias_m$resid_check, cellwise_bias_m$elevation)
+```
+
+Go with lat + lon.
+```{r}
+# ---- Set explicitly once you've reviewed the output above ----
+mean_bias_model <- m_latlon
+
+trace_calib[[bias_col]] <- predict(mean_bias_model, newdata = trace_calib)
+trace_calib[[corrected_col]] <- trace_calib[[trace_col]] - trace_calib[[bias_col]]
+
+trace_full[[bias_col]] <- predict(mean_bias_model, newdata = trace_full)
+trace_full[[corrected_col]] <- trace_full[[trace_col]] - trace_full[[bias_col]]
+```
+# ============================================================
+# STEP 4: Check corrected mean — this month only
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = corrected_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)")
+)
+
+cellwise_variance_m <- compare_df_m %>%
+  mutate(!!corrected_col := .data[[paste0(var_name, "_trace")]] -
+           predict(mean_bias_model, newdata = compare_df_m)) %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    sd_corrected = sd(.data[[corrected_col]], na.rm = TRUE),
+    var_ratio = sd_corrected / sd_era,
+    .groups = "drop"
+  )
+cellwise_variance_m %>% arrange(desc(abs(var_ratio - 1)))
+summary(cellwise_variance_m$var_ratio)
+```
+# ============================================================
+# STEP 5: Decide if variance needs correcting — this month only
+# ============================================================
+```{r}
+vr_elev   <- lm(var_ratio ~ elevation, data = cellwise_variance_m)
+vr_lat    <- lm(var_ratio ~ lat, data = cellwise_variance_m)
+vr_lon    <- lm(var_ratio ~ lon, data = cellwise_variance_m)
+vr_latlon <- lm(var_ratio ~ lat + lon, data = cellwise_variance_m)
+vr_full   <- lm(var_ratio ~ elevation + lat + lon, data = cellwise_variance_m)
+vr_flat <- lm(var_ratio ~ 1, data = cellwise_variance_m) 
+
+summary(vr_elev); summary(vr_lat); summary(vr_lon); summary(vr_latlon); summary(vr_full); summary(vr_flat)
+anova(vr_lat, vr_latlon)
+anova(vr_flat, vr_latlon)
+anova(vr_lat, vr_full)
+
+AIC(vr_elev, vr_lat, vr_lon, vr_latlon, vr_full, vr_flat)
+```
+
+```{r}
+# ---- Set explicitly, or skip Step 5 entirely if var_ratio was already close to 1 ----
+var_ratio_model <- vr_latlon
+
+trace_calib[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_calib)
+trace_calib <- trace_calib %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+
+trace_full[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_full)
+trace_full <- trace_full %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+```
+# ============================================================
+# STEP 6: Check rescaled values — this month only
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, rescaled_col, rescaled_col),
+  c("ERA5 (calib)", "TraCE (calib, rescaled)", "TraCE (full, rescaled)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = rescaled_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, rescaled_col, rescaled_col),
+  c("ERA5 (calib)", "TraCE (calib, rescaled)", "TraCE (full, rescaled)")
+)
+
+
+cellwise_check_m <- trace_calib %>%
+  left_join(
+    era_calib %>% dplyr::select(lat, lon, year, !!paste0(era_col, "_era_ref") := all_of(era_col)),
+    by = c("lat", "lon", "year")
+  ) %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(era_col, "_era_ref")]], na.rm = TRUE),
+    sd_rescaled = sd(.data[[rescaled_col]], na.rm = TRUE),
+    var_ratio_after = sd_rescaled / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_check_m %>% arrange(desc(abs(var_ratio_after - 1)))
+
+range(cellwise_check_m$var_ratio_after)
+```
+
+Plot century trend for June
+```{r}
+plot_century_trend <- function(full_data, var_col,
+                                era_data, era_col,
+                                calib_data, calib_col,
+                                var_label = var_col,
+                                bin_width = 100) {
+  
+  # Bin the full corrected record into century windows
+  df_summary <- full_data %>%
+    dplyr::select(year, all_of(var_col)) %>%
+    mutate(century_bin = floor(year / bin_width) * bin_width) %>%
+    group_by(century_bin) %>%
+    summarise(
+      mean_val = mean(.data[[var_col]], na.rm = TRUE),
+      ci_low   = quantile(.data[[var_col]], 0.025, na.rm = TRUE),
+      ci_high  = quantile(.data[[var_col]], 0.975, na.rm = TRUE),
+      n_obs    = n(),
+      .groups  = "drop"
+    )
+  
+  # ERA5 calibration-period reference mean
+  era5_mean <- era_data %>%
+    group_by(year, lat, lon) %>%
+    summarise(mean_obs = mean(.data[[era_col]], na.rm = TRUE), .groups = "drop") %>%
+    pull(mean_obs) %>%
+    mean(na.rm = TRUE)
+  
+  breaks_seq <- as.character(seq(min(df_summary$century_bin), max(df_summary$century_bin), by = 500))
+  
+  ggplot(df_summary, aes(x = as.factor(century_bin), y = mean_val)) +
+    geom_point(size = 3, alpha = 0.2) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.1, alpha = 0.2) +
+    geom_hline(yintercept = era5_mean, linetype = "dotted", color = "red", linewidth = 0.5) +
+    scale_x_discrete(breaks = breaks_seq) +
+    theme_minimal() +
+    labs(x = paste0("Year (", bin_width, "-yr bin)"), y = var_label, title = "") +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      legend.title = element_blank()
+    )
+}
+
+#plot corrected full trace for all months:
+plot_century_trend(
+  full_data = trace_full, var_col = "swr_rescaled",
+  era_data = era_seasonal, era_col = "swr",
+  var_label = "Corrected swr"
+)
+```
+Accept rescaled values as final correction.
+```{r}
+# trace_calib[[final_col]] <- trace_calib[[rescaled_col]]
+# trace_full[[final_col]]  <- trace_full[[rescaled_col]]
+```
+
+# ============================================================
+# STEP 7: Apply QM if Step 1 showed it's viable; otherwise finalize as-is
+# ============================================================
+```{r}
+# ── Fit QM on corrected_col (calibration period only) ────────────────────────
+qm_model_rquant <- fitQmap(
+  compare_df_m[[paste0(var_name, "_era")]],
+  trace_calib[[corrected_col]],
+  method = "RQUANT",
+  qstep = 0.01,
+  wet.day = FALSE
+)
+
+# ── Apply QM to BOTH trace_calib and trace_full ───────────────────────────────
+trace_calib[[final_col]] <- doQmap(trace_calib[[corrected_col]], qm_model_rquant, slope = TRUE)
+trace_full[[final_col]]  <- doQmap(trace_full[[corrected_col]],  qm_model_rquant, slope = TRUE)
+
+# ── Replace the flattened LOW tail with a linear ramp between the QM boundary
+# and a conservative floor (natural raw calib-vs-full gap) ───────────────────
+
+floor_val    <- min(trace_calib[[corrected_col]], na.rm = TRUE)
+boundary_out <- doQmap(floor_val, qm_model_rquant, slope = TRUE)
+
+natural_gap <- min(trace_calib[[trace_col]], na.rm = TRUE) - min(trace_full[[trace_col]], na.rm = TRUE)
+conservative_floor <- boundary_out - natural_gap
+
+min_corrected_full <- min(trace_full[[corrected_col]], na.rm = TRUE)
+
+cat("QM input floor:", floor_val, "  QM output at floor:", boundary_out, "\n")
+cat("Natural raw calib-vs-full gap:", natural_gap, "\n")
+cat("Conservative output floor:", conservative_floor, "\n")
+cat("Most extreme trace_full corrected input:", min_corrected_full, "\n")
+
+trace_full <- trace_full %>%
+  mutate(
+    !!final_col := ifelse(
+      .data[[corrected_col]] < floor_val,
+      boundary_out + (.data[[corrected_col]] - floor_val) *
+        (conservative_floor - boundary_out) / (min_corrected_full - floor_val),
+      .data[[final_col]]
+    )
+  )
+
+n_ramped <- sum(trace_full[[corrected_col]] < floor_val, na.rm = TRUE)
+cat("Rows replaced with ramped extrapolation:", n_ramped,
+    sprintf("(%.3f%%)\n", 100 * n_ramped / nrow(trace_full)))
+
+# ── Physical floor: swr cannot be negative ────────────────────────────────────
+n_negative <- sum(trace_full[[final_col]] < 0, na.rm = TRUE)
+cat("Rows below 0 after ramping:", n_negative, "\n")
+trace_full[[final_col]]  <- pmax(trace_full[[final_col]], 0)
+trace_calib[[final_col]] <- pmax(trace_calib[[final_col]], 0)
+
+# ── Verify: should show real variation, not one repeated value ───────────────
+summary(trace_full[[final_col]])
+n_distinct(trace_full %>% filter(.data[[corrected_col]] < floor_val) %>% pull(!!final_col))
+
+# ---- OPTION B: QM excluded ----
+# trace_calib[[final_col]] <- trace_calib[[rescaled_col]]
+# trace_full[[final_col]]  <- trace_full[[rescaled_col]]
+
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, final_col, final_col),
+  c("ERA5 (calib)", "TraCE (calib, final)", "TraCE (full, final)"),
+  var_name, month_val
+)
+
+#scatter of corrected_col vs. final_col for the ramped rows only to confirm the ramp looks like a smooth line rather than something distorted:
+trace_full %>%
+  filter(.data[[corrected_col]] < floor_val) %>%
+  ggplot(aes(x = .data[[corrected_col]], y = .data[[final_col]])) +
+  geom_point(alpha = 0.1) +
+  theme_minimal() +
+  labs(title = "Ramped low-tail extrapolation for swr")
+```
+
+Where and when is ramping applied? mostly in the north and west. begins ~1000 bce, going from 0% and gradually increasing to up to 50% pre -10000 bcs.
+Ramping is applied when the paleo period trace values fall outside the calibration period range. an increasing fraction of paleo SWR values (0% in recent centuries, rising to ~25% by the mid-Holocene and ~50% pre-Holocene) fell outside the ERA5 calibration range and required linear tail extrapolation
+```{r}
+# ── Flag ramped rows explicitly, so we can inspect them without re-deriving
+# the condition each time ─────────────────────────────────────────────────────
+
+ramped_flag <- trace_full[[corrected_col]] < floor_val
+
+# ── When in time does ramping occur? ──────────────────────────────────────────
+
+ramping_by_century <- trace_full %>%
+  filter(ramped_flag) %>%
+  mutate(century_bin = floor(year / 100) * 100) %>%
+  count(century_bin, sort = TRUE)
+
+print(ramping_by_century, n = 30)
+
+# Quick visual: ramped-row counts across the record
+ggplot(ramping_by_century, aes(x = century_bin, y = n)) +
+  geom_col() +
+  labs(title = "Ramped (low-tail extrapolated) swr rows by century",
+       x = "Year (century bin)", y = "Count") +
+  theme_minimal()
+
+# ── Where in space does ramping occur? ────────────────────────────────────────
+
+ramping_by_cell <- trace_full %>%
+  filter(ramped_flag) %>%
+  count(lat, lon, sort = TRUE) %>%
+  mutate(pct_of_ramped = round(100 * n / sum(n), 1))
+
+print(ramping_by_cell, n = Inf)
+
+ggplot(ramping_by_cell, aes(x = lon, y = lat, color = pct_of_ramped, size = n)) +
+  geom_point() +
+  scale_color_viridis_c() +
+  labs(title = "Spatial distribution of ramped swr rows") +
+  theme_minimal()
+
+# ── Cross-tab: which gridcells are ramped in which centuries? ────────────────
+# (distinguishes "one cell ramped constantly" from "many cells ramped during
+# one event" — same diagnostic pattern used for the RH extrapolation earlier)
+
+ramped_cell_by_century <- trace_full %>%
+  filter(ramped_flag) %>%
+  mutate(century_bin = floor(year / 100) * 100) %>%
+  count(lat, lon, century_bin) %>%
+  tidyr::pivot_wider(names_from = century_bin, values_from = n, values_fill = 0)
+
+ramped_cell_by_century
+
+# ── Overall rate: is ramping roughly constant across the record, or does it
+# concentrate in specific periods? ────────────────────────────────────────────
+
+trace_full %>%
+  mutate(century_bin = floor(year / 100) * 100) %>%
+  group_by(century_bin) %>%
+  summarise(
+    pct_ramped_this_century = mean(.data[[corrected_col]] < floor_val, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = century_bin, y = pct_ramped_this_century)) +
+  geom_line() +
+  labs(title = "Fraction of gridcell-years ramped, by century",
+       x = "Year (century bin)", y = "Fraction ramped") +
+  theme_minimal()
+```
+Check whether the corrected-to-final relationship is well-approximated by a line over the affected range, since if it roughly is, the ramp isn't as crude as it might seem:
+```{r}
+trace_calib %>%
+  ggplot(aes(x = .data[[corrected_col]], y = .data[[final_col]])) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "loess", color = "blue") +
+  geom_smooth(method = "lm", color = "red", linetype = "dashed") +
+  theme_minimal()
+```
+The loess and linear fits track closely near the low end, the ramp is a fine approximation
+loess fits a smooth, non-parametric curve through the actual (swr_corrected, swr_final) scatter by locally averaging nearby points, with no assumption that the relationship must be a straight line. So wherever the blue loess curve visibly departs from the red line, that's telling you "the real relationship curves away from linear right here" — and wherever they overlap, a straight line is a good local approximation.
+
+# ============================================================
+# STORE swr's results and models before moving to the next month
+# ============================================================
+```{r}
+if (!exists("seasonal_models")) seasonal_models <- list()
+if (!exists("seasonal_results_calib")) seasonal_results_calib <- list()
+if (!exists("seasonal_results_full")) seasonal_results_full <- list()
+
+# Bundle the ramp parameters only if a ramp was actually applied this run;
+# NULL otherwise, so the stored record accurately reflects what happened
+ramp_params <- if (exists("n_distinct_below") && n_distinct_below <= 1 && n_below > 0) {
+  list(
+    floor_val           = floor_val,
+    boundary_out        = boundary_out,
+    natural_gap         = natural_gap,
+    conservative_floor  = conservative_floor,
+    min_corrected_full  = min_corrected_full
+  )
+} else {
+  NULL
+}
+
+seasonal_models[[as.character(var_name)]] <- list(
+  mean_model      = mean_bias_model,
+  var_ratio_model = NULL,         
+  qm_model        = NULL, 
+  ramp_params     = ramp_params
+)
+
+seasonal_results_calib[[as.character(var_name)]] <- trace_calib
+seasonal_results_full[[as.character(var_name)]]  <- trace_full
+
+# Sanity check before moving on - confirms what actually got stored for this variable
+cat("Stored for", var_name, ":\n")
+cat("  mean_model:", class(seasonal_models[[var_name]]$mean_model)[1], "\n")
+cat("  var_ratio_model:", ifelse(is.null(seasonal_models[[var_name]]$var_ratio_model), "NULL", "set"), "\n")
+cat("  qm_model class:", class(seasonal_models[[var_name]]$qm_model)[1], "\n")
+cat("  ramp applied:", !is.null(seasonal_models[[var_name]]$ramp_params), "\n")
+```
+
+
+
+# ========================================================================================================================
+# ==========================================    RELATIVE HUMIDITY          ===============================================
+# ========================================================================================================================
+
+
+# ============================================================
+# DEFINE VARIABLE + MONTH FOR THIS RUN
+# Change these two lines and re-run top to bottom, once per month (6, 7, 8)
+# ============================================================
+```{r}
+var_name  <- "rh"
+month_val <- NULL
+
+era_col   <- var_name
+trace_col <- var_name
+
+# Filter to this var only, right at the source - everything downstream inherits this scope
+era_calib   <- era_seasonal  %>% dplyr::select(lat, lon, year, era_col)
+trace_calib <- trace_seasonal %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+trace_full  <- trace_seasonal_full  %>% dplyr::select(lat, lon, ce_year, year, elevation, trace_col)
+
+# Dynamically-named output columns (unchanged across months - the month scoping lives in the data, not the names)
+bias_col      <- paste0(var_name, "_predicted_bias")
+corrected_col <- paste0(var_name, "_corrected")
+var_ratio_col <- paste0(var_name, "_var_ratio_pred")
+cell_mean_col <- paste0(var_name, "_cell_mean")
+rescaled_col  <- paste0(var_name, "_rescaled")
+final_col     <- paste0(var_name, "_final")
+```
+
+
+# ============================================================
+# STEP 1: Compare ERA5 calib / TraCE calib / TraCE full RAW — this month only
+# Does the full paleo record fall outside the calibration TraCE range?
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_compare(
+  list(era_calib, trace_calib, trace_full),
+  c("year", "year", "year"),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = trace_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, trace_col, trace_col),
+  c("ERA5 (calib)", "TraCE (calib)", "TraCE (full, raw)")
+)
+range(era_calib[[era_col]], na.rm = TRUE)
+range(trace_calib[[trace_col]], na.rm = TRUE)
+range(trace_full[[trace_col]], na.rm = TRUE)
+# If trace_full's range is meaningfully wider than trace_calib's -> QM will extrapolate -> flag for Step 7
+```
+# ============================================================
+# STEP 2: Calculate bias for the calibration period — this month only
+# ============================================================
+```{r}
+compare_df_m <- era_calib %>%
+  inner_join(trace_calib, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+  # adjust join columns if your seasonal frames key differently
+
+bias_summary_m <- tibble(
+  variable = var_name, month = month_val,
+  mean_bias = mean(compare_df_m[[paste0(var_name, "_trace")]] -
+                    compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  correlation = cor(compare_df_m[[paste0(var_name, "_trace")]],
+                     compare_df_m[[paste0(var_name, "_era")]], use = "complete.obs"),
+  era_sd = sd(compare_df_m[[paste0(var_name, "_era")]], na.rm = TRUE),
+  trace_sd = sd(compare_df_m[[paste0(var_name, "_trace")]], na.rm = TRUE)
+)
+bias_summary_m
+
+cellwise_bias_m <- compare_df_m %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    bias = mean(.data[[paste0(var_name, "_trace")]] - .data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    .groups = "drop"
+  )
+cellwise_bias_m
+
+ggplot(cellwise_bias_m, aes(x=lon, y=lat, size = abs(bias), color=bias)) + geom_point()
+
+cor(cellwise_bias_m$bias, cellwise_bias_m$lon)
+cor(cellwise_bias_m$bias, cellwise_bias_m$lat)
+cor(cellwise_bias_m$bias, cellwise_bias_m$elevation)
+```
+# ============================================================
+# STEP 3: Fit candidate mean-bias models — this month only
+# Fully manual, same as every variable so far — inspect, then assign the winner explicitly
+# ============================================================
+```{r}
+m_elev   <- lm(bias ~ elevation, data = cellwise_bias_m)
+m_lat    <- lm(bias ~ lat, data = cellwise_bias_m)
+m_lon    <- lm(bias ~ lon, data = cellwise_bias_m)
+m_latlon <- lm(bias ~ lat + lon, data = cellwise_bias_m)
+m_full   <- lm(bias ~ elevation + lat + lon, data = cellwise_bias_m)
+m_flat <- lm(bias ~ 1, data = cellwise_bias_m)
+
+summary(m_elev); summary(m_lat); summary(m_lon); summary(m_latlon); summary(m_full); summary(m_flat)
+anova(m_lat, m_latlon)
+anova(m_latlon, m_full)
+anova(m_flat, m_full)
+anova(m_lon, m_full)
+AIC(m_elev, m_lat, m_lon, m_latlon, m_full, m_flat)
+
+```
+
+relative humidity's bias/spread in this dataset genuinely isn't strongly spatially structured, at least not across only 23 cells and 44 years. forcing a spatial prediction would be wrong. 
+```{r}
+# ---- Set explicitly once you've reviewed the output above ----
+mean_bias_model <- m_full
+
+trace_calib[[bias_col]] <- predict(mean_bias_model, newdata = trace_calib)
+trace_calib[[corrected_col]] <- trace_calib[[trace_col]] - trace_calib[[bias_col]]
+
+trace_full[[bias_col]] <- predict(mean_bias_model, newdata = trace_full)
+trace_full[[corrected_col]] <- trace_full[[trace_col]] - trace_full[[bias_col]]
+```
+# ============================================================
+# STEP 4: Check corrected mean — this month only
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = corrected_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, corrected_col, corrected_col),
+  c("ERA5 (calib)", "TraCE (calib, corrected)", "TraCE (full, corrected)")
+)
+
+cellwise_variance_m <- compare_df_m %>%
+  mutate(!!corrected_col := .data[[paste0(var_name, "_trace")]] -
+           predict(mean_bias_model, newdata = compare_df_m)) %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(var_name, "_era")]], na.rm = TRUE),
+    sd_corrected = sd(.data[[corrected_col]], na.rm = TRUE),
+    var_ratio = sd_corrected / sd_era,
+    .groups = "drop"
+  )
+cellwise_variance_m %>% arrange(desc(abs(var_ratio - 1)))
+summary(cellwise_variance_m$var_ratio)
+
+ggplot(cellwise_variance_m, aes(x=lon, y=lat, color=var_ratio)) + geom_point()
+```
+# ============================================================
+# STEP 5: Decide if variance needs correcting — this month only
+# ============================================================
+```{r}
+vr_elev   <- lm(var_ratio ~ elevation, data = cellwise_variance_m)
+vr_lat    <- lm(var_ratio ~ lat, data = cellwise_variance_m)
+vr_lon    <- lm(var_ratio ~ lon, data = cellwise_variance_m)
+vr_latlon <- lm(var_ratio ~ lat + lon, data = cellwise_variance_m)
+vr_full   <- lm(var_ratio ~ elevation + lat + lon, data = cellwise_variance_m)
+vr_elevlat   <- lm(var_ratio ~ elevation + lat, data = cellwise_variance_m)
+vr_flat <- lm(var_ratio ~ 1, data = cellwise_variance_m)
+
+summary(vr_elev); summary(vr_lat); summary(vr_lon); summary(vr_latlon); summary(vr_full); summary(vr_flat); summary(vr_elevlat)
+anova(vr_lat, vr_latlon)
+anova(vr_full, vr_elevlat)
+
+AIC(vr_elev, vr_lat, vr_lon, vr_latlon, vr_full, vr_flat, vr_elevlat)
+
+```
+
+elevation + lat is best. 
+
+Go with vr_elevlat
+```{r}
+# ---- Set explicitly, or skip Step 5 entirely if var_ratio was already close to 1 ----
+var_ratio_model <- vr_full
+
+trace_calib[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_calib)
+trace_calib <- trace_calib %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+
+trace_full[[var_ratio_col]] <- predict(var_ratio_model, newdata = trace_full)
+trace_full <- trace_full %>%
+  group_by(lat, lon) %>%
+  mutate(
+    !!cell_mean_col := mean(.data[[corrected_col]], na.rm = TRUE),
+    !!rescaled_col := .data[[cell_mean_col]] +
+      (.data[[corrected_col]] - .data[[cell_mean_col]]) / .data[[var_ratio_col]]
+  ) %>%
+  ungroup()
+```
+# ============================================================
+# STEP 6: Check rescaled values — this month only
+# ============================================================
+```{r}
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, rescaled_col, rescaled_col),
+  c("ERA5 (calib)", "TraCE (calib, rescaled)", "TraCE (full, rescaled)"),
+  var_name, month_val
+)
+
+plot_timeseries_calib(
+  era_df = era_calib, era_year_col = "year", era_value_col = era_col,
+  trace_df = trace_calib, trace_year_col = "year", trace_value_col = rescaled_col,
+  var_label = var_name, month_label = month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, rescaled_col, rescaled_col),
+  c("ERA5 (calib)", "TraCE (calib, rescaled)", "TraCE (full, rescaled)")
+)
+
+
+cellwise_check_m <- trace_calib %>%
+  left_join(
+    era_calib %>% dplyr::select(lat, lon, year, !!paste0(era_col, "_era_ref") := all_of(era_col)),
+    by = c("lat", "lon", "year")
+  ) %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(.data[[paste0(era_col, "_era_ref")]], na.rm = TRUE),
+    sd_rescaled = sd(.data[[rescaled_col]], na.rm = TRUE),
+    var_ratio_after = sd_rescaled / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_check_m %>% arrange(desc(abs(var_ratio_after - 1)))
+
+range(cellwise_check_m$var_ratio_after)
+
+#variance ratio still doesnt 
+#how does rescaling change varaince ratio?
+summary(cellwise_variance_m$var_ratio) #corrected
+summary(cellwise_check_m$var_ratio_after) #rescaled
+
+summary(era_calib$rh) 
+summary(trace_calib$rh_rescaled)
+summary(trace_full$rh_rescaled)
+
+
+```
+
+Plot century trend for June
+```{r}
+plot_century_trend <- function(full_data, var_col,
+                                era_data, era_col,
+                                calib_data, calib_col,
+                                var_label = var_col,
+                                bin_width = 100) {
+  
+  # Bin the full corrected record into century rhows
+  df_summary <- full_data %>%
+    dplyr::select(year, all_of(var_col)) %>%
+    mutate(century_bin = floor(year / bin_width) * bin_width) %>%
+    group_by(century_bin) %>%
+    summarise(
+      mean_val = mean(.data[[var_col]], na.rm = TRUE),
+      ci_low   = quantile(.data[[var_col]], 0.025, na.rm = TRUE),
+      ci_high  = quantile(.data[[var_col]], 0.975, na.rm = TRUE),
+      n_obs    = n(),
+      .groups  = "drop"
+    )
+  
+  # ERA5 calibration-period reference mean
+  era5_mean <- era_data %>%
+    group_by(year, lat, lon) %>%
+    summarise(mean_obs = mean(.data[[era_col]], na.rm = TRUE), .groups = "drop") %>%
+    pull(mean_obs) %>%
+    mean(na.rm = TRUE)
+  
+  breaks_seq <- as.character(seq(min(df_summary$century_bin), max(df_summary$century_bin), by = 500))
+  
+  ggplot(df_summary, aes(x = as.factor(century_bin), y = mean_val)) +
+    geom_point(size = 3, alpha = 0.2) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.1, alpha = 0.2) +
+    geom_hline(yintercept = era5_mean, linetype = "dotted", color = "red", linewidth = 0.5) +
+    scale_x_discrete(breaks = breaks_seq) +
+    theme_minimal() +
+    labs(x = paste0("Year (", bin_width, "-yr bin)"), y = var_label, title = "") +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+      legend.title = element_blank()
+    )
+}
+
+#plot corrected full trace for all months:
+plot_century_trend(
+  full_data = trace_full, var_col = "rh_rescaled",
+  era_data = era_seasonal, era_col = "rh",
+  var_label = "Rescaled relative humidity"
+)
+
+plot_century_trend(
+  full_data = trace_full, var_col = "rh_corrected",
+  era_data = era_seasonal, era_col = "rh",
+  var_label = "Corrected relative humidity"
+)
+```
+ 
+```{r}
+# trace_calib[[final_col]] <- trace_calib[[rescaled_col]]
+# trace_full[[final_col]]  <- trace_full[[rescaled_col]]
+```
+
+# ============================================================
+# STEP 7: Apply QM if Step 1 showed it's viable; otherwise finalize as-is
+# ============================================================
+
+Rescaleing produces negative values and values above 100% humidity. Neither makes sense. Apply QM to corrected values only:
+```{r}
+# ---- OPTION A: QM viable ----
+qm_model_rquant <- fitQmap(
+  compare_df_m[[paste0(var_name, "_era")]],
+  trace_calib[[corrected_col]],
+  method = "RQUANT",
+  qstep = 0.01,
+  wet.day = FALSE
+)
+trace_calib[[final_col]] <- doQmap(trace_calib[[corrected_col]], qm_model_rquant, slope = TRUE)
+trace_full[[final_col]]  <- doQmap(trace_full[[corrected_col]],  qm_model_rquant, slope = TRUE)
+
+# ── Check whether the low tail is flattened (values below trace_calib's
+# fitted range collapsing to a single output) ─────────────────────────────────
+floor_val <- min(trace_calib[[corrected_col]], na.rm = TRUE)
+
+n_below <- sum(trace_full[[corrected_col]] < floor_val, na.rm = TRUE)
+n_distinct_below <- n_distinct(trace_full %>% filter(.data[[corrected_col]] < floor_val) %>% pull(!!final_col))
+
+cat("Rows below calib range:", n_below, sprintf("(%.3f%%)\n", 100 * n_below / nrow(trace_full)))
+cat("Distinct final values among those rows:", n_distinct_below,
+    "(1 = flattened, needs ramp)\n")
+
+# ── If flattened: apply ramp using RH's raw calib-vs-full min gap as the
+# conservative floor anchor ───────────────────────────────────────────────────
+if (n_distinct_below <= 1 && n_below > 0) {
+
+  boundary_out <- doQmap(floor_val, qm_model_rquant, slope = TRUE)
+  natural_gap  <- min(trace_calib[[trace_col]], na.rm = TRUE) - min(trace_full[[trace_col]], na.rm = TRUE)
+  conservative_floor <- boundary_out - natural_gap
+  min_corrected_full <- min(trace_full[[corrected_col]], na.rm = TRUE)
+
+  cat("Ramp: boundary_out =", boundary_out,
+      " natural_gap =", natural_gap,
+      " conservative_floor =", conservative_floor, "\n")
+
+  trace_full <- trace_full %>%
+    mutate(
+      !!final_col := ifelse(
+        .data[[corrected_col]] < floor_val,
+        boundary_out + (.data[[corrected_col]] - floor_val) *
+          (conservative_floor - boundary_out) / (min_corrected_full - floor_val),
+        .data[[final_col]]
+      )
+    )
+
+  cat("Rows ramped:", n_below, sprintf("(%.3f%%)\n", 100 * n_below / nrow(trace_full)))
+} else {
+  cat("No ramp applied - low tail was not flattened, or no rows fell below calib range.\n")
+}
+
+# ── Physical clamp: RH must be between 0 and 100% ─────────────────────────────
+n_below_0   <- sum(trace_full[[final_col]] < 0,   na.rm = TRUE)
+n_above_100 <- sum(trace_full[[final_col]] > 100, na.rm = TRUE)
+cat("Clamped to 0:", n_below_0, "  Clamped to 100:", n_above_100, "\n")
+
+trace_full[[final_col]]  <- pmin(pmax(trace_full[[final_col]],  0), 100)
+trace_calib[[final_col]] <- pmin(pmax(trace_calib[[final_col]], 0), 100)
+
+# ── Verify final result ───────────────────────────────────────────────────────
+summary(trace_calib[[final_col]])
+summary(trace_full[[final_col]])
+```
+
+view:
+```{r}
+# Final density/quantile comparison, same as every other variable's Step 7 close-out
+plot_density_compare(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, final_col, final_col),
+  c("ERA5 (calib)", "TraCE (calib, final)", "TraCE (full, final)"),
+  var_name, month_val
+)
+
+quantile_compare_table(
+  list(era_calib, trace_calib, trace_full),
+  c(era_col, final_col, final_col),
+  c("ERA5 (calib)", "TraCE (calib, final)", "TraCE (full, final)")
+)
+
+#plot corrected full trace for all months:
+plot_century_trend(
+  full_data = trace_full, var_col = "rh_final",
+  era_data = era_seasonal, era_col = "rh",
+  var_label = "Corrected relative humidity"
+)
+
+summary(era_calib$rh)
+summary(trace_calib$rh)
+summary(trace_calib$rh_corrected)
+summary(trace_calib$rh_final)
+summary(trace_full$rh)
+summary(trace_full$rh_corrected)
+summary(trace_full$rh_final)
+```
+
+
+# ============================================================
+# STORE rh's results and models before moving to the next month
+# ============================================================
+```{r}
+if (!exists("seasonal_models")) seasonal_models <- list()
+if (!exists("seasonal_results_calib")) seasonal_results_calib <- list()
+if (!exists("seasonal_results_full")) seasonal_results_full <- list()
+
+# Bundle the ramp parameters only if a ramp was actually applied this run;
+# NULL otherwise, so the stored record accurately reflects what happened
+ramp_params <- if (exists("n_distinct_below") && n_distinct_below <= 1 && n_below > 0) {
+  list(
+    floor_val           = floor_val,
+    boundary_out        = boundary_out,
+    natural_gap         = natural_gap,
+    conservative_floor  = conservative_floor,
+    min_corrected_full  = min_corrected_full
+  )
+} else {
+  NULL
+}
+
+seasonal_models[[as.character(var_name)]] <- list(
+  mean_model      = mean_bias_model,
+  var_ratio_model = NULL,         
+  qm_model        = NULL, 
+  ramp_params     = ramp_params
+)
+
+seasonal_results_calib[[as.character(var_name)]] <- trace_calib
+seasonal_results_full[[as.character(var_name)]]  <- trace_full
+
+# Sanity check before moving on - confirms what actually got stored for this variable
+cat("Stored for", var_name, ":\n")
+cat("  mean_model:", class(seasonal_models[[var_name]]$mean_model)[1], "\n")
+cat("  var_ratio_model:", ifelse(is.null(seasonal_models[[var_name]]$var_ratio_model), "NULL", "set"), "\n")
+cat("  qm_model class:", class(seasonal_models[[var_name]]$qm_model)[1], "\n")
+cat("  ramp applied:", !is.null(seasonal_models[[var_name]]$ramp_params), "\n")
+
+```
+
+#combine into one dataframe
+```{r}
+id_cols <- c("lat", "lon", "ce_year", "year", "elevation")
+
+trace_calib_all_vars <- reduce(
+  seasonal_results_calib,
+  left_join,
+  by = id_cols
+)
+
+trace_full_all_vars <- reduce(
+  seasonal_results_full,
+  left_join,
+  by = id_cols
+)
+
+nrow(trace_full_all_vars)   # should now be ONE row per gridcell-year, not (n_vars x gridcell-years)
+head(trace_full_all_vars)
+```
+
+
+```{r}
+# ============================================================
+# Combine and save all models
+# ============================================================
+
+# Read existing seasonal model store if it exists, so saving precip doesn't wipe out
+# any other variable you may have already finished
+seasonal_models_path <- file.path(rds_root, "lightning_seasonal_bias_correction_models.rds")
+
+if (file.exists(seasonal_models_path)) {
+  seasonal_bias_correction_models <- readRDS(seasonal_models_path)
+} else {
+  seasonal_bias_correction_models <- list()
+}
+
+seasonal_bias_correction_models[[var_name]] <- seasonal_models  
+
+saveRDS(seasonal_bias_correction_models, seasonal_models_path)
+
+# Confirm structure
+names(seasonal_bias_correction_models)           
+names(seasonal_bias_correction_models[[var_name]])   
+```
+
+Save only corrected final columns with just var name CALIBRATION PERIOD:
+```{r}
+# ============================================================
+# Save only each variable's FINAL column, renamed to the bare variable name
+# ============================================================
+id_cols <- c("lat", "lon", "ce_year", "year")
+
+# Find every "*_final" column present in the combined dataframe
+final_cols <- names(trace_calib_all_vars)[grepl("_final$", names(trace_calib_all_vars))]
+
+export_cols <- c(id_cols, final_cols)
+
+trace_calib_export <- trace_calib_all_vars %>%
+  dplyr::select(all_of(export_cols)) %>%
+  rename_with(~ sub("_final$", "", .x), all_of(final_cols))
+
+names(trace_calib_export)   # confirm this now shows lat, lon, ce_year, year, rh, tair, precip, ... (no _final suffix)
+
+write_parquet(
+  trace_calib_export,
+  file.path(paleoclimate_data_root, paste0("trace21ka_processed/trace_calibration_lightning_seasonal_corrected.parquet"))
+)
+```
+
+Save only corrected final columns with just var name FULL PERIOD:
+```{r}
+# ============================================================
+# Save only each variable's FINAL column, renamed to the bare variable name
+# ============================================================
+id_cols <- c("lat", "lon", "ce_year", "year")
+
+# Find every "*_final" column present in the combined dataframe
+final_cols <- names(trace_full_all_vars)[grepl("_final$", names(trace_full_all_vars))]
+
+export_cols <- c(id_cols, final_cols)
+
+trace_full_export <- trace_full_all_vars %>%
+  dplyr::select(all_of(export_cols)) %>%
+  rename_with(~ sub("_final$", "", .x), all_of(final_cols))
+
+names(trace_full_export)   # confirm this now shows lat, lon, ce_year, year, rh, tair, precip, ... (no _final suffix)
+
+write_parquet(
+  trace_full_export,
+  file.path(paleoclimate_data_root, paste0("trace21ka_processed/trace_lightning_seasonal_corrected.parquet"))
+)
+```
+

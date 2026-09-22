@@ -1,0 +1,966 @@
+---
+title: "Metrics_table"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(PRROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(data.table)
+library(raster)
+library(sp)
+library(patchwork)
+library(gt)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures.
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+config_file_path <- file.path(base_path, "paleo_config.properties")
+config <- read_properties(config_file_path)
+
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+
+figure_root <- file.path(figure_root, "Posterior_Draws")
+```
+
+Read in output from 500 draws of the posterior distribution for all parameters in pipeline:
+```{r}
+df <- fread(file.path(base_path, "Models/Pipeline/predictions_training_posterior_bb_no_outliers_cap.csv"))
+summary(df$n_strikes)
+```
+
+Get observed outcomes from training data
+```{r}
+strike_rates <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+strike_counts <- read.csv(file.path(drivers_root, "lightning_strike_count_climate_jja_2002_2011_no_outliers.csv"))
+fire_counts <- read.csv(file.path(drivers_root, "lightning_ignition_jja_2002_2011_new_no_outliers.csv"))
+burned_areas <- read.csv(file.path(drivers_root, "burned_area_jja_2002_2011_new.csv"))
+
+# need total burned area per gridcell-month. Though the model was trained on
+# fire size per single fire, pipeline simulations sum sampled burned area per
+# fire, so we need to compare the same aggregation in the training data.
+burned_areas_agg <- burned_areas %>%
+  group_by(lat, lon, year, month) %>%
+  summarise(burned_area_km2_total = sum(burned_area_km2_total, na.rm = TRUE), .groups = "drop")
+
+strike_rates_join <- strike_rates %>%
+  dplyr::select(lat, lon, year, r_strike_obs = strikes) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+fire_counts <- fire_counts %>%
+  dplyr::select(lat, lon, year, month, fire_count) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+strike_counts <- strike_counts %>%
+  dplyr::select(lat, lon, year, month, n_strikes_obs = strike_count) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+obs <- fire_counts %>% left_join(strike_counts, by = c("lat", "lon", "year", "month"))
+
+obs <- obs %>%
+  left_join(strike_rates_join, by = c("lat", "lon", "year")) %>%
+  left_join(burned_areas_agg, by = c("lat", "lon", "year", "month")) %>%
+  mutate(r_strike_obs = ifelse(is.na(r_strike_obs), 0, r_strike_obs)) %>%
+  mutate(burned_area_km2_total = ifelse(is.na(burned_area_km2_total), 0, burned_area_km2_total)) %>%
+  dplyr::select(lat, lon, year, month, r_strike_obs, n_strikes_obs, fire_count, burned_area_km2_total)
+
+# check
+nrow(obs) == nrow(fire_counts) # should be true
+sum(obs$burned_area_km2_total > 0)   # should be n_distinct(burned_areas gridcell-months), not raw fire count
+sum(is.na(obs$r_strike_obs))            # should be 0 if strike_rates covers the same lat/lon/year set
+
+summary(obs)
+
+# Remove rows where fire_count exceeds strike_count
+obs <- obs %>%
+  filter(!(n_strikes_obs > 0 & fire_count > n_strikes_obs))
+
+summary(obs)
+```
+
+Split 500 draws into test and train for calculating metrics:
+```{r}
+# 1. Recreate the EXACT same df that was originally split
+# all training sets used the same seed, just need to make sure to use a
+# training set that includes month (ie. not lightning strike rate drivers)
+df_train <- read.csv(file.path(drivers_root, "lightning_ignition_jja_2002_2011_new.csv"))
+
+sample_size <- floor(0.8 * nrow(df_train))
+set.seed(123)
+train_index <- sample(seq_len(nrow(df_train)), size = sample_size)
+
+# 2. Extract identifying keys, not the data itself
+train_keys <- unique(df_train[train_index, c("lat", "lon", "year", "month")])
+test_keys  <- unique(df_train[-train_index, c("lat", "lon", "year", "month")])
+
+setDT(train_keys); setDT(test_keys)
+train_keys[, split := "train"]
+test_keys[,  split := "test"]
+split_lookup <- rbind(train_keys, test_keys)
+
+# 3. Load predictions and join the split label in ONE pass
+df <- split_lookup[df, on = .(lat, lon, year, month)]
+setDT(df)
+
+obs <- split_lookup[obs, on = .(lat, lon, year, month)]
+setDT(obs)
+
+# calculate observed ignition rate (fires/strikes)
+obs <- obs %>%
+  mutate(
+    ignition_efficiency = case_when(
+      n_strikes_obs == 0          ~ 0,
+      fire_count > n_strikes_obs  ~ 0,
+      TRUE                        ~ fire_count / n_strikes_obs
+    )
+  )
+```
+
+Read in the burned area | 1 ignition model predictions and training observations. This sub-model is not included in the unified pipeline, so metrics cannot be computed from `df`.
+
+The burned area | 1 ignition model was fit on a different set of data (per-fire records, one row per real fire) than what the pipeline outputs (per-gridcell-month total burned area, aggregated across however many simulated fires happened to occur, further modified by the area cap). These are two different statistical objects answering two different questions: given a fire happened, how big was it? vs. how much total area burned in this gridcell this month? So it's necessary to evaluate both if the goal is to isolate whether errors in the pipeline's burned-area output stem from the regression itself or from compounding/aggregation/capping.
+```{r}
+ba_model_draws <- readRDS(file.path(rds_root, "Burned_Area/redo/ba_model_500_draws_test.rds"))
+```
+
+```{r}
+setDT(df); setDT(obs)
+df_test  <- df[split == "test"]
+obs_test <- obs[split == "test"]
+n_draws  <- uniqueN(df_test$draw_id)
+
+# =============================================================================
+# HELPERS -- everything computed PER DRAW, then summarized as mean + 95% CI
+# across draws. No nonzero-only variants for the Overall/Spatial/Temporal
+# metrics: the zero-match (%) metric already reports occurrence agreement
+# directly, so a separate nonzero-filtered re-run of every other metric was
+# redundant and, for sparse outcomes, tended to make performance look worse
+# without adding distinct information.
+#
+# S-score IS computed on zero-removed data (see compute_sscore usage below),
+# matching the histogram-plotting script's convention. When both observed
+# and predicted are ~98% zero (fire count, burned area), independently
+# computing 15 quantile breakpoints on each side collapses almost all of
+# them down to "0" -- leaving one dominant shared-zero bin that alone
+# contributes close to the full score, before the calculation has said
+# anything about whether the real, nonzero tail's SHAPE matches. Filtering
+# zeros out first forces the score to actually compare the nonzero
+# distributions' shapes, which is the informative comparison zero_match (%)
+# doesn't already provide.
+# =============================================================================
+
+format_with_ci <- function(mean_val, lo_val, hi_val, digits = 2) {
+  sprintf("%.*f [%.*f, %.*f]", digits, mean_val, digits, lo_val, digits, hi_val)
+}
+format_plain <- function(val, digits = 2) sprintf("%.*f", digits, val)
+
+# ---- Summary stats: observed (fixed) + predicted (per draw, then CI) ------
+compute_summary_stats <- function(df_dt, obs_dt, pred_col, obs_col,
+                                   mean_digits = 2, var_digits = 2, max_digits = 2) {
+  obs_vals <- obs_dt[[obs_col]]
+
+  by_draw <- df_dt[, .(
+    mean_pred = mean(get(pred_col), na.rm = TRUE),
+    var_pred  = var(get(pred_col), na.rm = TRUE),
+    max_pred  = max(get(pred_col), na.rm = TRUE)
+  ), by = draw_id]
+
+  list(
+    mean_obs = format_plain(mean(obs_vals, na.rm = TRUE), mean_digits),
+    var_obs  = format_plain(var(obs_vals, na.rm = TRUE), var_digits),
+    max_obs  = format_plain(max(obs_vals, na.rm = TRUE), max_digits),
+    mean_pred = format_with_ci(mean(by_draw$mean_pred), quantile(by_draw$mean_pred, 0.025), quantile(by_draw$mean_pred, 0.975), mean_digits),
+    var_pred  = format_with_ci(mean(by_draw$var_pred),  quantile(by_draw$var_pred, 0.025),  quantile(by_draw$var_pred, 0.975), var_digits),
+    max_pred  = format_with_ci(mean(by_draw$max_pred),  quantile(by_draw$max_pred, 0.025),  quantile(by_draw$max_pred, 0.975), max_digits)
+  )
+}
+# ---- Overall agreement, per draw: RMSE (native units), bias ratio, --------
+# ---- Pearson, Spearman -----------------------------------------------------
+compute_overall_by_draw <- function(df_dt, obs_dt, pred_col, obs_col,
+                                     key = c("lat", "lon", "year", "month")) {
+  m <- df_dt[obs_dt, on = key, nomatch = 0]
+  m <- m[!is.na(get(pred_col)) & !is.na(get(obs_col))]
+
+  m[, .(
+    rmse       = sqrt(mean((get(pred_col) - get(obs_col))^2)),
+    bias_ratio = sum(get(pred_col)) / sum(get(obs_col)),
+    pearson    = cor(get(pred_col), get(obs_col)),
+    spearman   = cor(get(pred_col), get(obs_col), method = "spearman")
+  ), by = draw_id]
+}
+
+# ---- Spatial agreement, per draw: aggregate to gridcell, correlate --------
+compute_spatial_by_draw <- function(df_dt, obs_dt, pred_col, obs_col) {
+  o_g <- obs_dt[, .(obs = mean(get(obs_col), na.rm = TRUE)), by = .(lat, lon)]
+  p_g <- df_dt[, .(pred = mean(get(pred_col), na.rm = TRUE)), by = .(draw_id, lat, lon)]
+  m <- p_g[o_g, on = c("lat", "lon"), nomatch = 0]
+
+  m[, .(spatial_pearson  = cor(pred, obs),
+        spatial_spearman = cor(pred, obs, method = "spearman")),
+    by = draw_id]
+}
+
+# ---- Temporal agreement (ACC/NRMSE of annual anomalies), per draw --------
+compute_temporal <- function(df_dt, obs_dt, pred_col, obs_col) {
+  pred_annual <- df_dt[, .(value = mean(get(pred_col), na.rm = TRUE)), by = .(draw_id, year)]
+  obs_annual  <- obs_dt[, .(obs_value = mean(get(obs_col), na.rm = TRUE)), by = year]
+
+  pred_annual[obs_annual, on = "year", nomatch = 0][
+    , .(acc            = cor(value - mean(value), obs_value - mean(obs_value)),
+        nrmse_temporal = sqrt(mean(((value - mean(value)) - (obs_value - mean(obs_value)))^2)) / sd(obs_value)),
+    by = draw_id
+  ]
+}
+
+# ---- S-score (quantile_union binning), per draw ---------------------------
+compute_sscore <- function(pred_vals_by_draw, obs_vals, sscore_bins = 15) {
+  probs <- seq(0, 1, length.out = sscore_bins + 1)
+  b_obs  <- quantile(obs_vals, probs = probs, na.rm = TRUE)
+  b_pred <- quantile(pred_vals_by_draw$value, probs = probs, na.rm = TRUE)
+  breaks <- sort(unique(c(b_obs, b_pred)))
+  breaks[1] <- min(c(obs_vals, pred_vals_by_draw$value), na.rm = TRUE)
+  breaks[length(breaks)] <- max(c(obs_vals, pred_vals_by_draw$value), na.rm = TRUE)
+  bin_levels <- levels(cut(c(obs_vals, pred_vals_by_draw$value), breaks = breaks, include.lowest = TRUE))
+
+  obs_bin <- factor(cut(obs_vals, breaks = breaks, include.lowest = TRUE), levels = bin_levels)
+  P_obs <- as.numeric(table(obs_bin)) / length(obs_vals)
+
+  pred_vals_by_draw[, bin := factor(cut(value, breaks = breaks, include.lowest = TRUE), levels = bin_levels)]
+  pd <- pred_vals_by_draw[, .N, by = .(draw_id, bin)]
+  pd[, P_pred := N / sum(N), by = draw_id]
+  full_grid <- CJ(draw_id = unique(pred_vals_by_draw$draw_id), bin = bin_levels)
+  pd <- pd[full_grid, on = c("draw_id", "bin")]
+  pd[is.na(P_pred), P_pred := 0]
+  P_obs_lookup <- setNames(P_obs, bin_levels)
+  pd[, P_obs := P_obs_lookup[as.character(bin)]]
+
+  pd[, .(sscore = sum(pmin(P_pred, P_obs))), by = draw_id]
+}
+
+# ---- Zero-match, per draw ---------------------------------------------------
+compute_zero_match <- function(pred_col, obs_col, df_dt, obs_dt, key = c("lat", "lon", "year", "month")) {
+  m <- df_dt[obs_dt, on = key, nomatch = 0]
+  m[, zm := (get(pred_col) == 0) == (get(obs_col) == 0)]
+  m[, .(zero_match = mean(zm, na.rm = TRUE) * 100), by = draw_id]
+}
+
+# ---- Summarize any per-draw data.table's numeric columns to mean+CI -------
+summarize_ci <- function(dt, cols) {
+  out <- list()
+  for (col in names(cols)) {
+    x <- dt[[col]]
+    out[[col]] <- format_with_ci(mean(x, na.rm = TRUE),
+                                  quantile(x, 0.025, na.rm = TRUE),
+                                  quantile(x, 0.975, na.rm = TRUE),
+                                  cols[[col]])
+  }
+  out
+}
+
+# =============================================================================
+# ASSEMBLE ONE ROW PER PIPELINE OUTCOME
+# =============================================================================
+build_outcome_row <- function(pred_col, obs_col, label,
+                               mean_digits = 2, var_digits = 2, max_digits = 2) {
+
+  summ     <- compute_summary_stats(df_test, obs_test, pred_col, obs_col,
+                                     mean_digits = mean_digits, var_digits = var_digits, max_digits = max_digits)
+  overall  <- compute_overall_by_draw(df_test, obs_test, pred_col, obs_col)
+  spatial  <- compute_spatial_by_draw(df_test, obs_test, pred_col, obs_col)
+  temporal <- compute_temporal(df_test, obs_test, pred_col, obs_col)
+
+  # S-score computed on ZERO-REMOVED data, independently on each side --
+  # matches the histogram-plotting script's convention (see note above).
+  pred_mask   <- df_test[[pred_col]] != 0
+  pred_dt     <- data.table(draw_id = df_test$draw_id[pred_mask], value = df_test[[pred_col]][pred_mask])
+  obs_nonzero <- obs_test[[obs_col]][obs_test[[obs_col]] != 0]
+  sscore      <- compute_sscore(pred_dt, obs_nonzero)
+
+  zeromatch <- compute_zero_match(pred_col, obs_col, df_test, obs_test)
+
+  overall_fmt  <- summarize_ci(overall,  list(rmse = 3, bias_ratio = 2, pearson = 2, spearman = 2))
+  spatial_fmt  <- summarize_ci(spatial,  list(spatial_pearson = 2, spatial_spearman = 2))
+  temporal_fmt <- summarize_ci(temporal, list(acc = 2, nrmse_temporal = 2))
+  sscore_fmt   <- summarize_ci(sscore,   list(sscore = 2))
+  zeromatch_fmt <- summarize_ci(zeromatch, list(zero_match = 1))
+
+  tibble(
+    outcome = label,
+
+    mean_obs = summ$mean_obs, mean_pred = summ$mean_pred,
+    var_obs  = summ$var_obs,  var_pred  = summ$var_pred,
+    max_obs  = summ$max_obs,  max_pred  = summ$max_pred,
+
+    rmse       = overall_fmt$rmse,
+    bias_ratio = overall_fmt$bias_ratio,
+    pearson    = overall_fmt$pearson,
+    spearman   = overall_fmt$spearman,
+
+    spatial_pearson  = spatial_fmt$spatial_pearson,
+    spatial_spearman = spatial_fmt$spatial_spearman,
+
+    acc            = temporal_fmt$acc,
+    nrmse_temporal = temporal_fmt$nrmse_temporal,
+
+    sscore     = sscore_fmt$sscore,
+    zero_match = zeromatch_fmt$zero_match
+  )
+}
+
+# =============================================================================
+# BURNED AREA | 1 IGNITION -- model-level, its own held-out per-fire test
+# set (ba_model_draws), 500 posterior draws. Every row is a confirmed fire,
+# so zero_match is not applicable ("\u2014").
+# =============================================================================
+build_ba_model_row_ci <- function(draws_dt, pred_col = "burned_area_pred",
+                                   obs_col = "burned_area_km2_total",
+                                   label = "Burned area | 1 ignition",
+                                   mean_digits = 2, var_digits = 2, max_digits = 2) {
+
+  obs_ref <- draws_dt[draw_id == draws_dt$draw_id[1]][[obs_col]]
+
+  by_draw_summ <- draws_dt[, .(
+    mean_pred = mean(get(pred_col), na.rm = TRUE),
+    var_pred  = var(get(pred_col), na.rm = TRUE),
+    max_pred  = max(get(pred_col), na.rm = TRUE)
+  ), by = draw_id]
+
+  overall_by_draw <- draws_dt[, .(
+    rmse       = sqrt(mean((get(pred_col) - get(obs_col))^2)),
+    bias_ratio = sum(get(pred_col)) / sum(get(obs_col)),
+    pearson    = cor(get(pred_col), get(obs_col)),
+    spearman   = cor(get(pred_col), get(obs_col), method = "spearman")
+  ), by = draw_id]
+
+  obs_by_cell <- draws_dt[draw_id == draws_dt$draw_id[1], .(obs = mean(get(obs_col))), by = .(lat, lon)]
+  spatial_by_draw <- draws_dt[, .(pred = mean(get(pred_col))), by = .(draw_id, lat, lon)][
+    obs_by_cell, on = c("lat", "lon"), nomatch = 0][
+    , .(spatial_pearson  = cor(pred, obs),
+        spatial_spearman = cor(pred, obs, method = "spearman")),
+    by = draw_id
+  ]
+
+  obs_by_year <- draws_dt[draw_id == draws_dt$draw_id[1], .(obs_value = sum(get(obs_col))), by = year]
+  temporal_by_draw <- draws_dt[, .(value = sum(get(pred_col))), by = .(draw_id, year)][
+    obs_by_year, on = "year", nomatch = 0][
+    , .(acc            = cor(value - mean(value), obs_value - mean(obs_value)),
+        nrmse_temporal = sqrt(mean(((value - mean(value)) - (obs_value - mean(obs_value)))^2)) / sd(obs_value)),
+    by = draw_id
+  ]
+
+  # S-score on zero-removed data, same convention as build_outcome_row()
+  # (harmless here even though every observed fire is already nonzero by
+  # construction -- kept for consistency, and guards against the rare case
+  # of an exactly-zero predicted draw).
+  pred_mask <- draws_dt[[pred_col]] != 0
+  pred_dt_for_sscore <- data.table(draw_id = draws_dt$draw_id[pred_mask], value = draws_dt[[pred_col]][pred_mask])
+  obs_ref_nonzero <- obs_ref[obs_ref != 0]
+  sscore <- compute_sscore(pred_dt_for_sscore, obs_ref_nonzero)
+
+  summ_fmt <- list(
+    mean_obs = format_plain(mean(obs_ref), mean_digits), var_obs = format_plain(var(obs_ref), var_digits), max_obs = format_plain(max(obs_ref), max_digits),
+    mean_pred = format_with_ci(mean(by_draw_summ$mean_pred), quantile(by_draw_summ$mean_pred, 0.025), quantile(by_draw_summ$mean_pred, 0.975), mean_digits),
+    var_pred  = format_with_ci(mean(by_draw_summ$var_pred),  quantile(by_draw_summ$var_pred, 0.025),  quantile(by_draw_summ$var_pred, 0.975), var_digits),
+    max_pred  = format_with_ci(mean(by_draw_summ$max_pred),  quantile(by_draw_summ$max_pred, 0.025),  quantile(by_draw_summ$max_pred, 0.975), max_digits)
+  )
+  overall_fmt  <- summarize_ci(overall_by_draw,  list(rmse = 2, bias_ratio = 2, pearson = 2, spearman = 2))
+  spatial_fmt  <- summarize_ci(spatial_by_draw,  list(spatial_pearson = 2, spatial_spearman = 2))
+  temporal_fmt <- summarize_ci(temporal_by_draw, list(acc = 2, nrmse_temporal = 2))
+  sscore_fmt   <- summarize_ci(sscore,           list(sscore = 2))
+
+  tibble(
+    outcome = label,
+
+    mean_obs = summ_fmt$mean_obs, mean_pred = summ_fmt$mean_pred,
+    var_obs  = summ_fmt$var_obs,  var_pred  = summ_fmt$var_pred,
+    max_obs  = summ_fmt$max_obs,  max_pred  = summ_fmt$max_pred,
+
+    rmse       = overall_fmt$rmse,
+    bias_ratio = overall_fmt$bias_ratio,
+    pearson    = overall_fmt$pearson,
+    spearman   = overall_fmt$spearman,
+
+    spatial_pearson  = spatial_fmt$spatial_pearson,
+    spatial_spearman = spatial_fmt$spatial_spearman,
+
+    acc            = temporal_fmt$acc,
+    nrmse_temporal = temporal_fmt$nrmse_temporal,
+
+    sscore     = sscore_fmt$sscore,
+    zero_match = "\u2014"
+  )
+}
+```
+
+
+
+```{r}
+# NOTE: Ignition efficiency is intentionally excluded from this table.
+# Comparing its predicted per-strike probability against the observed
+# ignition rate as a continuous quantity mixes a smooth probability
+# estimate against a small-sample, often-extreme empirical ratio (see
+# Table X below), and doing so is inconsistent with how ignition
+# predictions are otherwise reported elsewhere (as classification metrics,
+# and as a separate reliability-style plot rather than an obs/pred
+# histogram). Its performance is reported exclusively in the
+# classification-based table (ROC AUC, PR AUC, Brier score) below.
+outcome_order <- c("Strike rate", "Strike count", "Burned area | 1 ignition",
+                    "Fire count", "Total burned area")
+
+table_data <- bind_rows(
+  build_outcome_row("r_strike", "r_strike_obs", "Strike rate", mean_digits = 3, var_digits = 4, max_digits = 2),
+  build_outcome_row("n_strikes", "n_strikes_obs", "Strike count"),
+  build_ba_model_row_ci(ba_model_draws),
+  build_outcome_row("fire_count_pred", "fire_count", "Fire count", mean_digits = 3, var_digits = 3, max_digits = 2),
+  build_outcome_row("total_burned_area_capped", "burned_area_km2_total", "Total burned area")
+) %>%
+  mutate(outcome = factor(outcome, levels = outcome_order)) %>%
+  arrange(outcome)
+
+# =============================================================================
+# BUILD THE gt TABLE
+# =============================================================================
+gt_tbl <- table_data %>%
+  gt(rowname_col = "outcome") %>%
+  tab_spanner(label = "Mean",     columns = c(mean_obs, mean_pred)) %>%
+  tab_spanner(label = "Variance", columns = c(var_obs, var_pred)) %>%
+  tab_spanner(label = "Max",      columns = c(max_obs, max_pred)) %>%
+  tab_spanner(label = "Overall agreement", columns = c(rmse, bias_ratio, pearson, spearman)) %>%
+  tab_spanner(label = "Spatial agreement", columns = c(spatial_pearson, spatial_spearman)) %>%
+  tab_spanner(label = "Temporal agreement", columns = c(acc, nrmse_temporal)) %>%
+  tab_spanner(label = "Distributional agreement", columns = c(sscore, zero_match)) %>%
+  cols_label(
+    mean_obs = "Observed", mean_pred = "Predicted",
+    var_obs  = "Observed", var_pred  = "Predicted",
+    max_obs  = "Observed", max_pred  = "Predicted",
+    rmse = "RMSE", bias_ratio = "Bias ratio", pearson = "Pearson r", spearman = "Spearman $\\rho$",
+    spatial_pearson = "Pearson r", spatial_spearman = "Spearman $\\rho$",
+    acc = "ACC", nrmse_temporal = "NRMSE",
+    sscore = "S-score", zero_match = "Zero match (\\%)"
+  ) %>%
+  tab_header(title = "Training-period sub-model performance (test set)") %>%
+  tab_footnote(
+    footnote = "Mean, Variance, and Max are computed across all gridcell-months in the test set; predicted values reflect the 95\\%  interval across 500 posterior draws; observed values are single fixed quantities. RMSE, bias ratio, Pearson, and Spearman (Overall agreement) are likewise computed across all gridcell-months. RMSE is in the outcome's units; compare against the Mean/Variance/Max to judge the relative magnitude of RMSE. S-score is computed on zero-removed data, since zero-inflated outcomes dominates the score; \\% zero-match is computed separately on the full data. Values in brackets are 95\\% intervals across 500 posterior draws. ACC/NRMSE (Temporal) computed on annual anomalies relative to each observed outcome training period mean. S-score uses 15 quantile bins.",
+    locations = cells_title()
+  ) %>%
+  tab_footnote(
+    footnote = "\"Burned area | 1 ignition\" evaluates the burned-area regression model directly on its own held-out per-fire test set (500 posterior draws), independent of the upstream strike-count/ignition pipeline and the gridcell-area cap. Every row is a confirmed fire; zero-match does not apply. Spatial CI reflects only parameter uncertainty in the prediction, whereas the pipeline-level fire count and total burned area uncertainty incorporates upstream strike-count and ignition stochasticity.",
+    locations = cells_stub(rows = outcome == "Burned area | 1 ignition")
+  )
+
+gt_tbl
+
+#write.table(gt_tbl, "metrics_table.csv")
+```
+
+Ignition efficiency is excluded from this table and reported instead in Table X (classification-based metrics), for consistency with how ignition predictions are handled elsewhere in this analysis. With the exception of burned area | 1 ignition, which reflects the burned-area regression's own held-out per-fire predictions, evaluated independently of the pipeline, all metrics above are computed from the full simulation pipeline's output against the corresponding observed gridcell-month-year record.
+
+Mean / Variance / Max
+
+Descriptive summary of the observed and predicted distributions themselves, before looking at any agreement metric. Comparing these side by side answers a basic sanity question the correlation/error metrics below don't directly address: does the model reproduce roughly the right overall scale and spread, or is it systematically compressed/inflated relative to reality? These are also the reference point for reading RMSE (below) in context -- an RMSE that looks large in isolation may be small relative to the outcome's own variance, or vice versa.
+
+Overall agreement
+
+RMSE: root mean squared error, in the outcome's own units. Penalizes large individual errors more heavily than small ones (since errors are squared before averaging). Lower is better; 0 = perfect. Read alongside the Mean/Variance/Max columns to judge whether a given RMSE is large or small relative to the outcome's own typical scale.
+
+Bias ratio: sum of all predicted values divided by sum of all observed values. Tells you about aggregate over/under-prediction, independent of whether individual gridcell-months line up correctly. 1.0 = totals match exactly; above 1 = model overpredicts in aggregate; below 1 = underpredicts. Note this can look fine even when Pearson/RMSE are poor (overprediction in some places can cancel underprediction elsewhere), so it should always be read alongside the correlation/error metrics, not instead of them.
+
+Pearson r: linear correlation between predicted and observed values across every gridcell-month. Ranges -1 to 1; 1 = perfect positive linear agreement, 0 = no linear relationship, negative = they move in opposite directions.
+
+Spearman rho: rank correlation -- do gridcell-months that are relatively higher/lower in observed also come out relatively higher/lower in predicted, regardless of whether the relationship is linear. More robust to outliers and nonlinear-but-monotonic relationships than Pearson. Same -1 to 1 scale and interpretation.
+
+Spatial agreement
+
+Same Pearson/Spearman definitions as above, but computed after collapsing each gridcell down to its mean value across the whole test period first. Answers a different question than overall agreement: not "does the model get every month right," but "does the model correctly identify which locations are consistently higher- or lower-activity than others."
+
+Temporal agreement: ACC and NRMSE
+
+ACC (anomaly correlation coefficient): correlate year-to-year anomalies (each year's value minus its own series' 10-year mean) between predicted and observed. This strips out any constant bias and asks purely: does the model get the pattern of good years vs. bad years right? 1 = perfect year-to-year tracking, 0 = no relationship, negative = it gets which years are high/low backwards.
+
+NRMSE (temporal): RMSE of those same anomalies, normalized by the observed anomalies' own standard deviation. Near 0 = anomaly errors small relative to real interannual variability (good); near/above 1 = errors as large as, or larger than, genuine year-to-year variability (poor).
+
+Distributional agreement: S-score and zero-match
+
+S-score: measures how well the shape of the predicted distribution matches the observed distribution among the nonzero values only (as two histograms, zeros excluded from both sides before binning), using quantile-union binning so neither distribution's sample size dominates. Ranges 0 to 1; 1 = the two nonzero distributions perfectly overlap in shape, 0 = no overlap at all.
+
+Zero match (%): the percentage of gridcell-months where predicted-is-zero and observed-is-zero agree (both are zero, or both are nonzero), computed on the full (non-zero-filtered) data. Answers specifically: how reliably does the model predict whether an event occurs at all, at the exact same location and time. Together, zero-match and S-score are meant to be read as a pair: zero-match reports occurrence agreement, S-score reports magnitude/shape agreement among the events that did occur.
+
+## Table X: Ignition efficiency, classification-based metrics
+
+As noted above, comparing predicted per-strike ignition probability against the observed ignition rate as a continuous quantity is a poor fit for this sub-model specifically: the observed side is an empirical ratio (fires / strikes) that is extremely noisy at low strike counts (a single strike that ignites a fire gives an observed rate of 1.0, which is not evidence the true probability is anywhere near 1), while the predicted side is a smooth, continuous probability that should almost never approach 1. A classification framing -- did a fire occur at all in a given gridcell-month, given at least one strike -- is a more appropriate way to assess this model, since it evaluates the predicted probability against a genuine binary outcome rather than a small-sample ratio.
+```{r}
+compute_ignition_classification_by_draw <- function(df_dt, obs_dt) {
+  obs_bin <- obs_dt[n_strikes_obs > 0, .(lat, lon, year, month, fire_occurred = as.integer(fire_count > 0))]
+  m <- df_dt[obs_bin, on = c("lat", "lon", "year", "month"), nomatch = 0]
+
+  m[, .(
+    pr_auc  = PRROC::pr.curve(
+      scores.class0 = p_ignite_rate_cal[fire_occurred == 1],
+      scores.class1 = p_ignite_rate_cal[fire_occurred == 0]
+    )$auc.integral,
+    roc_auc = as.numeric(pROC::auc(pROC::roc(fire_occurred, p_ignite_rate_cal, quiet = TRUE))),
+    brier   = mean((p_ignite_rate_cal - fire_occurred)^2)
+  ), by = draw_id]
+}
+
+ignition_class_by_draw <- compute_ignition_classification_by_draw(df_test, obs_test)
+
+ignition_class_fmt <- summarize_ci(ignition_class_by_draw, list(pr_auc = 3, roc_auc = 2, brier = 5))
+
+# Observed event prevalence -- the baseline PR AUC would achieve under
+# random guessing (NOT 0.5, which is ROC AUC's chance level). PR AUC should
+# be read relative to THIS value, not against 0.5.
+obs_bin_for_prevalence <- obs_test[n_strikes_obs > 0, .(fire_occurred = as.integer(fire_count > 0))]
+prevalence <- mean(obs_bin_for_prevalence$fire_occurred)
+
+ignition_class_table <- tibble(
+  metric = c("Observed event prevalence", "PR AUC", "ROC AUC", "Brier score"),
+  value  = c(format_plain(prevalence, 3), ignition_class_fmt$pr_auc, ignition_class_fmt$roc_auc, ignition_class_fmt$brier)
+)
+
+ignition_class_gt <- ignition_class_table %>%
+  gt() %>%
+  tab_header(title = "Ignition efficiency: classification-based performance (test set)") %>%
+  cols_label(metric = "Metric", value = "Value [95\\% CI]") %>%
+  tab_footnote(
+    footnote = "These metrics are used to compare modeled probability predictions (ignition efficency) with a binary outcome (fire occurred during a gridcell-months with at least one observed strike). Observed event prevalence: the fraction of gridcell-months where a fire ocurred. PR AUC: a value greater than the observed event prevalence indicates that the model outperforms a random baseline; informative when positive cases (fire occurrence) are rare. ROC AUC: probability that the model ranks a randomly chosen fire-occurrence month above a randomly chosen non-occurrence month (0.5 = no better than chance, 1.0 = perfect discrimination). Brier score: mean squared error between predicted probability and the binary outcome (0 = perfect, 0.25 = performance of a coin-flip classifier on a balanced dataset; lower is better). All model values are the mean and 95\\% interval across 500 posterior draws; observed prevalence is a single fixed value.",
+    locations = cells_title()
+  )
+
+ignition_class_gt
+```
+
+
+LONG FORMAT to save space
+
+```{r}
+setDT(df); setDT(obs)
+df_test  <- df[split == "test"]
+obs_test <- obs[split == "test"]
+n_draws  <- uniqueN(df_test$draw_id)
+
+format_with_ci <- function(mean_val, lo_val, hi_val, digits = 2) {
+  sprintf("%.*f [%.*f, %.*f]", digits, mean_val, digits, lo_val, digits, hi_val)
+}
+format_plain <- function(val, digits = 2) sprintf("%.*f", digits, val)
+
+# ---- Default digit counts, one entry per reported metric -------------------
+# Override any subset per outcome via the `digits` argument to
+# build_outcome_row()/build_ba_model_row_ci() -- e.g.
+# digits = list(rmse = 1, bias_ratio = 1) narrows just those two columns
+# for that one outcome, leaving everything else at its default.
+default_digits <- list(
+  mean = 2, var = 2, max = 2,
+  rmse = 3, bias_ratio = 2, pearson = 2, spearman = 2,
+  spatial_pearson = 2, spatial_spearman = 2,
+  acc = 2, nrmse_temporal = 2,
+  sscore = 2, zero_match = 1
+)
+
+# ---- Summary stats: observed (fixed) + predicted (per draw, then CI) ------
+compute_summary_stats <- function(df_dt, obs_dt, pred_col, obs_col, digits) {
+  obs_vals <- obs_dt[[obs_col]]
+
+  by_draw <- df_dt[, .(
+    mean_pred = mean(get(pred_col), na.rm = TRUE),
+    var_pred  = var(get(pred_col), na.rm = TRUE),
+    max_pred  = max(get(pred_col), na.rm = TRUE)
+  ), by = draw_id]
+
+  list(
+    mean_obs = format_plain(mean(obs_vals, na.rm = TRUE), digits$mean),
+    var_obs  = format_plain(var(obs_vals, na.rm = TRUE), digits$var),
+    max_obs  = format_plain(max(obs_vals, na.rm = TRUE), digits$max),
+    mean_pred = format_with_ci(mean(by_draw$mean_pred), quantile(by_draw$mean_pred, 0.025), quantile(by_draw$mean_pred, 0.975), digits$mean),
+    var_pred  = format_with_ci(mean(by_draw$var_pred),  quantile(by_draw$var_pred, 0.025),  quantile(by_draw$var_pred, 0.975), digits$var),
+    max_pred  = format_with_ci(mean(by_draw$max_pred),  quantile(by_draw$max_pred, 0.025),  quantile(by_draw$max_pred, 0.975), digits$max)
+  )
+}
+
+# ---- Overall agreement, per draw: RMSE (native units), bias ratio, --------
+# ---- Pearson, Spearman -----------------------------------------------------
+compute_overall_by_draw <- function(df_dt, obs_dt, pred_col, obs_col,
+                                     key = c("lat", "lon", "year", "month")) {
+  m <- df_dt[obs_dt, on = key, nomatch = 0]
+  m <- m[!is.na(get(pred_col)) & !is.na(get(obs_col))]
+
+  m[, .(
+    rmse       = sqrt(mean((get(pred_col) - get(obs_col))^2)),
+    bias_ratio = sum(get(pred_col)) / sum(get(obs_col)),
+    pearson    = cor(get(pred_col), get(obs_col)),
+    spearman   = cor(get(pred_col), get(obs_col), method = "spearman")
+  ), by = draw_id]
+}
+
+# ---- Spatial agreement, per draw: aggregate to gridcell, correlate --------
+compute_spatial_by_draw <- function(df_dt, obs_dt, pred_col, obs_col) {
+  o_g <- obs_dt[, .(obs = mean(get(obs_col), na.rm = TRUE)), by = .(lat, lon)]
+  p_g <- df_dt[, .(pred = mean(get(pred_col), na.rm = TRUE)), by = .(draw_id, lat, lon)]
+  m <- p_g[o_g, on = c("lat", "lon"), nomatch = 0]
+
+  m[, .(spatial_pearson  = cor(pred, obs),
+        spatial_spearman = cor(pred, obs, method = "spearman")),
+    by = draw_id]
+}
+
+# ---- Temporal agreement (ACC/NRMSE of annual anomalies), per draw --------
+compute_temporal <- function(df_dt, obs_dt, pred_col, obs_col) {
+  pred_annual <- df_dt[, .(value = mean(get(pred_col), na.rm = TRUE)), by = .(draw_id, year)]
+  obs_annual  <- obs_dt[, .(obs_value = mean(get(obs_col), na.rm = TRUE)), by = year]
+
+  pred_annual[obs_annual, on = "year", nomatch = 0][
+    , .(acc            = cor(value - mean(value), obs_value - mean(obs_value)),
+        nrmse_temporal = sqrt(mean(((value - mean(value)) - (obs_value - mean(obs_value)))^2)) / sd(obs_value)),
+    by = draw_id
+  ]
+}
+
+# ---- S-score (quantile_union binning), per draw ---------------------------
+compute_sscore <- function(pred_vals_by_draw, obs_vals, sscore_bins = 15) {
+  probs <- seq(0, 1, length.out = sscore_bins + 1)
+  b_obs  <- quantile(obs_vals, probs = probs, na.rm = TRUE)
+  b_pred <- quantile(pred_vals_by_draw$value, probs = probs, na.rm = TRUE)
+  breaks <- sort(unique(c(b_obs, b_pred)))
+  breaks[1] <- min(c(obs_vals, pred_vals_by_draw$value), na.rm = TRUE)
+  breaks[length(breaks)] <- max(c(obs_vals, pred_vals_by_draw$value), na.rm = TRUE)
+  bin_levels <- levels(cut(c(obs_vals, pred_vals_by_draw$value), breaks = breaks, include.lowest = TRUE))
+
+  obs_bin <- factor(cut(obs_vals, breaks = breaks, include.lowest = TRUE), levels = bin_levels)
+  P_obs <- as.numeric(table(obs_bin)) / length(obs_vals)
+
+  pred_vals_by_draw[, bin := factor(cut(value, breaks = breaks, include.lowest = TRUE), levels = bin_levels)]
+  pd <- pred_vals_by_draw[, .N, by = .(draw_id, bin)]
+  pd[, P_pred := N / sum(N), by = draw_id]
+  full_grid <- CJ(draw_id = unique(pred_vals_by_draw$draw_id), bin = bin_levels)
+  pd <- pd[full_grid, on = c("draw_id", "bin")]
+  pd[is.na(P_pred), P_pred := 0]
+  P_obs_lookup <- setNames(P_obs, bin_levels)
+  pd[, P_obs := P_obs_lookup[as.character(bin)]]
+
+  pd[, .(sscore = sum(pmin(P_pred, P_obs))), by = draw_id]
+}
+
+# ---- Zero-match, per draw ---------------------------------------------------
+compute_zero_match <- function(pred_col, obs_col, df_dt, obs_dt, key = c("lat", "lon", "year", "month")) {
+  m <- df_dt[obs_dt, on = key, nomatch = 0]
+  m[, zm := (get(pred_col) == 0) == (get(obs_col) == 0)]
+  m[, .(zero_match = mean(zm, na.rm = TRUE) * 100), by = draw_id]
+}
+
+# ---- Summarize any per-draw data.table's numeric columns to mean+CI -------
+summarize_ci <- function(dt, cols) {
+  out <- list()
+  for (col in names(cols)) {
+    x <- dt[[col]]
+    out[[col]] <- format_with_ci(mean(x, na.rm = TRUE),
+                                  quantile(x, 0.025, na.rm = TRUE),
+                                  quantile(x, 0.975, na.rm = TRUE),
+                                  cols[[col]])
+  }
+  out
+}
+
+# =============================================================================
+# ASSEMBLE ONE ROW PER PIPELINE OUTCOME
+# =============================================================================
+build_outcome_row <- function(pred_col, obs_col, label, digits = list(),
+                               sscore_remove_zeros = TRUE, report_zero_match = TRUE) {
+  digits <- modifyList(default_digits, digits)
+
+  summ     <- compute_summary_stats(df_test, obs_test, pred_col, obs_col, digits)
+  overall  <- compute_overall_by_draw(df_test, obs_test, pred_col, obs_col)
+  spatial  <- compute_spatial_by_draw(df_test, obs_test, pred_col, obs_col)
+  temporal <- compute_temporal(df_test, obs_test, pred_col, obs_col)
+
+  # S-score zero-removal is appropriate ONLY when zero-mass is genuinely
+  # SHARED between observed and predicted (e.g. fire count, burned area --
+  # both sides hit exact zero at comparable, high rates, so the shared zero
+  # bin is trivial agreement already captured by zero-match, and removing
+  # it reveals real nonzero-tail shape agreement). For an outcome like
+  # strike rate, predicted is drawn from a Gamma distribution with strictly
+  # positive support -- it can NEVER be exactly zero, while a real fraction
+  # of observed years genuinely have none. Removing observed zeros here
+  # would delete the single largest, most honest piece of evidence of a
+  # real structural limitation (the model cannot represent true "no
+  # lightning" years), inflating S-score rather than revealing anything.
+  # Set sscore_remove_zeros = FALSE for outcomes where the predicted side
+  # cannot structurally produce exact zeros.
+  if (sscore_remove_zeros) {
+    pred_mask   <- df_test[[pred_col]] != 0
+    pred_dt     <- data.table(draw_id = df_test$draw_id[pred_mask], value = df_test[[pred_col]][pred_mask])
+    obs_nonzero <- obs_test[[obs_col]][obs_test[[obs_col]] != 0]
+    sscore      <- compute_sscore(pred_dt, obs_nonzero)
+  } else {
+    pred_dt <- data.table(draw_id = df_test$draw_id, value = df_test[[pred_col]])
+    sscore  <- compute_sscore(pred_dt, obs_test[[obs_col]])
+  }
+
+  sscore_fmt <- summarize_ci(sscore, list(sscore = digits$sscore))
+
+  overall_fmt  <- summarize_ci(overall,  list(rmse = digits$rmse, bias_ratio = digits$bias_ratio,
+                                               pearson = digits$pearson, spearman = digits$spearman))
+  spatial_fmt  <- summarize_ci(spatial,  list(spatial_pearson = digits$spatial_pearson,
+                                               spatial_spearman = digits$spatial_spearman))
+  temporal_fmt <- summarize_ci(temporal, list(acc = digits$acc, nrmse_temporal = digits$nrmse_temporal))
+
+  # Zero-match is similarly uninformative when predicted can never be
+  # exactly zero: the figure would just reduce to (1 - observed zero
+  # fraction), not genuine occurrence-prediction skill.
+  if (report_zero_match) {
+    zeromatch     <- compute_zero_match(pred_col, obs_col, df_test, obs_test)
+    zeromatch_fmt <- summarize_ci(zeromatch, list(zero_match = digits$zero_match))
+    zero_match_out <- zeromatch_fmt$zero_match
+  } else {
+    zero_match_out <- "\u2014"
+  }
+
+  tibble(
+    outcome = label,
+
+    mean_obs = summ$mean_obs, mean_pred = summ$mean_pred,
+    var_obs  = summ$var_obs,  var_pred  = summ$var_pred,
+    max_obs  = summ$max_obs,  max_pred  = summ$max_pred,
+
+    rmse       = overall_fmt$rmse,
+    bias_ratio = overall_fmt$bias_ratio,
+    pearson    = overall_fmt$pearson,
+    spearman   = overall_fmt$spearman,
+
+    spatial_pearson  = spatial_fmt$spatial_pearson,
+    spatial_spearman = spatial_fmt$spatial_spearman,
+
+    acc            = temporal_fmt$acc,
+    nrmse_temporal = temporal_fmt$nrmse_temporal,
+
+    sscore     = sscore_fmt$sscore,
+    zero_match = zero_match_out
+  )
+}
+
+# =============================================================================
+# BURNED AREA | 1 IGNITION -- model-level, its own held-out per-fire test
+# set (ba_model_draws), 500 posterior draws. Every row is a confirmed fire,
+# so zero_match is not applicable ("\u2014").
+# =============================================================================
+build_ba_model_row_ci <- function(draws_dt, pred_col = "burned_area_pred",
+                                   obs_col = "burned_area_km2_total",
+                                   label = "Burned area | 1 ignition",
+                                   digits = list()) {
+  digits <- modifyList(default_digits, digits)
+
+  obs_ref <- draws_dt[draw_id == draws_dt$draw_id[1]][[obs_col]]
+
+  by_draw_summ <- draws_dt[, .(
+    mean_pred = mean(get(pred_col), na.rm = TRUE),
+    var_pred  = var(get(pred_col), na.rm = TRUE),
+    max_pred  = max(get(pred_col), na.rm = TRUE)
+  ), by = draw_id]
+
+  overall_by_draw <- draws_dt[, .(
+    rmse       = sqrt(mean((get(pred_col) - get(obs_col))^2)),
+    bias_ratio = sum(get(pred_col)) / sum(get(obs_col)),
+    pearson    = cor(get(pred_col), get(obs_col)),
+    spearman   = cor(get(pred_col), get(obs_col), method = "spearman")
+  ), by = draw_id]
+
+  obs_by_cell <- draws_dt[draw_id == draws_dt$draw_id[1], .(obs = mean(get(obs_col))), by = .(lat, lon)]
+  spatial_by_draw <- draws_dt[, .(pred = mean(get(pred_col))), by = .(draw_id, lat, lon)][
+    obs_by_cell, on = c("lat", "lon"), nomatch = 0][
+    , .(spatial_pearson  = cor(pred, obs),
+        spatial_spearman = cor(pred, obs, method = "spearman")),
+    by = draw_id
+  ]
+
+  obs_by_year <- draws_dt[draw_id == draws_dt$draw_id[1], .(obs_value = sum(get(obs_col))), by = year]
+  temporal_by_draw <- draws_dt[, .(value = sum(get(pred_col))), by = .(draw_id, year)][
+    obs_by_year, on = "year", nomatch = 0][
+    , .(acc            = cor(value - mean(value), obs_value - mean(obs_value)),
+        nrmse_temporal = sqrt(mean(((value - mean(value)) - (obs_value - mean(obs_value)))^2)) / sd(obs_value)),
+    by = draw_id
+  ]
+
+  pred_mask <- draws_dt[[pred_col]] != 0
+  pred_dt_for_sscore <- data.table(draw_id = draws_dt$draw_id[pred_mask], value = draws_dt[[pred_col]][pred_mask])
+  obs_ref_nonzero <- obs_ref[obs_ref != 0]
+  sscore <- compute_sscore(pred_dt_for_sscore, obs_ref_nonzero)
+
+  summ_fmt <- list(
+    mean_obs = format_plain(mean(obs_ref), digits$mean), var_obs = format_plain(var(obs_ref), digits$var), max_obs = format_plain(max(obs_ref), digits$max),
+    mean_pred = format_with_ci(mean(by_draw_summ$mean_pred), quantile(by_draw_summ$mean_pred, 0.025), quantile(by_draw_summ$mean_pred, 0.975), digits$mean),
+    var_pred  = format_with_ci(mean(by_draw_summ$var_pred),  quantile(by_draw_summ$var_pred, 0.025),  quantile(by_draw_summ$var_pred, 0.975), digits$var),
+    max_pred  = format_with_ci(mean(by_draw_summ$max_pred),  quantile(by_draw_summ$max_pred, 0.025),  quantile(by_draw_summ$max_pred, 0.975), digits$max)
+  )
+  overall_fmt  <- summarize_ci(overall_by_draw,  list(rmse = digits$rmse, bias_ratio = digits$bias_ratio,
+                                                       pearson = digits$pearson, spearman = digits$spearman))
+  spatial_fmt  <- summarize_ci(spatial_by_draw,  list(spatial_pearson = digits$spatial_pearson,
+                                                       spatial_spearman = digits$spatial_spearman))
+  temporal_fmt <- summarize_ci(temporal_by_draw, list(acc = digits$acc, nrmse_temporal = digits$nrmse_temporal))
+  sscore_fmt   <- summarize_ci(sscore,           list(sscore = digits$sscore))
+
+  tibble(
+    outcome = label,
+
+    mean_obs = summ_fmt$mean_obs, mean_pred = summ_fmt$mean_pred,
+    var_obs  = summ_fmt$var_obs,  var_pred  = summ_fmt$var_pred,
+    max_obs  = summ_fmt$max_obs,  max_pred  = summ_fmt$max_pred,
+
+    rmse       = overall_fmt$rmse,
+    bias_ratio = overall_fmt$bias_ratio,
+    pearson    = overall_fmt$pearson,
+    spearman   = overall_fmt$spearman,
+
+    spatial_pearson  = spatial_fmt$spatial_pearson,
+    spatial_spearman = spatial_fmt$spatial_spearman,
+
+    acc            = temporal_fmt$acc,
+    nrmse_temporal = temporal_fmt$nrmse_temporal,
+
+    sscore     = sscore_fmt$sscore,
+    zero_match = "\u2014"
+  )
+}
+
+table_data <- bind_rows(
+  build_outcome_row("r_strike", "r_strike_obs", "Strike rate", digits = list(mean = 3, var = 4, max = 2, rmse = 3),
+                     sscore_remove_zeros = FALSE, report_zero_match = FALSE),
+  build_outcome_row("n_strikes", "n_strikes_obs", "Strike count", digits = list(rmse = 1, bias_ratio = 1, var = 0, max = 0)),
+  build_ba_model_row_ci(ba_model_draws, digits = list(rmse = 1, var = 0, max = 0)),
+  build_outcome_row("fire_count_pred", "fire_count", "Fire count", digits = list(mean = 3, var = 3, max = 1)),
+  build_outcome_row("total_burned_area_capped", "burned_area_km2_total", "Total burned area", digits = list(rmse = 0, var = 0, max = 0))
+)
+table_data
+```
+
+```{r}
+library(tidyr)
+library(dplyr)
+
+# ---- Lookup: wide column name -> (row group, row label) -------------------
+# Order here determines row order in the final table -- matches the
+# original column order (Mean/Variance/Max -> Overall -> Spatial ->
+# Temporal -> Distributional), just now read top-to-bottom instead of
+# left-to-right.
+metric_lookup <- tribble(
+  ~column,             ~group,                      ~metric,
+  "mean_obs",          "Mean",                      "Observed",
+  "mean_pred",         "Mean",                      "Predicted",
+  "var_obs",           "Variance",                  "Observed",
+  "var_pred",          "Variance",                  "Predicted",
+  "max_obs",           "Max",                       "Observed",
+  "max_pred",          "Max",                       "Predicted",
+  "rmse",              "Overall agreement",         "RMSE",
+  "bias_ratio",        "Overall agreement",         "Bias ratio",
+  "pearson",           "Overall agreement",         "Pearson r",
+  "spearman",          "Overall agreement",         "Spearman rho",
+  "spatial_pearson",   "Spatial agreement",         "Pearson r",
+  "spatial_spearman",  "Spatial agreement",         "Spearman rho",
+  "acc",               "Temporal agreement",        "ACC",
+  "nrmse_temporal",    "Temporal agreement",        "NRMSE",
+  "sscore",            "Distributional agreement",  "S-score",
+  "zero_match",        "Distributional agreement",  "Zero match %"
+)
+
+# ---- Pivot: outcomes-as-rows -> long -> outcomes-as-columns ---------------
+table_transposed <- table_data %>%
+  pivot_longer(-outcome, names_to = "column", values_to = "value") %>%
+  left_join(metric_lookup, by = "column") %>%
+  dplyr::select(-column) %>%
+  pivot_wider(names_from = outcome, values_from = value) %>%
+  mutate(group = factor(group, levels = unique(metric_lookup$group))) %>%
+  arrange(group)
+
+# Reorder outcome columns explicitly, matching the original outcome_order
+table_transposed <- table_transposed %>%
+  dplyr::select(group, metric, all_of(outcome_order))
+
+# ---- Build the gt table, row-grouped by metric category -------------------
+gt_tbl <- table_transposed %>%
+  gt(groupname_col = "group", rowname_col = "metric") %>%
+  tab_header(title = "Training-period sub-model performance (test set)") %>%
+  tab_footnote(
+    footnote = "Mean, Variance, and Max are computed across all gridcell-months in the test set; predicted values reflect the 95\\%  interval across 500 posterior draws; observed values are single fixed quantities. RMSE, bias ratio, Pearson, and Spearman (Overall agreement) are likewise computed across all gridcell-months. RMSE is in the outcome's units; compare against the Mean/Variance/Max to judge the relative magnitude of RMSE. S-score is computed on zero-removed data, since zero-inflated outcomes dominates the score; \\% zero-match is computed separately on the full data. Values in brackets are 95\\% intervals across 500 posterior draws. ACC/NRMSE (Temporal) computed on annual anomalies relative to each observed outcome training period mean. S-score uses 15 quantile bins.",
+    locations = cells_title()
+  ) %>%
+  tab_footnote(
+    footnote = "\"Burned area | 1 ignition\" evaluates the burned-area regression model directly on its own held-out per-fire test set (500 posterior draws), independent of the upstream strike-count/ignition pipeline and the gridcell-area cap. Every row is a confirmed fire; zero-match does not apply. Spatial CI reflects only parameter uncertainty in the prediction, whereas the pipeline-level fire count and total burned area uncertainty incorporates upstream strike-count and ignition stochasticity.",
+    locations = cells_column_labels(columns = "Burned area | 1 ignition")
+  )
+
+gt_tbl
+```
+
+```{r}
+ignition_class_table <- tibble(
+  metric = c("Observed event prevalence", "PR AUC", "ROC AUC", "Brier score"),
+  `Ignition efficiency` = c(format_plain(prevalence, 3), ignition_class_fmt$pr_auc, ignition_class_fmt$roc_auc, ignition_class_fmt$brier)
+)
+
+ignition_class_gt <- ignition_class_table %>%
+  gt(rowname_col = "metric") %>%
+  tab_header(title = "Ignition efficiency: classification-based performance (test set)") %>%
+  tab_footnote(
+    footnote = "These metrics are used to compare modeled probability predictions (ignition efficency) with a binary outcome (fire occurred during a gridcell-months with at least one observed strike). Observed event prevalence: the fraction of gridcell-months where a fire ocurred. PR AUC: a value greater than the observed event prevalence indicates that the model outperforms a random baseline; informative when positive cases (fire occurrence) are rare. ROC AUC: probability that the model ranks a randomly chosen fire-occurrence month above a randomly chosen non-occurrence month (0.5 = no better than chance, 1.0 = perfect discrimination). Brier score: mean squared error between predicted probability and the binary outcome (0 = perfect, 0.25 = performance of a coin-flip classifier on a balanced dataset; lower is better). All model values are the mean and 95\\% interval across 500 posterior draws; observed prevalence is a single fixed value.",
+    locations = cells_title()
+  )
+
+ignition_class_gt
+```
+
+
+```{r}
+library(stringr)
+export_table_body_only <- function(gt_object, out_path) {
+  raw_tex <- as.character(gt::as_latex(gt_object))
+
+  # Extract ONLY the tabular/tabular* environment -- no float, no caption,
+  # no gt-default fontsize wrapper, no footnote minipage. Plain base-R
+  # regex, no glue() -- glue's {...} interpolation syntax is exactly what
+  # broke on LaTeX's own dense brace-nesting last time.
+  tabular_body <- regmatches(
+    raw_tex,
+    regexpr("\\\\begin\\{tabular\\*?\\}[\\s\\S]*?\\\\end\\{tabular\\*?\\}", raw_tex, perl = TRUE)
+  )
+
+  writeLines(tabular_body, out_path)
+  invisible(tabular_body)
+}
+
+export_table_body_only(gt_tbl, "metrics_table_body.tex")
+export_table_body_only(ignition_class_gt, "ignition_table_body.tex")
+```
+
+
+

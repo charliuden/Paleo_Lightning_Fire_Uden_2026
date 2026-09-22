@@ -1,0 +1,838 @@
+---
+title: "calibration to training period comparison plots"
+author: "Charlotte Uden"
+date: "2026-09-03"
+output: html_document
+---
+
+Across the training period and calibration period:
+
+1. stacked plos for lightning count, fire count, and burned area predictions and observations. Compare per-gridcell annual totals across time (each point is shown, rather than a boxplot or mean), for each year. Color by: training period predictions and observations, calibration period predictions from trace and era5, along with thunderstorm counts across teh calibration period and training period, fire count and burned area predictions (these will be annual totals across alaska, no location-specific values). The scale for calibration period observational thunderstorm data, should be on the right y-axis of the plots, since it will be a different variable to the predicted data - annual total thunderstorm count by location. FIre count and burned area calibration period observations during the calibration are not spatially explicit, so a single total per year will be plotted. Again, this should be on the right-hand y axis since it will be at a different scale form predicted fire cound and burned area data (spatialll explicit, one point per year-gridcell)
+2. To the right of each plot will be density plots, colored by training period observations and predictions, calibration period predictions from era5 and trace, and observations from calibration period. Again, since observational data during the calibration period is only reported as annual totals for thunderstorm (though spatially explicit), burned area it may make sense to have their scales on the right-hand axis. OR, perhaps these should be depicted on separate plots? ie. transform calibration period predictions to match the scale of the calibration period observations: annual total burned area and fire count. Thunderstorm data will never be directly comparable to the lightning data since they are different variables. But a right-hand y-axis for thunderstorm would help look at distrubtion compatability. 
+
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+modern_fire_stats_root <- config[["modern_fire_stats_root"]]
+calibration_thunderstorm <- config[["calibration_thunderstorm"]]
+```
+
+```{r}
+thunder_obs <- read.csv(file.path(calibration_thunderstorm, "thunderstorms_1950-2011.csv"))
+
+calib_fire_obs <- read.csv(file.path(modern_fire_stats_root, "alaska_lightning_fires_1950_1989.csv"))
+
+calib_pred_trace <- read.csv(file.path(predictions_root, "calibration_period_TRACE_predictions.csv"))
+calib_pred_era <- read.csv(file.path(predictions_root, "calibration_period_ERA5_predictions.csv"))
+
+train_pred_obs <- read.csv(file.path(predictions_root, "predictions_2002_2011_mixture.csv")) 
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+
+# ── 1. Aggregate to gridcell-year annual totals ────────────────────────────
+# All prediction datasets are gridcell-month resolution; sum across JJA
+# months within each gridcell-year to get one point per gridcell per year.
+
+train_annual <- train_pred_obs %>%
+  group_by(lat, lon, year, month) %>%
+  summarise(
+    n_strikes_obs   = sum(n_strikes_obs,        na.rm = TRUE),
+    n_strikes_pred  = sum(n_strikes,             na.rm = TRUE),
+    fire_count_obs  = sum(fire_count,            na.rm = TRUE),
+    fire_count_pred = sum(fire_count_pred,       na.rm = TRUE),
+    burned_km2_obs  = sum(burned_area_km2_total, na.rm = TRUE),
+    burned_km2_pred = sum(total_burned_area,     na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    burned_acres_obs  = burned_km2_obs  * 247.105,   # km2 -> acres
+    burned_acres_pred = burned_km2_pred * 247.105
+  )
+
+calib_annual <- bind_rows(
+  calib_pred_era %>%
+    group_by(lat, lon, year, month) %>%
+    summarise(
+      n_strikes_pred    = sum(n_strikes,                       na.rm = TRUE),
+      fire_count_pred   = sum(fire_count_pred,                 na.rm = TRUE),
+      burned_acres_pred = sum(total_burned_area_acres_capped,  na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(driver = "ERA5"),
+  calib_pred_trace %>%
+    group_by(lat, lon, year, month) %>%
+    summarise(
+      n_strikes_pred    = sum(n_strikes,                       na.rm = TRUE),
+      fire_count_pred   = sum(fire_count_pred,                 na.rm = TRUE),
+      burned_acres_pred = sum(total_burned_area_acres_capped,  na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(driver = "TraCE")
+) %>%
+  filter(year >= 1950, year <= 1989)  # drop spin-up year(s) used only for lags
+
+# Calibration-period observations — annual totals only, not gridded
+calib_fire_obs_annual <- calib_fire_obs %>%
+  select(year, fire_count, burned_acres) %>%
+  mutate(period_group = "calibration")
+
+# Statewide thunderstorm-day totals, per year (spans both periods)
+# Drop the 1990-2001 gap year(s), which fall between the calibration period
+# (ending 1989) and the training period (starting 2002), so as not to plot
+# thunderstorm data for a span with no corresponding model predictions.
+thunder_annual <- thunder_obs %>%
+  group_by(YEAR) %>%
+  summarise(thunder_total = sum(thunderstorm_days, na.rm = TRUE), .groups = "drop") %>%
+  rename(year = YEAR) %>%
+  filter(year <= 1989 | year >= 2002) %>%
+  mutate(period_group = if_else(year <= 1989, "calibration", "training"))
+
+
+# ── 2. Helper: one row for a given variable ─────────────────────────────────
+
+make_row <- function(scatter_df, right_df, right_var,
+                      y_lab, right_lab, title, group_colors) {
+
+  left_max  <- max(scatter_df$value, na.rm = TRUE)
+  right_max <- max(right_df[[right_var]], na.rm = TRUE)
+  scale_factor <- left_max / right_max
+
+  right_df <- right_df %>% mutate(scaled_value = .data[[right_var]] * scale_factor)
+
+  # All years present across both series, for light per-year gridlines
+  all_years <- sort(unique(c(scatter_df$year, right_df$year)))
+  year_range <- range(all_years)
+  five_yr_breaks <- seq(
+    from = 5 * floor(year_range[1] / 5),
+    to   = 5 * ceiling(year_range[2] / 5),
+    by   = 5
+  )
+
+  p_main <- ggplot() +
+    geom_vline(xintercept = all_years, color = "grey90", linewidth = 0.3) +
+    geom_jitter(data = scatter_df, aes(x = year, y = value, color = group),
+                width = 0.15, alpha = 0.35, size = 0.8) +
+    geom_line(data = right_df, aes(x = year, y = scaled_value, group = period_group),
+              color = "grey20", linewidth = 0.3, linetype = "dashed") +
+    geom_point(data = right_df, aes(x = year, y = scaled_value),
+               color = "grey20", size = 0.9, shape = 21, fill = "white") +
+    scale_color_manual(values = group_colors) +
+    scale_x_continuous(breaks = five_yr_breaks) +
+    scale_y_continuous(
+      name = y_lab,
+      sec.axis = sec_axis(~ . / scale_factor, name = right_lab)
+    ) +
+    guides(color = guide_legend(override.aes = list(alpha = 1, size = 2.5))) +
+    labs(x = NULL, title = title, color = NULL) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank()  # replaced by the per-year geom_vline
+    )
+
+  p_main
+}
+
+group_colors <- c(
+  "Training: observed"  = "black",
+  "Training: ERA5 predicted" = "#4C72B0",
+  "Calibration: ERA5 predicted"   = "#DD8452",
+  "Calibration: TraCE predicted"  = "#55A868"
+)
+
+# ── 3. Row 1 — Lightning ─────────────────────────────────────────────────
+
+lightning_scatter <- bind_rows(
+  train_annual %>% transmute(year, value = n_strikes_obs,  group = "Training: observed"),
+  train_annual %>% transmute(year, value = n_strikes_pred, group = "Training: ERA5 predicted"),
+  calib_annual %>% filter(driver == "ERA5")  %>% transmute(year, value = n_strikes_pred, group = "Calibration: ERA5 predicted"),
+  calib_annual %>% filter(driver == "TraCE") %>% transmute(year, value = n_strikes_pred, group = "Calibration: TraCE predicted")
+)
+
+row_lightning <- make_row(lightning_scatter, thunder_annual, "thunder_total",
+  y_lab = "Lightning strike count",
+  right_lab = "Thunderstorm days (statewide total)",
+  title = "Lightning", group_colors = group_colors)
+
+# ── 4. Row 2 — Fire count ────────────────────────────────────────────────
+
+fire_scatter <- bind_rows(
+  train_annual %>% transmute(year, value = fire_count_obs,  group = "Training: observed"),
+  train_annual %>% transmute(year, value = fire_count_pred, group = "Training: ERA5 predicted"),
+  calib_annual %>% filter(driver == "ERA5")  %>% transmute(year, value = fire_count_pred, group = "Calibration: ERA5 predicted"),
+  calib_annual %>% filter(driver == "TraCE") %>% transmute(year, value = fire_count_pred, group = "Calibration: TraCE predicted")
+)
+
+row_fire <- make_row(fire_scatter, calib_fire_obs_annual, "fire_count",
+  y_lab = "Fire count",
+  right_lab = "Historical fire count (statewide total)",
+  title = "Fire Count", group_colors = group_colors)
+
+# ── 5. Row 3 — Burned area (acres) ───────────────────────────────────────
+
+burned_scatter <- bind_rows(
+  train_annual %>% transmute(year, value = burned_acres_obs,  group = "Training: observed"),
+  train_annual %>% transmute(year, value = burned_acres_pred, group = "Training: ERA5 predicted"),
+  calib_annual %>% filter(driver == "ERA5")  %>% transmute(year, value = burned_acres_pred, group = "Calibration: ERA5 predicted"),
+  calib_annual %>% filter(driver == "TraCE") %>% transmute(year, value = burned_acres_pred, group = "Calibration: TraCE predicted")
+)
+
+row_burned <- make_row(burned_scatter, calib_fire_obs_annual, "burned_acres",
+  y_lab = "Burned acres",
+  right_lab = "Historical burned acres (statewide total)",
+  title = "Burned Area", group_colors = group_colors)
+
+# ── 6. Stack into one figure ─────────────────────────────────────────────
+
+final_fig <- row_lightning / row_fire / row_burned +
+  plot_annotation(tag_levels = "A")
+
+final_fig
+```
+
+```{r}
+
+ggsave("model_performance_training_calibration.png", final_fig, width = 12, height = 12, dpi = 300)
+
+```
+
+Plot annual totals over time:
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+
+# ── 1. Aggregate to STATEWIDE annual totals ────────────────────────────────
+# (sum across all gridcells within each year, on top of the gridcell-year
+# totals already computed in train_annual / calib_annual)
+
+train_statewide <- train_annual %>%
+  group_by(year) %>%
+  summarise(
+    n_strikes_obs   = sum(n_strikes_obs,   na.rm = TRUE),
+    n_strikes_pred  = sum(n_strikes_pred,  na.rm = TRUE),
+    fire_count_obs  = sum(fire_count_obs,  na.rm = TRUE),
+    fire_count_pred = sum(fire_count_pred, na.rm = TRUE),
+    burned_acres_obs  = sum(burned_acres_obs,  na.rm = TRUE),
+    burned_acres_pred = sum(burned_acres_pred, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+calib_statewide <- calib_annual %>%
+  group_by(year, driver) %>%
+  summarise(
+    n_strikes_pred    = sum(n_strikes_pred,    na.rm = TRUE),
+    fire_count_pred   = sum(fire_count_pred,   na.rm = TRUE),
+    burned_acres_pred = sum(burned_acres_pred, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Calibration-period observations are already statewide annual totals
+calib_fire_obs_annual <- calib_fire_obs %>%
+  select(year, fire_count, burned_acres) %>%
+  mutate(period_group = "calibration")
+
+thunder_annual <- thunder_obs %>%
+  group_by(YEAR) %>%
+  summarise(thunder_total = sum(thunderstorm_days, na.rm = TRUE), .groups = "drop") %>%
+  rename(year = YEAR)%>%
+  filter(year <= 1989 | year >= 2002) %>%
+  mutate(period_group = if_else(year <= 1989, "calibration", "training"))
+
+group_colors <- c(
+  "Training: observed"  = "black",
+  "Training: ERA5 predicted" = "#4C72B0",
+  "Calibration: ERA5 predicted"   = "#DD8452",
+  "Calibration: TraCE predicted"  = "#55A868"
+)
+
+# ── 2. Helper: one totals panel with an optional secondary-axis series ─────
+
+make_totals_panel <- function(pred_df, right_df = NULL, right_var = NULL,
+                               y_lab, right_lab = NULL, title) {
+
+  p <- ggplot()
+
+  # All years present, for light per-year gridlines and 5-year x-axis breaks
+  all_years <- sort(unique(c(pred_df$year, right_df$year)))
+  year_range <- range(all_years)
+  five_yr_breaks <- seq(
+    from = 5 * floor(year_range[1] / 5),
+    to   = 5 * ceiling(year_range[2] / 5),
+    by   = 5
+  )
+
+  if (!is.null(right_df)) {
+    scale_factor <- max(pred_df$value, na.rm = TRUE) / max(right_df[[right_var]], na.rm = TRUE)
+    right_df <- right_df %>% mutate(scaled_value = .data[[right_var]] * scale_factor)
+    if (!"period_group" %in% names(right_df)) right_df$period_group <- "all"
+
+    p <- p +
+      geom_line(data = right_df, aes(x = year, y = scaled_value, group = period_group),
+                color = "grey30", linewidth = 0.6, linetype = "dashed") +
+      geom_point(data = right_df, aes(x = year, y = scaled_value),
+                 color = "grey30", size = 1.8, shape = 21, fill = "white")
+  }
+
+  p <- p +
+    geom_line(data = pred_df, aes(x = year, y = value, color = group), linewidth = 0.7) +
+    geom_point(data = pred_df, aes(x = year, y = value, color = group), size = 1.4) +
+    scale_color_manual(values = group_colors) +
+    scale_x_continuous(breaks = five_yr_breaks) +
+    labs(x = NULL, y = y_lab, title = title, color = NULL) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+
+  if (!is.null(right_df)) {
+    p <- p + scale_y_continuous(
+      name = y_lab,
+      sec.axis = sec_axis(~ . / scale_factor, name = right_lab)
+    )
+  }
+
+  p
+}
+
+# ── 3. Row 1 — Lightning ────────────────────────────────────────────────
+
+lightning_totals <- bind_rows(
+  train_statewide %>% transmute(year, value = n_strikes_obs,  group = "Training: observed"),
+  train_statewide %>% transmute(year, value = n_strikes_pred, group = "Training: ERA5 predicted"),
+  calib_statewide %>% filter(driver == "ERA5")  %>% transmute(year, value = n_strikes_pred, group = "Calibration: ERA5 predicted"),
+  calib_statewide %>% filter(driver == "TraCE") %>% transmute(year, value = n_strikes_pred, group = "Calibration: TraCE predicted")
+)
+
+row_lightning <- make_totals_panel(
+  lightning_totals, thunder_annual, "thunder_total",
+  y_lab = "Lightning strikes (statewide total)",
+  right_lab = "Thunderstorm days (statewide total)",
+  title = "Lightning"
+)
+
+# ── 4. Row 2 — Fire count ───────────────────────────────────────────────
+
+fire_totals <- bind_rows(
+  train_statewide %>% transmute(year, value = fire_count_obs,  group = "Training: observed"),
+  train_statewide %>% transmute(year, value = fire_count_pred, group = "Training: ERA5 predicted"),
+  calib_statewide %>% filter(driver == "ERA5")  %>% transmute(year, value = fire_count_pred, group = "Calibration: ERA5 predicted"),
+  calib_statewide %>% filter(driver == "TraCE") %>% transmute(year, value = fire_count_pred, group = "Calibration: TraCE predicted")
+)
+
+row_fire <- make_totals_panel(
+  fire_totals, calib_fire_obs_annual, "fire_count",
+  y_lab = "Fire count (statewide total)",
+  right_lab = "Historical fire count (statewide total)",
+  title = "Fire Count"
+)
+
+# ── 5. Row 3 — Burned area (acres) ──────────────────────────────────────
+
+burned_totals <- bind_rows(
+  train_statewide %>% transmute(year, value = burned_acres_obs,  group = "Training: observed"),
+  train_statewide %>% transmute(year, value = burned_acres_pred, group = "Training: ERA5 predicted"),
+  calib_statewide %>% filter(driver == "ERA5")  %>% transmute(year, value = burned_acres_pred, group = "Calibration: ERA5 predicted"),
+  calib_statewide %>% filter(driver == "TraCE") %>% transmute(year, value = burned_acres_pred, group = "Calibration: TraCE predicted")
+)
+
+row_burned <- make_totals_panel(
+  burned_totals, calib_fire_obs_annual, "burned_acres",
+  y_lab = "Burned acres (tatewide total)",
+  right_lab = "Historical acres (statewide total)",
+  title = "Burned Area"
+)
+
+# ── 6. Stack into one figure ────────────────────────────────────────────
+
+final_fig <- row_lightning / row_fire / row_burned +
+  plot_annotation(tag_levels = "A")
+
+final_fig
+ggsave("model_totals_training_calibration_annual_totals.png", final_fig, width = 10, height = 12, dpi = 300)
+```
+
+
+
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(gridExtra)
+library(grid)
+
+group_colors <- c(
+  "Training: observed"          = "black",
+  "Training: ERA5 predicted"    = "#4C72B0",
+  "Calibration: ERA5 predicted"  = "#DD8452",
+  "Calibration: TraCE predicted" = "#55A868"
+)
+
+# ── Helper: histogram with table inset in the top-right corner ────────────
+
+build_trimmed_histogram <- function(df, x_lab, title, group_colors,
+                                     trim_pct = 0.99, bins = 40, show_legend = TRUE,
+                                     tag_label = NULL) {
+
+  df_nonzero_full <- df %>% filter(value > 0)
+
+  summary_tbl <- df %>%
+    group_by(group) %>%
+    summarise(
+      pct_zero = round(100 * mean(value == 0, na.rm = TRUE), 1),
+      mean_val = round(mean(value[value > 0], na.rm = TRUE), 1),
+      var_val  = scales::comma(round(var(value[value > 0], na.rm = TRUE), 1)),
+      max_val  = scales::comma(round(max(value, na.rm = TRUE))),
+      .groups = "drop"
+    ) %>%
+    rename(Dataset = group, `% Zero` = pct_zero, Mean = mean_val,
+           Variance = var_val, `Max Value` = max_val)
+
+  row_colors <- group_colors[summary_tbl$Dataset]
+  tbl_theme <- ttheme_minimal(
+    core = list(fg_params = list(col = c(row_colors, rep("black", nrow(summary_tbl) * 4)),
+                                  hjust = 0, x = 0.05, fontsize = 7),
+                bg_params = list(fill = "white", col = NA, alpha = 0.85)),
+    colhead = list(fg_params = list(fontface = "bold", fontsize = 7),
+                   bg_params = list(fill = "white", col = NA, alpha = 0.85)),
+    padding = unit(c(3, 1.5), "mm")
+  )
+  tbl_grob <- tableGrob(summary_tbl, rows = NULL, theme = tbl_theme)
+
+  cutoff <- quantile(df_nonzero_full$value, trim_pct, na.rm = TRUE)
+  df_trimmed <- df_nonzero_full %>% filter(value <= cutoff)
+  n_dropped <- nrow(df_nonzero_full) - nrow(df_trimmed)
+  pct_dropped <- round(100 * n_dropped / nrow(df_nonzero_full), 1)
+
+  binwidth <- diff(range(df_trimmed$value, na.rm = TRUE)) / bins
+  is_discrete <- all(df_trimmed$value == round(df_trimmed$value)) &&
+    length(unique(df_trimmed$value)) < 40
+  if (is_discrete) binwidth <- 1
+
+  p <- ggplot(df_trimmed, aes(x = value, fill = group)) +
+    geom_histogram(aes(y = after_stat(count)), binwidth = binwidth,
+                    boundary = if (is_discrete) -0.5 else 0,
+                    position = position_dodge2(preserve = "single", padding = 0.1),
+                    color = "grey20", linewidth = 0.15) +
+    scale_fill_manual(values = group_colors) +
+    scale_x_continuous(labels = scales::comma) +
+    labs(x = x_lab,
+         y = "Count",
+         tag = tag_label,
+         subtitle = paste0("Histogram trimmed at ", scales::percent(trim_pct),
+                            " percentile (", pct_dropped, "% of nonzero points above ",
+                            scales::comma(round(cutoff)), " excluded from view)"),
+         fill = NULL) +
+    theme_minimal() +
+    theme(legend.position = if (show_legend) "bottom" else "none",
+          plot.subtitle = element_text(size = 7.5, color = "grey40"),
+          plot.tag = element_text(size = 12, face = "bold"))
+
+  # Inset the table in the top-right corner of the histogram panel.
+  # left/right/top/bottom are in NPC-like units (0-1 relative to the panel);
+  # adjust these four numbers to reposition/resize the table.
+  # ignore_tag = TRUE keeps the inset table out of patchwork's auto-tagging,
+  # though tagging is now handled manually via labs(tag = ...) above anyway.
+  p_with_table <- p +
+    inset_element(tbl_grob, left = 0.45, right = 1.0, top = 1.0, bottom = 0.62,
+                  align_to = "panel", ignore_tag = TRUE)
+
+  list(combined = p_with_table, x_lab = x_lab, title = title)
+}
+
+# ── 1. Lightning ──────────────────────────────────────────────────────────
+
+lightning_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = n_strikes_obs, group = "Training: observed"),
+  train_pred_obs %>% transmute(value = n_strikes,     group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = n_strikes,    group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = n_strikes,   group = "Calibration: TraCE predicted")
+)
+
+light_parts <- build_trimmed_histogram(lightning_gmy, "Lightning strikes (nonzero only)",
+                                        "Lightning", group_colors, show_legend = FALSE,
+                                        tag_label = "a)")
+
+# ── 2. Fire count ─────────────────────────────────────────────────────────
+
+fire_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = fire_count,      group = "Training: observed"),
+  train_pred_obs %>% transmute(value = fire_count_pred, group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = fire_count_pred, group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = fire_count_pred, group = "Calibration: TraCE predicted")
+)
+
+fire_parts <- build_trimmed_histogram(fire_gmy, "Fire count (nonzero only)",
+                                       "Fire Count", group_colors, show_legend = FALSE,
+                                       tag_label = "b)")
+
+# ── 3. Burned area (acres) ──────────────────────────────────────────────
+
+burned_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = burned_area_km2_total * 247.105, group = "Training: observed"),
+  train_pred_obs %>% transmute(value = total_burned_area * 247.105,     group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = total_burned_area_acres_capped, group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = total_burned_area_acres_capped, group = "Calibration: TraCE predicted")
+)
+
+burned_parts <- build_trimmed_histogram(burned_gmy, "Burned area (acres, nonzero only)",
+                                         "Burned Area", group_colors, trim_pct = 0.95, show_legend = TRUE,
+                                         tag_label = "c)")
+
+# ── 4. Combine — stacked vertically, one panel per variable ───────────────
+# Tags are set manually via labs(tag = ...) inside build_trimmed_histogram(),
+# so no tag_levels/tag_suffix here — that avoids patchwork's automatic
+# panel-counting picking up the inset tables as extra taggable panels.
+
+final_fig <- (light_parts$combined / fire_parts$combined / burned_parts$combined) +
+  plot_annotation()
+
+final_fig
+ggsave("histogram_trimmed_inset_table.png", final_fig, width = 9, height = 9, dpi = 300)
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(gridExtra)
+library(grid)
+
+group_colors <- c(
+  "Training: observed"          = "black",
+  "Training: ERA5 predicted"    = "#4C72B0",
+  "Calibration: ERA5 predicted"  = "#DD8452",
+  "Calibration: TraCE predicted" = "#55A868"
+)
+
+# ── Helper: histogram with table inset in the top-right corner ────────────
+
+build_trimmed_histogram <- function(df, x_lab, title, group_colors,
+                                     trim_pct = 0.99, bins = 40, show_legend = TRUE,
+                                     tag_label = NULL) {
+
+  df_nonzero_full <- df %>% filter(value > 0)
+
+  summary_tbl <- df %>%
+    group_by(group) %>%
+    summarise(
+      pct_zero = round(100 * mean(value == 0, na.rm = TRUE), 1),
+      mean_val = round(mean(value[value > 0], na.rm = TRUE), 4),
+      var_val  = scales::comma(round(var(value[value > 0], na.rm = TRUE), 4)),
+      max_val  = scales::comma(round(max(value, na.rm = TRUE), 4)),
+      .groups = "drop"
+    ) %>%
+    rename(Dataset = group, `% Zero` = pct_zero, Mean = mean_val,
+           Variance = var_val, `Max Value` = max_val)
+
+  row_colors <- group_colors[summary_tbl$Dataset]
+  tbl_theme <- ttheme_minimal(
+    core = list(fg_params = list(col = c(row_colors, rep("black", nrow(summary_tbl) * 4)),
+                                  hjust = 0, x = 0.05, fontsize = 7),
+                bg_params = list(fill = "white", col = NA, alpha = 0.85)),
+    colhead = list(fg_params = list(fontface = "bold", fontsize = 7),
+                   bg_params = list(fill = "white", col = NA, alpha = 0.85)),
+    padding = unit(c(3, 1.5), "mm")
+  )
+  tbl_grob <- tableGrob(summary_tbl, rows = NULL, theme = tbl_theme)
+
+  cutoff <- quantile(df_nonzero_full$value, trim_pct, na.rm = TRUE)
+  df_trimmed <- df_nonzero_full %>% filter(value <= cutoff)
+  n_dropped <- nrow(df_nonzero_full) - nrow(df_trimmed)
+  pct_dropped <- round(100 * n_dropped / nrow(df_nonzero_full), 1)
+
+  binwidth <- diff(range(df_trimmed$value, na.rm = TRUE)) / bins
+  is_discrete <- all(df_trimmed$value == round(df_trimmed$value)) &&
+    length(unique(df_trimmed$value)) < 40
+  if (is_discrete) binwidth <- 1
+
+  p <- ggplot(df_trimmed, aes(x = value, fill = group)) +
+    geom_histogram(aes(y = after_stat(count)), binwidth = binwidth,
+                    boundary = if (is_discrete) -0.5 else 0,
+                    position = position_dodge2(preserve = "single", padding = 0.1),
+                    color = "grey20", linewidth = 0.15) +
+    scale_fill_manual(values = group_colors) +
+    scale_x_continuous(labels = scales::comma) +
+    labs(x = x_lab,
+         y = "Count",
+         tag = tag_label,
+         subtitle = paste0("Histogram trimmed at ", scales::percent(trim_pct),
+                            " percentile (", pct_dropped, "% of nonzero points above ",
+                            scales::comma(round(cutoff, 4)), " excluded from view)"),
+         fill = NULL) +
+    theme_minimal() +
+    theme(legend.position = if (show_legend) "bottom" else "none",
+          plot.subtitle = element_text(size = 7.5, color = "grey40"),
+          plot.tag = element_text(size = 12, face = "bold"))
+
+  p_with_table <- p +
+    inset_element(tbl_grob, left = 0.45, right = 1.0, top = 1.0, bottom = 0.62,
+                  align_to = "panel", ignore_tag = TRUE)
+
+  list(combined = p_with_table, x_lab = x_lab, title = title)
+}
+
+# ── 1. Lightning strike count ──────────────────────────────────────────────
+
+lightning_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = n_strikes_obs, group = "Training: observed"),
+  train_pred_obs %>% transmute(value = n_strikes,     group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = n_strikes,    group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = n_strikes,   group = "Calibration: TraCE predicted")
+)
+
+light_parts <- build_trimmed_histogram(lightning_gmy, "Lightning strikes (nonzero only)",
+                                        "Lightning", group_colors, show_legend = FALSE,
+                                        tag_label = "a)")
+
+# ── 2. Lightning strike rate (strikes/km2/month) ───────────────────────────
+
+rate_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = r_strike_obs, group = "Training: observed"),
+  train_pred_obs %>% transmute(value = r_strike,     group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = r_strike,    group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = r_strike,   group = "Calibration: TraCE predicted")
+)
+
+rate_parts <- build_trimmed_histogram(rate_gmy, "Lightning strike rate (strikes/km2/month, nonzero only)",
+                                       "Strike Rate", group_colors, show_legend = FALSE,
+                                       tag_label = "b)")
+
+# ── 3. Fire count ─────────────────────────────────────────────────────────
+
+fire_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = fire_count,      group = "Training: observed"),
+  train_pred_obs %>% transmute(value = fire_count_pred, group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = fire_count_pred, group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = fire_count_pred, group = "Calibration: TraCE predicted")
+)
+
+fire_parts <- build_trimmed_histogram(fire_gmy, "Fire count (nonzero only)",
+                                       "Fire Count", group_colors, show_legend = FALSE,
+                                       tag_label = "c)")
+
+# ── 4. Burned area (acres) ──────────────────────────────────────────────
+
+burned_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = burned_area_km2_total * 247.105, group = "Training: observed"),
+  train_pred_obs %>% transmute(value = total_burned_area * 247.105,     group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = total_burned_area_acres_capped, group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = total_burned_area_acres_capped, group = "Calibration: TraCE predicted")
+)
+
+burned_parts <- build_trimmed_histogram(burned_gmy, "Burned area (acres, nonzero only)",
+                                         "Burned Area", group_colors, trim_pct = 0.95, show_legend = TRUE,
+                                         tag_label = "d)")
+
+# ── 5. Combine — stacked vertically, one panel per variable ───────────────
+
+final_fig <- (light_parts$combined / rate_parts$combined / fire_parts$combined / burned_parts$combined) +
+  plot_annotation()
+
+final_fig
+ggsave("histogram_trimmed_inset_table_with_rate.png", final_fig, width = 9, height = 12, dpi = 300)
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(gridExtra)
+library(grid)
+
+group_colors <- c(
+  "Training: observed"          = "black",
+  "Training: ERA5 predicted"    = "#4C72B0",
+  "Calibration: ERA5 predicted"  = "#DD8452",
+  "Calibration: TraCE predicted" = "#55A868"
+)
+
+# ── Helper: histogram with table inset in the top-right corner ────────────
+
+build_trimmed_histogram <- function(df, x_lab, title, group_colors,
+                                     trim_pct = 0.99, bins = 40, show_legend = TRUE,
+                                     tag_label = NULL, remove_zeros = TRUE) {
+
+  # % zero is always computed on the full data, regardless of remove_zeros,
+  # so the table stays informative either way.
+  summary_tbl_base <- df %>%
+    group_by(group) %>%
+    summarise(pct_zero = round(100 * mean(value == 0, na.rm = TRUE), 1), .groups = "drop")
+
+  # Base population for the histogram/mean/variance/max: nonzero only, or
+  # everything, depending on remove_zeros.
+  df_base <- if (remove_zeros) df %>% filter(value > 0) else df
+
+  summary_tbl <- df_base %>%
+    group_by(group) %>%
+    summarise(
+      mean_val = round(mean(value, na.rm = TRUE), 4),
+      var_val  = scales::comma(round(var(value, na.rm = TRUE), 4)),
+      max_val  = scales::comma(round(max(value, na.rm = TRUE), 4)),
+      .groups = "drop"
+    ) %>%
+    left_join(summary_tbl_base, by = "group") %>%
+    rename(Dataset = group, `% Zero` = pct_zero, Mean = mean_val,
+           Variance = var_val, `Max Value` = max_val) %>%
+    select(Dataset, `% Zero`, Mean, Variance, `Max Value`)
+
+  row_colors <- group_colors[summary_tbl$Dataset]
+  tbl_theme <- ttheme_minimal(
+    core = list(fg_params = list(col = c(row_colors, rep("black", nrow(summary_tbl) * 4)),
+                                  hjust = 0, x = 0.05, fontsize = 7),
+                bg_params = list(fill = "white", col = NA, alpha = 0.85)),
+    colhead = list(fg_params = list(fontface = "bold", fontsize = 7),
+                   bg_params = list(fill = "white", col = NA, alpha = 0.85)),
+    padding = unit(c(3, 1.5), "mm")
+  )
+  tbl_grob <- tableGrob(summary_tbl, rows = NULL, theme = tbl_theme)
+
+  cutoff <- quantile(df_base$value, trim_pct, na.rm = TRUE)
+  df_trimmed <- df_base %>% filter(value <= cutoff)
+  n_dropped <- nrow(df_base) - nrow(df_trimmed)
+  pct_dropped <- round(100 * n_dropped / nrow(df_base), 1)
+
+  binwidth <- diff(range(df_trimmed$value, na.rm = TRUE)) / bins
+  is_discrete <- all(df_trimmed$value == round(df_trimmed$value)) &&
+    length(unique(df_trimmed$value)) < 40
+  if (is_discrete) binwidth <- 1
+
+  trimmed_pop_label <- if (remove_zeros) "nonzero points" else "points"
+
+  p <- ggplot(df_trimmed, aes(x = value, fill = group)) +
+    geom_histogram(aes(y = after_stat(count)), binwidth = binwidth,
+                    boundary = if (is_discrete) -0.5 else 0,
+                    position = position_dodge2(preserve = "single", padding = 0.1),
+                    color = "grey20", linewidth = 0.15) +
+    scale_fill_manual(values = group_colors) +
+    scale_x_continuous(labels = scales::comma) +
+    labs(x = x_lab,
+         y = "Count",
+         tag = tag_label,
+         subtitle = paste0("Histogram trimmed at ", scales::percent(trim_pct),
+                            " percentile (", pct_dropped, "% of ", trimmed_pop_label, " above ",
+                            scales::comma(round(cutoff, 4)), " excluded from view)"),
+         fill = NULL) +
+    theme_minimal() +
+    theme(legend.position = if (show_legend) "bottom" else "none",
+          plot.subtitle = element_text(size = 7.5, color = "grey40"),
+          plot.tag = element_text(size = 12, face = "bold"))
+
+  p_with_table <- p +
+    inset_element(tbl_grob, left = 0.45, right = 1.0, top = 1.0, bottom = 0.62,
+                  align_to = "panel", ignore_tag = TRUE)
+
+  list(combined = p_with_table, x_lab = x_lab, title = title)
+}
+
+# ── 1. Lightning strike rate (zeros KEPT) ──────────────────────────────────
+
+rate_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = r_strike_obs, group = "Training: observed"),
+  train_pred_obs %>% transmute(value = r_strike,     group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = r_strike,    group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = r_strike,   group = "Calibration: TraCE predicted")
+)
+
+rate_parts <- build_trimmed_histogram(rate_gmy, "Lightning strike rate (strikes/km2/month)",
+                                       "Strike Rate", group_colors, show_legend = FALSE,
+                                       tag_label = "a)", remove_zeros = FALSE)
+
+# ── 2. Lightning strike count (zeros removed, as before) ──────────────────
+
+lightning_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = n_strikes_obs, group = "Training: observed"),
+  train_pred_obs %>% transmute(value = n_strikes,     group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = n_strikes,    group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = n_strikes,   group = "Calibration: TraCE predicted")
+)
+
+light_parts <- build_trimmed_histogram(lightning_gmy, "Lightning strikes (nonzero only)",
+                                        "Lightning", group_colors, show_legend = FALSE,
+                                        tag_label = "b)")
+
+
+# ── 3. Fire count (zeros removed) ──────────────────────────────────────────
+
+fire_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = fire_count,      group = "Training: observed"),
+  train_pred_obs %>% transmute(value = fire_count_pred, group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = fire_count_pred, group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = fire_count_pred, group = "Calibration: TraCE predicted")
+)
+
+fire_parts <- build_trimmed_histogram(fire_gmy, "Fire count (nonzero only)",
+                                       "Fire Count", group_colors, show_legend = FALSE,
+                                       tag_label = "c)")
+
+# ── 4. Burned area (acres, zeros removed) ──────────────────────────────────
+
+burned_gmy <- bind_rows(
+  train_pred_obs %>% transmute(value = burned_area_km2_total * 247.105, group = "Training: observed"),
+  train_pred_obs %>% transmute(value = total_burned_area * 247.105,     group = "Training: ERA5 predicted"),
+  calib_pred_era  %>% transmute(value = total_burned_area_acres_capped, group = "Calibration: ERA5 predicted"),
+  calib_pred_trace %>% transmute(value = total_burned_area_acres_capped, group = "Calibration: TraCE predicted")
+)
+
+burned_parts <- build_trimmed_histogram(burned_gmy, "Burned area (acres, nonzero only)",
+                                         "Burned Area", group_colors, trim_pct = 0.95, show_legend = TRUE,
+                                         tag_label = "d)")
+
+# ── 5. Combine — stacked vertically, one panel per variable ───────────────
+
+final_fig <- (rate_parts$combined / light_parts$combined / fire_parts$combined / burned_parts$combined) +
+  plot_annotation()
+
+final_fig
+ggsave("histogram_trimmed_inset_table_with_rate0.png", final_fig, width = 9, height = 12, dpi = 300)
+```
+

@@ -3,6 +3,10 @@ title: "Figure_map"
 output: html_document
 ---
 
+Figure caption:
+Spatial patterns of predicted and observed lightning-ignited fire activity across Alaska (June--August, 2002--2011). Each row compares a pipeline stage's predicted values (left), observed values (center), and bias (predicted -- observed; right). (a--c) Mean lightning strike rate (strikes km\textsuperscript{-2} month\textsuperscript{-1}). (d--f) Mean lightning strike count per gridcell-month. (g--i) Mean ignition probability(rate-calibrated). (j--l) Total fire count. (m--o) Total burned area (km\textsuperscript{2}), restricted to lightning-caused fires in the observed data.
+    
+    
 ```{r}
 library(dplyr)
 library(ggplot2)

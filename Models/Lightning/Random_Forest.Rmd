@@ -1,5 +1,197 @@
 ---
-title: "Random_Forest"
+title: "Random Forest for Strike Rate"
 output: html_document
 ---
 
+```{r}
+library(randomForest)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+Read in drivers
+```{r}
+df <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+head(df)
+summary(df$strikes)
+#remove all zeros
+df <- filter(df, strikes>0)
+
+```
+
+```{r}
+df <- df[c("strikes", "precip", "tair", "wind", "swr", "sp", "rh")]
+
+#check for correlation between variables
+#draw random sample of rows to plot 
+df_sample <- df %>% sample_frac(0.1)
+plot(df_sample)
+
+#apply random forest:
+rf <-randomForest(strikes~.,data=df, ntree=500) 
+print(rf)
+
+#mtry: Number of random variables used in each tree
+# - reducing mtry reduces correlation and strength. 
+# - the oob error rate tells you what value of mtry is optimal
+
+mtry <- tuneRF(df[-1],df$strikes, ntreeTry=500,
+               stepFactor=1.5,improve=0.01, trace=TRUE, plot=TRUE)
+best.m <- mtry[mtry[, 2] == min(mtry[, 2]), 1]
+#looking for mtry for the lowest oob error rate 
+print(mtry)
+print(best.m) 
+
+#apply best mtry to model
+rf <-randomForest(strikes~.,data=df, mtry=best.m, importance=TRUE,ntree=500)
+print(rf)
+
+#Evaluate variable importance
+importance(rf)
+varImpPlot(rf)
+
+
+```
+
+
+# Mean Decrease Accuracy (%IncMSE):
+- remove variables from the model and asses which have the greatest impact on model accuracy.
+- Higher the value of mean decrease accuracy or mean decrease gini score,
+       higher the importance of the variable in the model.
+- tells you effect of randomly shuffling values of a variable on increasing mse of model predictions
+- a higher number indicates that the variable is more important
+
+# Mean Decrease Gini or Increase in Node Purity (IncNodePurity):
+- expresses the change in the homogeneity of the of the groups created by the trees
+     (using the Gini coefficient as a measure).
+- What is expressed is the decrease in said purity if a particular variable
+      has no information. If a variable has no information to begin with,
+      the decrase would be zero. (from: https://www.reagro.org/methods/statistical/randomforest.html)
+
+Save random forest results for later use: 
+```{r}
+rf_results <- importance(rf)
+rf_results <- data.frame(Variable = rownames(rf_results), 
+                     IncMSE = rf_results[, "%IncMSE"],
+                     IncNodePurity = rf_results[, "IncNodePurity"]) 
+# Export
+#write.csv(rf_results, file.path(model_performance, "strike_rate_random_forest_no_zeros.csv), row.names = FALSE)
+```
+
+```{r}
+rf_results <- read.csv(file.path(performance_root, "strike_rate_random_forest_no_zeros.csv"))
+```
+
+```{r}
+#-------------------------
+# IncMSE plot
+#-------------------------
+rf_mse <- rf_results %>%
+  filter(metric == "%IncMSE")
+
+p_mse <- ggplot(rf_mse, aes(x = importance, y = reorder(variable, importance))) +
+  geom_hline(
+    yintercept = seq_along(unique(rf_mse$Variable)),
+    linetype = "dashed",
+    color = "grey75",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    shape = 21,    
+    size = 3,
+    color = "black",
+    stroke = 0.7
+  ) +
+  labs(
+    title = "(a)",
+    x = "%IncMSE",
+    y = NULL,
+    fill = "Training years"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    strip.background = element_blank(),
+    legend.position = "bottom"
+  ) + 
+  theme(legend.position = "none")
+
+
+#-------------------------
+# IncNodePurity plot
+#------------------------
+
+rf_node <- rf_results %>%
+  filter(metric == "IncNodePurity")
+
+p_node <- ggplot(rf_node,
+                 aes(x = importance,
+                     y = reorder(variable, importance))) +
+  geom_hline(
+    yintercept = seq_along(unique(rf_node$Variable)),
+    linetype = "dashed",
+    color = "grey75",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    shape = 21,         # circle with border
+    size = 3,
+    color = "black",
+    stroke = 0.7
+  ) +
+  labs(
+    title = "(b)",
+    x = "IncNodePurity",
+    y = NULL,
+    fill = "Training years"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    strip.background = element_blank(),
+    legend.position = "bottom"
+  )
+
+(p_mse + p_node) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```

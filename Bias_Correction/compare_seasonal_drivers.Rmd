@@ -1,0 +1,2202 @@
+---
+title: "Comparing seasonal trace and era5 data for correction"
+author: "Charlotte Uden"
+date: "2026-06-14"
+output: html_document
+---
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(arrow)
+library(geodata)
+library(terra)
+library(rnaturalearth)
+library(sf)
+library(patchwork)
+library(purrr)
+library(qmap)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+From python file that converted netcdf to parquet:
+Note: TraCE model years are offset from BP/CE. Year 0 in the model = 22000 BP.
+    We convert to approximate CE year: ce_year = model_year - 21950
+    (where 1950 CE = 0 BP = model year 21950)
+
+```{r}
+# Read the TRACE parquet file
+trace <- read_parquet(file.path(paleocliamte_data_root,"trace21ka_processed/trace_lightning_model.parquet"))
+
+names(trace)
+
+range(trace$ce_year)
+# How many unique years, and what's the spacing?
+sort(unique(trace$ce_year))
+
+length(unique(trace$ce_year))
+
+# Any gaps or big jumps?
+summary(diff(sort(unique(trace$ce_year))))
+
+trace %>% filter(ce_year %in% c(49, 90)) %>% distinct(ce_year)
+
+trace_target <- trace %>% filter(ce_year >= 46, ce_year <= 89)
+tail(trace_target)
+
+trace_target <- trace_target %>%
+  mutate(year = ce_year + 1900)
+
+# Sanity check
+range(trace_target$year)
+
+names(trace_target)
+
+```
+
+Map points
+```{r}
+# Get USA polygon
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+# Filter to Alaska only
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+
+# Download SRTM elevation data for Alaska
+# Alaska spans multiple tiles so we download by country
+
+# 1. Download and crop
+elev <- geodata::elevation_global(res = 10, path = tempdir())
+alaska_ext <- ext(-170, -130, 51, 72)
+elev_alaska <- crop(elev, alaska_ext)
+
+# 2. Mask to Alaska polygon
+alaska_vect <- terra::vect(alaska)
+elev_masked <- terra::mask(elev_alaska, alaska_vect)
+
+# 3. Convert to data frame — use elev_masked instead of elev_alaska
+elev_df <- as.data.frame(elev_masked, xy = TRUE)
+names(elev_df) <- c("lon", "lat", "elevation")
+elev_df <- elev_df %>% filter(!is.na(elevation), elevation >= 0)
+```
+
+
+```{r}
+p_elevation <- ggplot() +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250)) +  # contour interval in metres
+  geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) +
+  xlim(-170, -130) +
+  ylim(51, 72) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(h)") +
+  theme_minimal() +
+  theme(
+    axis.title.x     = element_text(size=11),
+    axis.title.y     = element_text(size=11),
+    axis.text.y      = element_text(size=11),
+    axis.text.x      = element_text(size=11),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2),
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2)
+  )
+
+plot_df <- filter(trace_target, year==1989)
+
+plot_df <- plot_df %>%
+  mutate(lon = ifelse(lon > 180, lon - 360, lon))
+
+# Convert plot_df to sf points (using the already-corrected -180/180 lon)
+plot_df_sf <- st_as_sf(plot_df, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+# Keep only points that fall inside the Alaska polygon
+plot_df_clipped <- st_filter(plot_df_sf, alaska)
+
+### PLOT! ###
+p_elevation + geom_point(aes(x = lon, y = lat, size = 1), data = plot_df_clipped)
+
+### Filter df to clipped points ###
+
+# Get unique lat/lon pairs from the clipped sf object (drop geometry, keep plain columns)
+alaska_coords <- plot_df_clipped %>%
+  st_drop_geometry() %>%
+  distinct(lat, lon)
+
+# Make sure the full trace dataframe's lon is in the same -180/180 convention
+# before joining (since your clipped points already got the -360 correction)
+trace_target <- trace_target %>%
+  mutate(lon_corrected = ifelse(lon > 180, lon - 360, lon))
+
+# Filter the full dataframe to only the Alaska-clipped locations, across all years
+trace <- trace_target %>%
+  semi_join(alaska_coords, by = c("lon_corrected" = "lon", "lat" = "lat"))
+
+nrow(trace)
+nrow(alaska_coords)
+
+
+```
+
+
+```{r}
+era <- read_parquet(file.path(era5_data_root,"bias_correction/processed_parquet/era5_lightning_model_1946_1990.parquet"))
+
+range(era$year)
+
+names(era)
+```
+
+plot era5 points
+
+```{r}
+plot_df <- filter(era, year==1989)
+
+# Convert plot_df to sf points (using the already-corrected -180/180 lon)
+plot_df_sf <- st_as_sf(plot_df, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+
+# Keep only points that fall inside the Alaska polygon
+plot_df_clipped <- st_filter(plot_df_sf, alaska)
+
+### PLOT! ###
+p_elevation + geom_point(aes(x = lon, y = lat, alpha=0.001), data = plot_df_clipped)
+
+### Filter df to clipped points ###
+
+# Get unique lat/lon pairs from the clipped sf object (drop geometry, keep plain columns)
+alaska_coords <- plot_df_clipped %>%
+  st_drop_geometry() %>%
+  distinct(lat, lon)
+
+# Make sure the full trace dataframe's lon is in the same -180/180 convention
+# before joining (since your clipped points already got the -360 correction)
+era <- era %>%
+  mutate(lon_corrected = ifelse(lon > 180, lon - 360, lon))
+
+# Filter the full dataframe to only the Alaska-clipped locations, across all years
+era <- era %>%
+  semi_join(alaska_coords, by = c("lon_corrected" = "lon", "lat" = "lat"))
+
+nrow(era)
+nrow(alaska_coords)
+```
+
+
+A spatial mis match: Aggregate ERA5 up to TraCE's grid by veraging all ERA5 points that fall within each TraCE grid cell. This maintains TraCE's actual physical resolution and avoids inventing false precision (interpolating trace down to era5 grid). 
+
+```{r}
+trace <- trace %>%
+  mutate(lon = ifelse(lon > 180, lon - 360, lon))
+
+# Get TraCE's 23 unique grid cells with an assumed cell width (check your actual grid spacing)
+trace_cells <- trace %>% distinct(lat, lon)
+
+# Build grid cell polygons around each TraCE point (adjust half-width to actual grid resolution)
+# TraCE-21ka is ~3.75° resolution - confirm by checking spacing in your data:
+sort(unique(trace$lat)) %>% diff()
+sort(unique(trace$lon)) %>% diff()
+
+library(FNN)  # for fast nearest-neighbor matching
+
+# Match each ERA5 point to nearest TraCE grid cell
+nn <- get.knnx(data = trace_cells[, c("lon", "lat")],
+               query = era[, c("lon", "lat")], k = 1)
+
+era$trace_lon <- trace_cells$lon[nn$nn.index]
+era$trace_lat <- trace_cells$lat[nn$nn.index]
+
+# Aggregate ERA5 to TraCE grid cells, by year
+era_agg <- era %>%
+  group_by(trace_lat, trace_lon, year) %>%
+  summarise(across(c(tair, precip, rh, wind, swr, sp), mean, na.rm = TRUE),
+            .groups = "drop") %>%
+  rename(lat = trace_lat, lon = trace_lon)
+
+#join 
+
+compare_df <- era_agg %>%
+  inner_join(trace, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+
+```
+
+
+```{r}
+vars <- c("tair", "precip", "rh", "wind", "swr", "sp")
+
+bias_summary <- purrr::map_dfr(vars, function(v) {
+  era_col <- compare_df[[paste0(v, "_era")]]
+  trace_col <- compare_df[[paste0(v, "_trace")]]
+  tibble(
+    variable = v,
+    mean_bias = mean(trace_col - era_col, na.rm = TRUE),   # ME
+    mae = mean(abs(trace_col - era_col), na.rm = TRUE),
+    rmse = sqrt(mean((trace_col - era_col)^2, na.rm = TRUE)),
+    correlation = cor(trace_col, era_col, use = "complete.obs"),
+    era_sd = sd(era_col, na.rm = TRUE),
+    trace_sd = sd(trace_col, na.rm = TRUE)
+  )
+})
+
+bias_summary
+
+```
+
+
+```{r}
+cellwise_bias <- purrr::map_dfr(vars, function(v) {
+  era_col   <- compare_df[[paste0(v, "_era")]]
+  trace_col <- compare_df[[paste0(v, "_trace")]]
+  
+  compare_df %>%
+    mutate(bias_tmp = trace_col - era_col) %>%
+    group_by(lat, lon) %>%
+    summarise(bias = mean(bias_tmp, na.rm = TRUE), .groups = "drop") %>%
+    mutate(variable = v)
+})
+
+cellwise_bias
+
+# Reshape to wide if you'd rather have one row per cell, one column per variable
+cellwise_bias_wide <- cellwise_bias %>%
+  tidyr::pivot_wider(names_from = variable, values_from = bias)
+
+cellwise_bias_wide
+```
+
+sp bias varies wildly and even flips sign.
+Large, sign-flipping, spatially inconsistent bias in surface pressure is a classic symptom of orography mismatch — TraCE's coarse ~3.75° grid can't resolve Alaska's actual terrain, so each grid cell's effective elevation in the model may be quite different from the real elevation at that lat/lon. Since surface pressure is strongly elevation-dependent, a cell sitting on a smoothed-out model mountain vs. a real coastal lowland (or vice versa) will show wildly different sp bias for reasons that have nothing to do with TraCE's climate physics being wrong — it's a resolution/representativeness issue.
+```{r}
+# Does sp bias correlate with real elevation at that grid cell?
+# You already have elev_df/elev_masked - extract mean elevation per TraCE cell
+
+trace_pts <- vect(cellwise_bias_wide, geom = c("lon", "lat"), crs = "EPSG:4326")
+trace_pts$elevation <- terra::extract(elev_masked, trace_pts)[, 2]
+
+ggplot(as.data.frame(trace_pts), aes(x = elevation, y = sp)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  labs(x = "Real elevation (m)", y = "SP bias (Pa)")
+
+```
+
+
+```{r}
+cellwise_long <- cellwise_bias_wide %>%
+  tidyr::pivot_longer(cols = c(tair, precip, rh, wind, swr, sp),
+                       names_to = "variable", values_to = "bias")
+
+plot_bias_map <- function(var) {
+  ggplot() +
+    geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3) +
+    geom_point(data = filter(cellwise_long, variable == var),
+               aes(x = lon, y = lat, color = bias), size = 4) +
+    scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+    coord_sf(xlim = c(-170, -130), ylim = c(51, 72)) +
+    ggtitle(var) +
+    theme_minimal()
+}
+
+vars <- c("tair", "precip", "rh", "wind", "swr", "sp")
+maps <- purrr::map(vars, plot_bias_map)
+
+# View them individually, or combine with patchwork
+wrap_plots(maps, ncol = 3)
+```
+
+HOW DO LON, LAN, AND ELEVATION CORRELATE WITH BIAS?
+
+1. Simple correlations
+
+```{r}
+
+# 1. Start from cellwise_bias_wide
+diag_df <- cellwise_bias_wide  # lat, lon, tair, precip, rh, wind, swr, sp
+
+# 2. Build spatial points from diag_df
+trace_pts <- vect(diag_df, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+# 3. Extract elevation using those points
+elev_vals <- terra::extract(elev_masked, trace_pts)
+
+# 4. Attach elevation back onto diag_df
+diag_df$elevation <- elev_vals[[2]]  # adjust index/name if needed
+
+names(diag_df)
+summary(diag_df$elevation)
+
+diag_df
+
+# 5. Now run the diagnostics
+vars <- c("tair", "precip", "rh", "wind", "swr", "sp")
+
+correlation_summary <- map_dfr(vars, function(v) {
+  tibble(
+    variable = v,
+    cor_elevation = cor(diag_df[[v]], diag_df$elevation, use = "complete.obs"),
+    cor_lat = cor(diag_df[[v]], diag_df$lat, use = "complete.obs"),
+    cor_lon = cor(diag_df[[v]], diag_df$lon, use = "complete.obs")
+  )
+})
+
+correlation_summary
+
+cor(diag_df[, c("elevation", "lat", "lon")])
+```
+
+The one to watch is elevation–lon at 0.566. It's moderate, not severe, but it does mean that if a variable's bias shows up as "explained by elevation" in the joint model, part of that effect could be partly absorbed by/confounded with longitude (i.e., is it really elevation driving the bias, or is it "eastern interior vs. western coastal" location, which happens to correlate with elevation?). Worth checking variance inflation factors (VIF) to quantify this directly:
+
+```{r}
+library(car)
+
+vif_check <- function(v) {
+  model <- lm(as.formula(paste(v, "~ elevation + lat + lon")), data = diag_df)
+  vif(model)
+}
+
+map(vars, vif_check) %>% set_names(vars)
+
+```
+
+VIF values under ~5 are generally fine. VIF only depends on the relationships among predictors (elevation, lat, lon), not on the response variable.
+
+All three values are comfortably under 5 (1.28–1.85), confirming what the raw correlation matrix suggested: no problematic multicollinearity. This means the joint model coefficients (bias ~ elevation + lat + lon) can be trusted for all six variables without worrying that elevation and longitude are confounding each other's estimated effects.
+
+2. Linear regression per variable (get p-values and R²)
+
+The _coef columns tell you direction and magnitude of the relationship (e.g., "bias increases by X per meter of elevation"), and _p tells you whether that's likely real vs. noise given n=23.
+
+```{r}
+diagnose_bias <- function(v) {
+  formula <- as.formula(paste(v, "~ elevation + lat + lon"))
+  model <- lm(formula, data = diag_df)
+  s <- summary(model)
+  
+  tibble(
+    variable = v,
+    r_squared = s$r.squared,
+    elevation_coef = coef(model)["elevation"],
+    elevation_p = s$coefficients["elevation", "Pr(>|t|)"],
+    lat_coef = coef(model)["lat"],
+    lat_p = s$coefficients["lat", "Pr(>|t|)"],
+    lon_coef = coef(model)["lon"],
+    lon_p = s$coefficients["lon", "Pr(>|t|)"]
+  )
+}
+
+bias_diagnostics <- map_dfr(vars, diagnose_bias)
+bias_diagnostics
+```
+
+Per variable, which single spatial factor explains the most bias variance (without the multicollinearity risk of throwing all three in one model)?
+```{r}
+diagnose_single <- function(v, predictor) {
+  formula <- as.formula(paste(v, "~", predictor))
+  model <- lm(formula, data = diag_df)
+  s <- summary(model)
+  tibble(
+    variable = v,
+    predictor = predictor,
+    r_squared = s$r.squared,
+    coef = coef(model)[[predictor]],
+    p_value = s$coefficients[predictor, "Pr(>|t|)"]
+  )
+}
+
+single_diagnostics <- expand_grid(v = vars, predictor = c("elevation", "lat", "lon")) %>%
+  pmap_dfr(diagnose_single)
+
+single_diagnostics %>% arrange(variable, desc(r_squared))
+
+```
+
+
+3. Visual Check
+
+```{r}
+plot_relationship <- function(v, predictor) {
+  ggplot(diag_df, aes(x = .data[[predictor]], y = .data[[v]])) +
+    geom_point() +
+    geom_smooth(method = "lm", se = TRUE) +
+    labs(title = paste(v, "vs", predictor)) +
+    theme_minimal()
+}
+
+wrap_plots(map(vars, ~plot_relationship(.x, "elevation")), ncol = 3)
+```
+
+
+
+High R² + low p-value + visually clean linear trend → that variable's bias is genuinely driven by that spatial factor, and correction should probably be stratified/regressed by that factor (e.g., elevation-adjusted correction for sp) rather than a single flat offset.
+Low R² / high p-value → bias for that variable looks more spatially uniform, and a single global correction per variable is probably adequate.
+Given the small n, weight the scatter plots fairly heavily alongside the p-values before deciding. a p-value of 0.06 with 23 points and a visually obvious trend is still worth acting on, whereas I'd be cautious over-interpreting a "significant" p=0.04 driven by one or two outlier cells.
+
+
+Clear spatial structure. Needs location-aware correction
+
+wind: the standout. R²=0.944 in the joint model, and both lat (p=0.0000003) and lon (p=0.0000002) are highly significant on their own (single-predictor R²: 0.56 for lon, 0.50 for lat). Elevation barely matters (R²=0.04, p=0.35). Wind bias is almost entirely explained by geographic position, likely reflecting real terrain-channeling/coastal exposure effects TraCE's coarse grid can't resolve. This needs a spatially-varying correction (e.g., a 2D smooth/kriged correction surface over lat/lon), not a single offset.
+
+sp: driven almost entirely by elevation (R²=0.636, p=0.0000005 alone), while lat/lon contribute little on their own. This confirms the orography hypothesis from earlier — TraCE's smoothed terrain doesn't capture real elevation, so pressure bias tracks real elevation directly. Correction should be elevation-stratified (e.g., regress bias on elevation and apply that as a correction function, rather than a flat per-cell offset).
+
+swr: moderate structure, split between lat (R²=0.295, p=0.007) and lon (R²=0.188, p=0.039), elevation not significant. Makes sense physically — solar radiation bias tracking latitude (sun angle/day length) is expected. Could use a simple lat-based correction term, possibly combined with a small lon adjustment.
+
+Weaker/marginal structure
+
+rh: nothing reaches conventional significance alone (lon p=0.058, lat p=0.090), though the joint model's R²=0.373 with lat significant (p=0.020) suggests some structure exists but is somewhat diffuse/collinear across predictors. Worth a spatial map check, but I'd be cautious overfitting a correction model here given the marginal single-predictor p-values.
+
+tair: this is the interesting one. Recall the bias magnitudes you saw earlier were very consistent across cells (mostly -8 to -13). That's consistent with what shows up here: no single predictor reaches significance alone (elevation R²=0.079, p=0.19 is the "best" and still not significant), even though the joint model creeps up to R²=0.298 with borderline lat/lon terms (p=~0.057–0.059). This supports what the raw bias table suggested: tair bias is close to spatially uniform. A single flat offset (or simple quantile mapping applied uniformly) is likely sufficient — don't overcomplicate it with a spatial model that's fitting noise.
+
+precip: joint R²=0.450 but dominated by lon alone (R²=0.420, p=0.0008); elevation and lat contribute little. Note the coefficients are tiny (~1e-10) simply because of precip's units/scale. not a red flag, just scale. A longitude-dependent correction works here.
+
+########################
+######  FIT MODELS  ####
+########################
+
+######
+tair
+######
+
+flat/uniform bias, but correlation was only 0.151. Since tair's bias is spatially uniform but the earlier bias_summary showed low correlation (0.151) and TraCE's variance is much smaller than ERA5's (0.67 vs 1.84), a simple mean-shift would fix the average but leave TraCE's variability collapsed relative to reality. That argues for quantile mapping applied globally (pooling all cells, since bias doesn't vary spatially) rather than a flat offset — it corrects both the mean and the spread.
+
+```{r}
+
+# Fit one quantile mapping model for tair, pooling all cells/years
+# (justified since bias showed no significant spatial structure)
+qm_tair <- fitQmap(compare_df$tair_era, compare_df$tair_trace, method = "QUANT", qstep = 0.01, wet.day=FALSE)
+
+# Apply correction to the full trace dataframe (not just compare_df, so it covers all years)
+trace$tair_corrected <- doQmap(trace$tair, qm_tair)
+
+# Check it worked - corrected TraCE stats should now resemble ERA5's
+compare_df$tair_trace_corrected <- doQmap(compare_df$tair_trace, qm_tair)
+
+tibble(
+  mean_era = mean(compare_df$tair_era, na.rm = TRUE),
+  mean_trace_raw = mean(compare_df$tair_trace, na.rm = TRUE),
+  mean_trace_corrected = mean(compare_df$tair_trace_corrected, na.rm = TRUE),
+  sd_era = sd(compare_df$tair_era, na.rm = TRUE),
+  sd_trace_raw = sd(compare_df$tair_trace, na.rm = TRUE),
+  sd_trace_corrected = sd(compare_df$tair_trace_corrected, na.rm = TRUE)
+)
+
+```
+BUT!!! Quantile mapping cannot handle temp values outside the calibration range. Instead, stick with just mean and varaince correction
+
+```{r}
+tair_calib_mean <- mean(compare_df$tair_trace, na.rm = TRUE)
+tair_calib_sd <- sd(compare_df$tair_trace, na.rm = TRUE)
+tair_era_mean <- mean(compare_df$tair_era, na.rm = TRUE)
+tair_era_sd <- sd(compare_df$tair_era, na.rm = TRUE)
+
+tair_affine_model <- list(
+  calib_mean = tair_calib_mean, calib_sd = tair_calib_sd,
+  era_mean = tair_era_mean, era_sd = tair_era_sd
+)
+
+apply_tair_affine <- function(x, model) {
+  model$era_mean + (x - model$calib_mean) * (model$era_sd / model$calib_sd)
+}
+
+# Check it worked
+compare_df$tair_affine <- apply_tair_affine(compare_df$tair_trace, tair_affine_model)
+tibble(
+  mean_era = mean(compare_df$tair_era, na.rm=TRUE), mean_corrected = mean(compare_df$tair_affine, na.rm=TRUE),
+  sd_era = sd(compare_df$tair_era, na.rm=TRUE), sd_corrected = sd(compare_df$tair_affine, na.rm=TRUE)
+)
+```
+
+
+######
+sp 
+######
+
+Elevation-stratified. Since sp bias is driven by elevation (not lat/lon), the cleanest approach is to regress bias on elevation and use that as a correction function, rather than quantile mapping per cell (which would need way more than 40 obs/cell to be reliable, and wouldn't generalize to elevations you don't have TraCE cells at).
+
+```{r}
+# Fit the elevation-bias relationship using your cellwise results
+sp_elev <- lm(sp ~ elevation, data = diag_df)
+sp_elev_lat <- lm(sp ~ elevation + lat, data = diag_df)
+sp_elev_lon <- lm(sp ~ elevation + lon, data = diag_df)
+sp_full <- lm(sp ~ elevation + lat + lon, data = diag_df)
+
+summary(sp_elev)
+summary(sp_elev_lat)
+summary(sp_elev_lon)
+summary(sp_full)
+
+anova(sp_elev, sp_elev_lat)
+anova(sp_elev, sp_elev_lon)
+anova(sp_elev, sp_full)
+anova(sp_elev_lon, sp_full)
+
+AIC(sp_elev, sp_elev_lat, sp_elev_lon, sp_full)
+
+diag_df$sp_elev_residual <- residuals(sp_elev)
+cor(diag_df$sp_elev_residual, diag_df$lat)
+cor(diag_df$sp_elev_residual, diag_df$lon)
+
+```
+
+Final mean bias correction model: elevation + lon
+```{r}
+sp_bias_model <- sp_elev_lon
+summary(sp_bias_model)
+
+#ne more check
+diag_df$sp_final_residual <- residuals(sp_bias_model)
+cor(diag_df$sp_final_residual, diag_df$lat)
+cor(diag_df$sp_final_residual, diag_df$lon)  # this one is ~0 since lon is in the model
+```
+
+Residual-correlation check flags lat as a possible remaining spatial signal even after elevation + lon, but formal comparison (ANOVA, AIC, above) doesn't support its inclusion.
+
+Next, check variance structure
+
+Attach elevation to trace and compare_df
+```{r}
+
+trace_pts_full <- vect(trace %>% distinct(lat, lon), geom = c("lon", "lat"), crs = "EPSG:4326")
+elev_full <- terra::extract(elev_masked, trace_pts_full)
+
+trace_elev_lookup <- trace %>% 
+  distinct(lat, lon) %>% 
+  mutate(elevation = elev_full[[2]])
+
+# Only join if trace doesn't already have elevation - check first
+if (!"elevation" %in% names(trace)) {
+  trace <- trace %>% left_join(trace_elev_lookup, by = c("lat", "lon"))
+}
+
+if (!"elevation" %in% names(compare_df)) {
+  compare_df <- compare_df %>% left_join(trace_elev_lookup, by = c("lat", "lon"))
+}
+```
+
+Apply the mean bias correction model
+```{r}
+#sp_bias_model <- sp_elev_lon  # final: elevation + lon
+
+trace$sp_predicted_bias <- predict(sp_bias_model, newdata = trace)
+trace$sp_corrected <- trace$sp - trace$sp_predicted_bias
+
+compare_df$sp_predicted_bias <- predict(sp_bias_model, newdata = compare_df)
+compare_df$sp_trace_corrected <- compare_df$sp_trace - compare_df$sp_predicted_bias
+
+tibble(
+  mean_bias_raw = mean(compare_df$sp_trace - compare_df$sp_era, na.rm = TRUE),
+  mean_bias_corrected = mean(compare_df$sp_trace_corrected - compare_df$sp_era, na.rm = TRUE)
+)
+```
+
+Overall and cell-wise varaince check
+```{r}
+tibble(
+  sd_era = sd(compare_df$sp_era, na.rm = TRUE),
+  sd_trace_raw = sd(compare_df$sp_trace, na.rm = TRUE),
+  sd_trace_corrected = sd(compare_df$sp_trace_corrected, na.rm = TRUE),
+  var_ratio_raw = sd_trace_raw / sd_era,
+  var_ratio_corrected = sd_trace_corrected / sd_era
+)
+
+cellwise_variance <- compare_df %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    sd_era = sd(sp_era, na.rm = TRUE),
+    sd_trace_corrected = sd(sp_trace_corrected, na.rm = TRUE),
+    var_ratio = sd_trace_corrected / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_variance %>% arrange(desc(abs(var_ratio - 1)))
+
+cor(cellwise_variance$var_ratio, cellwise_variance$lat)
+cor(cellwise_variance$var_ratio, cellwise_variance$lon)
+cor(cellwise_variance$var_ratio, cellwise_variance$elevation)
+
+ggplot(cellwise_variance, aes(x=lon, y=lat, size = var_ratio)) + geom_point()
+
+summary(cellwise_variance$var_ratio)
+```
+
+variance ratio decreases in the norhteast. Test which spatial predictor is best for variance ratio:
+```{r}
+vr_lon <- lm(var_ratio ~ lon, data = cellwise_variance)
+vr_lat <- lm(var_ratio ~ lat, data = cellwise_variance)
+vr_elev <- lm(var_ratio ~ elevation, data = cellwise_variance)
+vr_lonlat <- lm(var_ratio ~ lon + lat, data = cellwise_variance)
+vr_lonelev <- lm(var_ratio ~ lon + elevation, data = cellwise_variance)
+vr_full <- lm(var_ratio ~ lon + lat + elevation, data = cellwise_variance)
+
+summary(vr_lon)
+summary(vr_lat)
+summary(vr_elev)
+summary(vr_lonlat)
+summary(vr_lonelev)
+summary(vr_full)
+
+anova(vr_lon, vr_lonlat)
+anova(vr_lon, vr_lonelev)
+anova(vr_lonlat, vr_full)
+anova(vr_lonelev, vr_full)
+
+AIC(vr_lon, vr_lat, vr_elev, vr_lonlat, vr_lonelev, vr_full)
+```
+
+vr_lonlat (lon + lat) is the best model at AIC = -37.86.
+
+```{r}
+var_ratio_model_sp <- vr_lonlat  # lon + lat
+
+# Predict the variance ratio at each cell in compare_df
+compare_df$sp_var_ratio_pred <- predict(var_ratio_model_sp, newdata = compare_df)
+
+# Rescale each cell's corrected values around its own mean, using the predicted ratio
+compare_df <- compare_df %>%
+  group_by(lat, lon) %>%
+  mutate(
+    sp_cell_mean = mean(sp_trace_corrected, na.rm = TRUE),
+    sp_rescaled = sp_cell_mean + (sp_trace_corrected - sp_cell_mean) / sp_var_ratio_pred
+  ) %>%
+  ungroup()
+
+# Check cellwise variance ratio after rescaling only (no QM yet)
+cellwise_check_rescaled <- compare_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(sp_era, na.rm = TRUE),
+    sd_rescaled = sd(sp_rescaled, na.rm = TRUE),
+    var_ratio_after = sd_rescaled / sd_era,
+    .groups = "drop"
+  )
+
+print(cellwise_check_rescaled, n = 23)
+
+summary(cellwise_check_rescaled$var_ratio_after)
+
+#check overall check alongside the cellwise breakdown, since the pooled number masked the real spread after mean bias correction:
+tibble(
+  mean_era = mean(compare_df$sp_era, na.rm = TRUE),
+  mean_rescaled = mean(compare_df$sp_rescaled, na.rm = TRUE),
+  sd_era = sd(compare_df$sp_era, na.rm = TRUE),
+  sd_rescaled = sd(compare_df$sp_rescaled, na.rm = TRUE)
+)
+```
+
+cell wise variance ratio looks good! ranges from 0.9022 to 1.0662. skip quantile mapping here rather than risk it introducing the same erratic noise (it did on an earlier try at correcting sp). 
+
+Finalize sp in compare_df and apply the full pipeline to trace
+```{r}
+compare_df$sp_final <- compare_df$sp_rescaled
+
+tibble(
+  mean_era = mean(compare_df$sp_era, na.rm = TRUE),
+  mean_final = mean(compare_df$sp_final, na.rm = TRUE),
+  sd_era = sd(compare_df$sp_era, na.rm = TRUE),
+  sd_final = sd(compare_df$sp_final, na.rm = TRUE)
+)
+
+# Mean correction (elevation + lon)
+trace$sp_predicted_bias <- predict(sp_bias_model, newdata = trace)
+trace$sp_corrected <- trace$sp - trace$sp_predicted_bias
+
+# Variance rescaling (lon + lat)
+trace$sp_var_ratio_pred <- predict(var_ratio_model_sp, newdata = trace)
+
+trace <- trace %>%
+  group_by(lat, lon) %>%
+  mutate(
+    sp_cell_mean = mean(sp_corrected, na.rm = TRUE),
+    sp_rescaled = sp_cell_mean + (sp_corrected - sp_cell_mean) / sp_var_ratio_pred
+  ) %>%
+  ungroup()
+
+trace$sp_final <- trace$sp_rescaled  # no QM
+```
+
+Validate against ERA5:
+```{r}
+compare_df_sp_check <- era_agg %>%
+  inner_join(trace, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+
+tibble(
+  sd_era = sd(compare_df_sp_check$sp_era, na.rm = TRUE),
+  sd_final = sd(compare_df_sp_check$sp_final, na.rm = TRUE),
+  mean_era = mean(compare_df_sp_check$sp_era, na.rm = TRUE),
+  mean_final = mean(compare_df_sp_check$sp_final, na.rm = TRUE)
+)
+
+qqplot(compare_df_sp_check$sp_era, compare_df_sp_check$sp_final,
+       xlab = "ERA5 quantiles", ylab = "Final corrected TraCE quantiles",
+       main = "QQ: final trace$sp_final vs ERA5")
+abline(0, 1, col = "red")
+```
+
+```{r}
+# qm_sp_test <- fitQmap(compare_df$sp_era, compare_df$sp_rescaled, method = "QUANT", qstep = 0.1, wet.day=FALSE)
+# compare_df$sp_final_qm <- doQmap(compare_df$sp_rescaled, qm_sp_test)
+# 
+# cellwise_check_qm <- compare_df %>%
+#   group_by(lat, lon) %>%
+#   summarise(
+#     sd_era = sd(sp_era, na.rm = TRUE),
+#     sd_final = sd(sp_final_qm, na.rm = TRUE),
+#     var_ratio_after = sd_final / sd_era,
+#     .groups = "drop"
+#   )
+# 
+# print(cellwise_check_qm, n = 23)
+# 
+# # Also check KS/overlap directly to see if shape actually improved
+# ks.test(compare_df$sp_final_qm, compare_df$sp_era)$statistic
+# overlap_coef(compare_df$sp_final_qm, compare_df$sp_era)  # from your earlier function
+```
+
+Two independent attempts (different qstep) both show QM degrading the well-behaved variance structure you achieved through rescaling
+The underlying cause (pooled-vs-cellwise mismatch) isn't something a parameter tweak (qstep) fixes. Instead, it would require a genuinely different, sample size attempt (per-cell QM) that this sample size can't support reliably
+Five of six variables are excellently corrected on every metric
+sp's mean and variance are excellently corrected (std_bias ≈ 0, sd_ratio ≈ 1.01) — only the finer distributional shape (median/tail alignment, skew) remains imperfect. 
+
+
+One more thing, at the end of this script, metrics to assess how well each variable is corrected finds that for sp, skew_diff=0.320 and q_bias = -982. These metrics are sensative to where you put the threshold, making it look as though sp's distributional shape is imperfect. However, corrected sp values are concengtrated well and correspond to era5 concetration at high sp values. This is importnat to check because high strike rates occur at high sp values and sp in the era5 data is also most concentrated around high values. 
+
+```{r}
+thresholds <- seq(80000, 100000, by = 2000)
+
+tibble(
+  threshold = thresholds,
+  pct_era = map_dbl(thresholds, ~mean(compare_df$sp_era > .x, na.rm = TRUE)),
+  pct_final = map_dbl(thresholds, ~mean(compare_df$sp_final > .x, na.rm = TRUE)),
+  diff = pct_era - pct_final
+)
+```
+
+So, although at each threshold, the correceted values bounce around the era5 concentration of sp values, rather than always being underrepresented. ie. after 88000, trace corrected values dont start to rise in concentration yet, but when they do, at 90000, their concentratoin looks pretty similar to era5. This means that, though not perfect, corrected trace values will be able to represent summers with high sp that can yeild high strike rates. sp's correction has some non-directional shape imperfection, but this is not a structural bias that would distort the strike-rate model's behavior in a predictable way
+
+######
+wind 
+######
+
+For wind, the joint model (elevation + lat + lon) already showed R²=0.944 — both lat and lon highly significant, elevation not. same regression-based correction approach that worked for sp might work here.
+First, test predictor sets:
+```{r}
+wind_full <- lm(wind ~ elevation + lat + lon, data = diag_df)
+wind_latlon <- lm(wind ~ lat + lon, data = diag_df)
+
+summary(wind_full)
+summary(wind_latlon)
+
+anova(wind_latlon, wind_full)
+```
+
+Check residuals are clean. 
+If that correlation is small (unlike what happened with sp's lat-suppression), wind ~ lat + lon is the model to go with.
+```{r}
+diag_df$wind_residual <- residuals(wind_latlon)
+cor(diag_df$wind_residual, diag_df$elevation)  # should be non-zero since elevation isn't in the model - check it's small
+```
+
+Apply the correction
+```{r}
+wind_bias_model <- wind_latlon  # better model
+
+trace$wind_predicted_bias <- predict(wind_bias_model, newdata = trace)
+trace$wind_corrected <- trace$wind - trace$wind_predicted_bias
+
+# Check it worked
+compare_df$wind_predicted_bias <- predict(wind_bias_model, newdata = compare_df)
+compare_df$wind_trace_corrected <- compare_df$wind_trace - compare_df$wind_predicted_bias
+
+tibble(
+  mean_bias_raw = mean(compare_df$wind_trace - compare_df$wind_era, na.rm = TRUE),
+  mean_bias_corrected = mean(compare_df$wind_trace_corrected - compare_df$wind_era, na.rm = TRUE)
+)
+```
+
+Do the corrected values still show unrealistic day-to-day/year-to-year spread even after the spatial correction?
+
+```{r}
+#Overall variance comparison: raw vs corrected vs ERA5
+tibble(
+  sd_era = sd(compare_df$wind_era, na.rm = TRUE),
+  sd_trace_raw = sd(compare_df$wind_trace, na.rm = TRUE),
+  sd_trace_corrected = sd(compare_df$wind_trace_corrected, na.rm = TRUE),
+  var_ratio_raw = sd_trace_raw / sd_era,
+  var_ratio_corrected = sd_trace_corrected / sd_era
+)
+```
+
+var_ratio_corrected is still far from 1 (similar to var_ratio_raw), the spatial correction fixed the mean but not the spread
+
+```{r}
+#Per-cell variance comparison — is the mismatch uniform or worse in some cells?
+cellwise_variance <- compare_df %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    sd_era = sd(wind_era, na.rm = TRUE),
+    sd_trace_corrected = sd(wind_trace_corrected, na.rm = TRUE),
+    var_ratio = sd_trace_corrected / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_variance %>% arrange(desc(abs(var_ratio - 1)))
+```
+
+Looking at var_ratio, variance is off and it varies by location. 
+Plot to get a better look:
+```{r}
+#Year-to-year spread, pooled across cells — does corrected TraCE track ERA5's interannual variability, or is it just noisier/smoother at every timestep?
+yearly_compare <- compare_df %>%
+  group_by(year) %>%
+  summarise(
+    era_mean = mean(wind_era, na.rm = TRUE),
+    trace_corrected_mean = mean(wind_trace_corrected, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(yearly_compare, aes(x = year)) +
+  geom_line(aes(y = era_mean, color = "ERA5")) +
+  geom_line(aes(y = trace_corrected_mean, color = "TraCE (corrected)")) +
+  labs(y = "Mean wind speed", color = "Source", title = "Year-to-year wind: ERA5 vs corrected TraCE") +
+  theme_minimal()
+
+ggplot(compare_df) +
+  geom_density(aes(x = wind_era, color = "ERA5"), linewidth = 1) +
+  geom_density(aes(x = wind_trace, color = "TraCE (raw)"), linewidth = 1, linetype = "dashed") +
+  geom_density(aes(x = wind_trace_corrected, color = "TraCE (corrected)"), linewidth = 1) +
+  labs(x = "Wind speed", color = "Source", title = "Wind distribution: raw vs corrected vs ERA5") +
+  theme_minimal()
+
+#QQ plot — the most direct diagnostic for whether spread/shape still needs correction
+qqplot(compare_df$wind_era, compare_df$wind_trace_corrected,
+       xlab = "ERA5 quantiles", ylab = "Corrected TraCE quantiles",
+       main = "QQ: corrected TraCE vs ERA5 (wind)")
+abline(0, 1, col = "red")
+
+ggplot(cellwise_variance) + geom_point(aes(x=lon, y=lat, size=var_ratio))
+
+#is variance ratio spatially distinct?
+plot(cellwise_variance$lat, cellwise_variance$var_ratio)
+plot(cellwise_variance$lon, cellwise_variance$var_ratio)
+plot(cellwise_variance$elevation, cellwise_variance$var_ratio)
+
+cor(cellwise_variance$lat, cellwise_variance$var_ratio)
+cor(cellwise_variance$lon, cellwise_variance$var_ratio)
+cor(cellwise_variance$elevation, cellwise_variance$var_ratio)
+```
+
+Rescale each cell's corrected TraCE values around its own mean, using the predicted ratio
+REscaling shrinks/expands each cell's spread around its own mean by the predicted ratio
+
+Lon and lat look strongest 
+```{r}
+#test variance ratio predictors
+# Compare single vs joint variance-ratio models
+vr_lon <- lm(var_ratio ~ lon, data = cellwise_variance)
+vr_lat <- lm(var_ratio ~ lat, data = cellwise_variance)
+vr_latlon <- lm(var_ratio ~ lat + lon, data = cellwise_variance)
+
+summary(vr_lon)
+summary(vr_lat)
+summary(vr_latlon)
+anova(vr_lon, vr_lat)
+anova(vr_lat, vr_latlon)
+anova(vr_lon, vr_latlon)
+```
+
+
+
+Predict variance ratio at each cell's longitude in compare_df using best model from above
+```{r}
+var_ratio_model_wind <- vr_latlon #best varaince ratio model
+
+compare_df$wind_var_ratio_pred <- predict(var_ratio_model_wind, newdata = compare_df)
+
+#rescale: 
+compare_df <- compare_df %>%
+  group_by(lat, lon) %>%
+  mutate(
+    wind_cell_mean = mean(wind_trace_corrected, na.rm = TRUE),
+    wind_rescaled = wind_cell_mean + (wind_trace_corrected - wind_cell_mean) / wind_var_ratio_pred
+  ) %>%
+  ungroup()
+
+```
+
+
+Check again
+```{r}
+# Look at cell wise variance ratio after rescaling
+cellwise_variance <- compare_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(wind_era, na.rm = TRUE),
+    sd_trace_rescaled = sd(wind_rescaled, na.rm = TRUE),
+    var_ratio_rescaled = sd_trace_rescaled / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_variance
+```
+
+
+```{r}
+yearly_compare <- compare_df %>%
+  group_by(year) %>%
+  summarise(
+    era_mean = mean(wind_era, na.rm = TRUE),
+    trace_rescaledd_mean = mean(wind_rescaled, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(yearly_compare, aes(x = year)) +
+  geom_line(aes(y = era_mean, color = "ERA5")) +
+  geom_line(aes(y = trace_rescaledd_mean, color = "TraCE (corrected)")) +
+  labs(y = "Mean wind speed", color = "Source", title = "Year-to-year wind: ERA5 vs corrected TraCE") +
+  theme_minimal()
+
+# QQ plot - should hug the 1:1 line much more closely now
+qqplot(compare_df$wind_era, compare_df$wind_rescaled,
+       xlab = "ERA5 quantiles", ylab = "Final corrected TraCE quantiles",
+       main = "QQ: final corrected TraCE vs ERA5 (wind)")
+abline(0, 1, col = "red")
+
+# Density overlay
+ggplot(compare_df) +
+  geom_density(aes(x = wind_era, color = "ERA5"), linewidth = 1) +
+  geom_density(aes(x = wind_trace, color = "TraCE (raw)"), linewidth = 1, linetype = "dashed") +
+  geom_density(aes(x = wind_rescaled, color = "TraCE (final corrected)"), linewidth = 1) +
+  labs(x = "Wind speed", color = "Source") +
+  theme_minimal()
+
+ggplot(cellwise_variance) + geom_point(aes(x=lon, y=lat, size=var_ratio_rescaled))
+
+```
+
+Apply full correction to trace dataframe
+```{r}
+# Apply variance rescaling to the full trace dataframe
+# (mean-bias correction already applied above via wind_bias_model)
+
+trace$wind_var_ratio_pred <- predict(var_ratio_model_wind, newdata = trace)
+
+trace <- trace %>%
+  group_by(lat, lon) %>%
+  mutate(
+    wind_cell_mean = mean(wind_corrected, na.rm = TRUE),
+    wind_rescaled = wind_cell_mean + (wind_corrected - wind_cell_mean) / wind_var_ratio_pred
+  ) %>%
+  ungroup()
+
+trace$wind_final <- trace$wind_rescaled
+```
+
+Validate it against ERA5, rebuilding the comparison subset from the finalized trace, not reusing the old compare_df
+```{r}
+compare_df <- era_agg %>%
+  inner_join(trace, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+
+tibble(
+  sd_era = sd(compare_df$wind_era, na.rm = TRUE),
+  sd_final = sd(compare_df$wind_rescaled, na.rm = TRUE),
+  mean_era = mean(compare_df$wind_era, na.rm = TRUE),
+  mean_final = mean(compare_df$wind_rescaled, na.rm = TRUE)
+)
+
+qqplot(compare_df$wind_era, compare_df$wind_rescaled,
+       xlab = "ERA5 quantiles", ylab = "Final corrected TraCE quantiles",
+       main = "QQ: final trace$wind_final vs ERA5")
+abline(0, 1, col = "red")
+
+compare_df$wind_final <- trace$wind_rescaled
+```
+
+#####
+shortwave radiation
+#####
+
+Fit and compare candidate models
+```{r}
+swr_lat <- lm(swr ~ lat, data = diag_df)
+swr_latlon <- lm(swr ~ lat + lon, data = diag_df)
+swr_full <- lm(swr ~ elevation + lat + lon, data = diag_df)
+
+summary(swr_lat)
+summary(swr_latlon)
+summary(swr_full)
+
+anova(swr_lat, swr_latlon)
+anova(swr_latlon, swr_full)
+```
+
+Check residuals of your chosen model against the excluded predictor(s)
+
+```{r}
+diag_df$swr_residual <- residuals(swr_lat)
+cor(diag_df$swr_residual, diag_df$elevation)
+
+plot(diag_df$swr_residual, diag_df$elevation, main="Residuals of lat linear correction agains elevation")
+
+diag_df$swr_residual <- residuals(swr_latlon)
+cor(diag_df$swr_residual, diag_df$elevation)
+
+plot(diag_df$swr_residual, diag_df$elevation, main="Residuals of lat lon linear correction agains elevation")
+
+#OLS residuals are always exactly uncorrelated with every predictor that's in the model, regardless of whether that predictor actually explains anything. So checking cor(residuals(swr_full), elevation) will always return ~0,
+diag_df$swr_residual <- residuals(swr_full)
+cor(diag_df$swr_residual, diag_df$elevation)
+
+plot(diag_df$swr_residual, diag_df$elevation, main="Residuals of lat lon and elevation linear correction agains elevation")
+
+summary(swr_full)
+anova(swr_latlon, swr_full)
+```
+does elevation's coefficient/ANOVA test support including it? no. elevation is at p=0.126, non-significant, despite the residual pattern.
+Apply the spatial correction
+```{r}
+
+diag_df$swr_residual <- residuals(swr_latlon)
+swr_bias_model <- swr_latlon  # update if step 1/2 suggests otherwise
+
+trace$swr_predicted_bias <- predict(swr_bias_model, newdata = trace)
+trace$swr_corrected <- trace$swr - trace$swr_predicted_bias
+
+compare_df$swr_predicted_bias <- predict(swr_bias_model, newdata = compare_df)
+compare_df$swr_trace_corrected <- compare_df$swr_trace - compare_df$swr_predicted_bias
+
+tibble(
+  mean_bias_raw = mean(compare_df$swr_trace - compare_df$swr_era, na.rm = TRUE),
+  mean_bias_corrected = mean(compare_df$swr_trace_corrected - compare_df$swr_era, na.rm = TRUE)
+)
+```
+Check variance/spread — does it need the rescale+QM treatment like wind, or is a simple global QM (like tair) enough?
+```{r}
+tibble(
+  sd_era = sd(compare_df$swr_era, na.rm = TRUE),
+  sd_trace_raw = sd(compare_df$swr_trace, na.rm = TRUE),
+  sd_trace_corrected = sd(compare_df$swr_trace_corrected, na.rm = TRUE)
+)
+
+cellwise_variance_swr <- compare_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(swr_era, na.rm = TRUE),
+    sd_trace_corrected = sd(swr_trace_corrected, na.rm = TRUE),
+    var_ratio = sd_trace_corrected / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_variance_swr %>% arrange(desc(abs(var_ratio - 1)))
+
+ggplot(cellwise_variance_swr, aes(x = lat, y = var_ratio)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "loess", se = TRUE)
+```
+
+Variance correction. 
+var_ratio ranges from 0.5-1.5.
+Could use elevation for variance correction (instead of in mean bias correction). spatial regression fixes the mean, then a separate check on spread/variance can reveal a different predictor driving the leftover variability. Check if variance can be predicted by elevation, lat, or lon:
+```{r}
+# Apply the mean-bias correction using swr_latlon
+swr_bias_model <- swr_latlon
+
+trace$swr_predicted_bias <- predict(swr_bias_model, newdata = trace)
+trace$swr_corrected <- trace$swr - trace$swr_predicted_bias
+
+compare_df$swr_predicted_bias <- predict(swr_bias_model, newdata = compare_df)
+compare_df$swr_trace_corrected <- compare_df$swr_trace - compare_df$swr_predicted_bias
+
+# Now check per-cell variance ratio against elevation, lat, AND lon
+cellwise_variance_swr <- compare_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(swr_era, na.rm = TRUE),
+    sd_trace_corrected = sd(swr_trace_corrected, na.rm = TRUE),
+    var_ratio = sd_trace_corrected / sd_era,
+    .groups = "drop"
+  ) %>%
+  left_join(diag_df %>% dplyr::select(lat, lon, elevation), by = c("lat", "lon"))
+
+print(cellwise_variance_swr)
+
+cor(cellwise_variance_swr$var_ratio, cellwise_variance_swr$elevation)
+cor(cellwise_variance_swr$var_ratio, cellwise_variance_swr$lat)
+cor(cellwise_variance_swr$var_ratio, cellwise_variance_swr$lon)
+
+ggplot(cellwise_variance_swr, aes(x = elevation, y = var_ratio)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "loess", se = TRUE)
+
+ggplot(cellwise_variance_swr, aes(x = lat, y = var_ratio)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "loess", se = TRUE)
+
+ggplot(cellwise_variance_swr, aes(x = lon, y = var_ratio)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "loess", se = TRUE)
+```
+
+lat and lon are stronger predictors of variance ration than elevation. 
+compare using one versus both:
+```{r}
+# Compare single vs joint variance-ratio models
+vr_lon <- lm(var_ratio ~ lon, data = cellwise_variance_swr)
+vr_latlon <- lm(var_ratio ~ lat + lon, data = cellwise_variance_swr)
+
+summary(vr_lon)
+summary(vr_latlon)
+anova(vr_lon, vr_latlon)
+
+# Visual check - is the lon relationship smooth/monotonic like wind's was?
+ggplot(cellwise_variance_swr, aes(x = lon, y = var_ratio)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "loess", se = TRUE)
+```
+R² jumps meaningfully (0.586 → 0.787), and the ANOVA confirms it (p=0.0003). Go with var_ratio ~ lat + lon.
+
+Apply the full correction pipeline for swr:
+```{r}
+# Final variance-ratio model
+var_ratio_model_swr <- lm(var_ratio ~ lat + lon, data = cellwise_variance_swr)
+
+# Rescale compare_df
+compare_df$swr_var_ratio_pred <- predict(var_ratio_model_swr, newdata = compare_df)
+
+compare_df <- compare_df %>%
+  group_by(lat, lon) %>%
+  mutate(
+    swr_cell_mean = mean(swr_trace_corrected, na.rm = TRUE),
+    swr_rescaled = swr_cell_mean + (swr_trace_corrected - swr_cell_mean) / swr_var_ratio_pred
+  ) %>%
+  ungroup()
+
+# Check before quantile mapping
+cellwise_check_swr <- compare_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(swr_era, na.rm = TRUE),
+    sd_rescaled = sd(swr_rescaled, na.rm = TRUE),
+    var_ratio_after = swr_rescaled / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_check_swr %>% arrange(desc(abs(var_ratio_after - 1)))
+
+
+# Quantile map on top
+qm_swr_final <- fitQmap(compare_df$swr_era, compare_df$swr_rescaled, method = "QUANT", qstep = 0.01, wet.day=FALSE)
+compare_df$swr_final <- doQmap(compare_df$swr_rescaled, qm_swr_final)
+
+# Check
+cellwise_check_swr <- compare_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(swr_era, na.rm = TRUE),
+    sd_final = sd(swr_final, na.rm = TRUE),
+    var_ratio_after = sd_final / sd_era,
+    .groups = "drop"
+  )
+cellwise_check_swr %>% arrange(desc(abs(var_ratio_after - 1)))
+
+# Overall check too
+tibble(
+  mean_era = mean(compare_df$swr_era, na.rm = TRUE),
+  mean_final = mean(compare_df$swr_final, na.rm = TRUE),
+  sd_era = sd(compare_df$swr_era, na.rm = TRUE),
+  sd_final = sd(compare_df$swr_final, na.rm = TRUE)
+)
+```
+
+Apply to the full trace dataframe:
+```{r}
+swr_bias_model <- swr_latlon  # mean-bias model (elevation excluded)
+
+# Mean correction
+trace$swr_predicted_bias <- predict(swr_bias_model, newdata = trace)
+trace$swr_corrected <- trace$swr - trace$swr_predicted_bias
+
+# Variance rescaling
+trace$swr_var_ratio_pred <- predict(var_ratio_model_swr, newdata = trace)
+
+trace <- trace %>%
+  group_by(lat, lon) %>%
+  mutate(
+    swr_cell_mean = mean(swr_corrected, na.rm = TRUE),
+    swr_rescaled = swr_cell_mean + (swr_corrected - swr_cell_mean) / swr_var_ratio_pred
+  ) %>%
+  ungroup()
+
+# Quantile map
+trace$swr_final <- doQmap(trace$swr_rescaled, qm_swr_final)
+```
+
+validation against ERA5:
+```{r}
+compare_df_swr_check <- era_agg %>%
+  inner_join(trace, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+
+tibble(
+  sd_era = sd(compare_df_swr_check$swr_era, na.rm = TRUE),
+  sd_final = sd(compare_df_swr_check$swr_final, na.rm = TRUE),
+  mean_era = mean(compare_df_swr_check$swr_era, na.rm = TRUE),
+  mean_final = mean(compare_df_swr_check$swr_final, na.rm = TRUE)
+)
+
+qqplot(compare_df_swr_check$swr_era, compare_df_swr_check$swr_final,
+       xlab = "ERA5 quantiles", ylab = "Final corrected TraCE quantiles",
+       main = "QQ: final trace$swr_final vs ERA5")
+abline(0, 1, col = "red")
+```
+######
+precip
+######
+
+Fit and compare candidate models for correcting mean bias:
+```{r}
+precip_lon <- lm(precip ~ lon, data = diag_df)
+precip_latlon <- lm(precip ~ lat + lon, data = diag_df)
+precip_full <- lm(precip ~ elevation + lat + lon, data = diag_df)
+
+summary(precip_lon)
+summary(precip_latlon)
+summary(precip_full)
+
+anova(precip_lon, precip_latlon)
+anova(precip_latlon, precip_full)
+```
+Lon only is best!
+
+Check residuals of the lon-only model against the excluded predictors:
+```{r}
+diag_df$precip_residual <- residuals(precip_lon)
+cor(diag_df$precip_residual, diag_df$lat)
+cor(diag_df$precip_residual, diag_df$elevation)
+```
+
+Apply the mean-bias correction to lon model
+```{r}
+precip_bias_model <- precip_lon 
+
+trace$precip_predicted_bias <- predict(precip_bias_model, newdata = trace)
+trace$precip_corrected <- trace$precip - trace$precip_predicted_bias
+
+compare_df$precip_predicted_bias <- predict(precip_bias_model, newdata = compare_df)
+compare_df$precip_trace_corrected <- compare_df$precip_trace - compare_df$precip_predicted_bias
+
+tibble(
+  mean_bias_raw = mean(compare_df$precip_trace - compare_df$precip_era, na.rm = TRUE),
+  mean_bias_corrected = mean(compare_df$precip_trace_corrected - compare_df$precip_era, na.rm = TRUE)
+)
+```
+Check variance/spread — same as before, does it need rescaling?
+```{r}
+tibble(
+  sd_era = sd(compare_df$precip_era, na.rm = TRUE),
+  sd_trace_raw = sd(compare_df$precip_trace, na.rm = TRUE),
+  sd_trace_corrected = sd(compare_df$precip_trace_corrected, na.rm = TRUE)
+)
+
+cellwise_variance_precip <- compare_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(precip_era, na.rm = TRUE),
+    sd_trace_corrected = sd(precip_trace_corrected, na.rm = TRUE),
+    var_ratio = sd_trace_corrected / sd_era,
+    .groups = "drop"
+  ) %>%
+  left_join(diag_df %>% dplyr::select(lat, lon, elevation), by = c("lat", "lon"))
+
+cor(cellwise_variance_precip$var_ratio, cellwise_variance_precip$elevation)
+cor(cellwise_variance_precip$var_ratio, cellwise_variance_precip$lat)
+cor(cellwise_variance_precip$var_ratio, cellwise_variance_precip$lon)
+
+p1 <- ggplot(diag_df, aes(x = elevation, y = precip_residual)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "precip vs elevation") +
+  theme_minimal()
+
+p2 <- ggplot(diag_df, aes(x = lat, y = precip_residual)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "precip vs lat") +
+  theme_minimal()
+
+p3 <- ggplot(diag_df, aes(x = lon, y = precip_residual)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "precip vs lon") +
+  theme_minimal()
+
+p1 + p2 + p3
+
+tibble(
+  sd_era = 1.125237e-08,
+  sd_trace_raw = 7.712999e-09,
+  sd_trace_corrected = 8.862564e-09,
+  ratio_raw = sd_trace_raw / sd_era,
+  ratio_corrected = sd_trace_corrected / sd_era
+)
+```
+No, varince of mean corrected precip is similar enough to era5 data, though whether 21% variance underestimation is "good enough" or "still worth fixing" is somewhat a judgment call. I'm goign to stop here though. 
+
+ALERT!! looking at variance ratio, all values are at ~0.5. so theres no spatial component to variance mis match, but instead, I should be using quantil mapping, which addresses mean and variance simulaneously. See var_ratio column below:
+
+```{r}
+cellwise_variance_precip %>% arrange(desc(abs(var_ratio - 1)))
+```
+
+Single global quantile mapping on top of the spatial correction, without the added complexity of a spatial variance model:
+
+```{r}
+qm_precip <- fitQmap(compare_df$precip_era, compare_df$precip_trace_corrected, 
+                      method = "QUANT", qstep = 0.01, wet.day=FALSE)
+
+compare_df$precip_final <- doQmap(compare_df$precip_trace_corrected, qm_precip)
+trace$precip_final <- doQmap(trace$precip_corrected, qm_precip)
+
+# Check
+tibble(
+  mean_era = mean(compare_df$precip_era, na.rm = TRUE),
+  mean_final = mean(compare_df$precip_final, na.rm = TRUE),
+  sd_era = sd(compare_df$precip_era, na.rm = TRUE),
+  sd_final = sd(compare_df$precip_final, na.rm = TRUE)
+)
+```
+
+
+```{r}
+tibble(
+  sd_era = sd(compare_df$precip_era, na.rm = TRUE),
+  sd_trace_raw = sd(compare_df$precip_trace, na.rm = TRUE),
+  sd_trace_final = sd(compare_df$precip_final, na.rm = TRUE),
+  ratio_raw = sd_trace_raw / sd_era,
+  ratio_final = sd_trace_final / sd_era
+)
+
+qqplot(compare_df$precip_era, compare_df$precip_final,
+       xlab = "ERA5 quantiles", ylab = "Final corrected TraCE quantiles",
+       main = "QQ: final precip vs ERA5")
+abline(0, 1, col = "red")
+```
+
+linear regression on mean bias from elevation an dlon, then quantile mapping on variance (global, since variance ration is spatially uniform). 
+
+#####################
+#relative humidity
+#####################
+
+Compare models
+
+```{r}
+rh_lat <- lm(rh ~ lat, data = diag_df)
+rh_latlon <- lm(rh ~ lat + lon, data = diag_df)
+rh_full <- lm(rh ~ elevation + lat + lon, data = diag_df)
+
+summary(rh_lat)
+summary(rh_latlon)
+summary(rh_full)
+
+anova(rh_lat, rh_latlon)
+anova(rh_latlon, rh_full)
+
+AIC(rh_lat, rh_latlon, rh_full)
+```
+p values are marginal for lon and lat, insignificant for elevation
+plot:
+
+```{r}
+#NOTE, values in diag_df are the bias
+
+p1 <- ggplot(diag_df, aes(x = elevation, y = rh)) +
+  geom_point(size = 3) + geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "rh vs elevation") + theme_minimal()
+
+p2 <- ggplot(diag_df, aes(x = lat, y = rh)) +
+  geom_point(size = 3) + geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "rh vs lat") + theme_minimal()
+
+p3 <- ggplot(diag_df, aes(x = lon, y = rh)) +
+  geom_point(size = 3) + geom_smooth(method = "lm", se = TRUE) +
+  labs(title = "rh vs lon") + theme_minimal()
+
+p1 + p2 + p3
+```
+not super significance, especially not for elevation. But lon and lat do help explain some of the bias. Apply the mean correction (using lat and lon), then separately check whether the spread still needs fixing.
+
+Apply the mean-bias correction
+```{r}
+rh_bias_model <- rh_latlon
+
+trace$rh_predicted_bias <- predict(rh_bias_model, newdata = trace)
+trace$rh_corrected <- trace$rh - trace$rh_predicted_bias
+
+compare_df$rh_predicted_bias <- predict(rh_bias_model, newdata = compare_df)
+compare_df$rh_trace_corrected <- compare_df$rh_trace - compare_df$rh_predicted_bias
+
+tibble(
+  mean_bias_raw = mean(compare_df$rh_trace - compare_df$rh_era, na.rm = TRUE),
+  mean_bias_corrected = mean(compare_df$rh_trace_corrected - compare_df$rh_era, na.rm = TRUE)
+)
+```
+
+Check whether spread still needs correcting, and whether it's spatially patterned
+```{r}
+tibble(
+  sd_era = sd(compare_df$rh_era, na.rm = TRUE),
+  sd_trace_raw = sd(compare_df$rh_trace, na.rm = TRUE),
+  sd_trace_corrected = sd(compare_df$rh_trace_corrected, na.rm = TRUE)
+)
+
+cellwise_variance_rh <- compare_df %>%
+  group_by(lat, lon, elevation) %>%
+  summarise(
+    sd_era = sd(rh_era, na.rm = TRUE),
+    sd_trace_corrected = sd(rh_trace_corrected, na.rm = TRUE),
+    var_ratio = sd_trace_corrected / sd_era,
+    .groups = "drop"
+  )
+
+cellwise_variance_rh %>% arrange(desc(abs(var_ratio - 1)))
+
+cor(cellwise_variance_rh$var_ratio, cellwise_variance_rh$lat)
+cor(cellwise_variance_rh$var_ratio, cellwise_variance_rh$lon)
+cor(cellwise_variance_rh$var_ratio, cellwise_variance_rh$elevation)
+
+ggplot(cellwise_variance_rh, aes(x = lat, y = var_ratio)) +
+  geom_point(size = 3) + geom_smooth(method = "loess", se = TRUE)
+
+ggplot(cellwise_variance_rh, aes(x = lon, y = var_ratio)) +
+  geom_point(size = 3) + geom_smooth(method = "loess", se = TRUE)
+
+ggplot(cellwise_variance_rh, aes(x = elevation, y = var_ratio)) +
+  geom_point(size = 3) + geom_smooth(method = "loess", se = TRUE)
+```
+Latitude variance ratio seems to change most with latitude
+```{r}
+vr_lat <- lm(var_ratio ~ lat, data = cellwise_variance_rh)
+vr_latlon <- lm(var_ratio ~ lat + lon, data = cellwise_variance_rh)
+
+summary(vr_lat)
+summary(vr_latlon)
+
+anova(vr_lat, vr_latlon)
+```
+Just use lat for variance correction. 
+
+Apply the rescaling, using lat alone:
+```{r}
+var_ratio_model_rh <- lm(var_ratio ~ lat, data = cellwise_variance_rh)
+
+# Rescale compare_df
+compare_df$rh_var_ratio_pred <- predict(var_ratio_model_rh, newdata = compare_df)
+
+compare_df <- compare_df %>%
+  group_by(lat, lon) %>%
+  mutate(
+    rh_cell_mean = mean(rh_trace_corrected, na.rm = TRUE),
+    rh_rescaled = rh_cell_mean + (rh_trace_corrected - rh_cell_mean) / rh_var_ratio_pred
+  ) %>%
+  ungroup()
+
+# Quantile map on top
+#qm_rh_final <- fitQmap(compare_df$rh_era, compare_df$rh_rescaled, method = "QUANT", qstep = 0.01, wet.day=FALSE)
+#compare_df$rh_final <- doQmap(compare_df$rh_rescaled, qm_rh_final)
+
+# Check
+cellwise_check_rh <- compare_df %>%
+  group_by(lat, lon) %>%
+  summarise(
+    sd_era = sd(rh_era, na.rm = TRUE),
+    sd_rescaled = sd(rh_rescaled, na.rm = TRUE),
+    var_ratio_after = sd_rescaled / sd_era,
+    .groups = "drop"
+  )
+cellwise_check_rh %>% arrange(desc(abs(var_ratio_after - 1)))
+
+tibble(
+  mean_era = mean(compare_df$rh_era, na.rm = TRUE),
+  mean_final = mean(compare_df$rh_rescaled, na.rm = TRUE),
+  sd_era = sd(compare_df$rh_era, na.rm = TRUE),
+  sd_final = sd(compare_df$rh_rescaled, na.rm = TRUE)
+)
+
+compare_df$rh_final <- compare_df$rh_rescaled
+```
+
+```{r}
+# Density overlay
+ggplot(compare_df) +
+  geom_density(aes(x = rh_era, color = "ERA5"), linewidth = 1) +
+  geom_density(aes(x = rh_trace, color = "TraCE (raw)"), linewidth = 1, linetype = "dashed") +
+  geom_density(aes(x = rh_final, color = "TraCE (final corrected)"), linewidth = 1) +
+  labs(x = "Relative Humidity", color = "Source") +
+  theme_minimal()
+
+```
+Not perfect match, but quantile mapping, which would fix this, generates incorrect values in the paleo period, since paleo value fall outside the rage of values that quantile mapping was fit on. 
+
+Apply to the full trace dataframe:
+```{r}
+rh_bias_model <- rh_latlon  # mean-bias model, already applied above but confirming for clarity
+
+trace$rh_var_ratio_pred <- predict(var_ratio_model_rh, newdata = trace)
+
+trace <- trace %>%
+  group_by(lat, lon) %>%
+  mutate(
+    rh_cell_mean = mean(rh_corrected, na.rm = TRUE),
+    rh_rescaled = rh_cell_mean + (rh_corrected - rh_cell_mean) / rh_var_ratio_pred
+  ) %>%
+  ungroup()
+
+trace$rh_final <- trace$rh_rescaled
+```
+
+```{r}
+compare_df_rh_check <- era_agg %>%
+  inner_join(trace, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+
+tibble(
+  sd_era = sd(compare_df_rh_check$rh_era, na.rm = TRUE),
+  sd_final = sd(compare_df_rh_check$rh_final, na.rm = TRUE),
+  mean_era = mean(compare_df_rh_check$rh_era, na.rm = TRUE),
+  mean_final = mean(compare_df_rh_check$rh_final, na.rm = TRUE)
+)
+
+qqplot(compare_df_rh_check$rh_era, compare_df_rh_check$rh_final,
+       xlab = "ERA5 quantiles", ylab = "Final corrected TraCE quantiles",
+       main = "QQ: final trace$rh_final vs ERA5")
+abline(0, 1, col = "red")
+```
+Plots!
+
+```{r}
+#compare_df column names
+var_config <- tibble::tribble(
+  ~var,     ~label,      ~era_col,    ~raw_col,     ~corrected_col,
+  "tair",   "Air Temp",  "tair_era",  "tair_trace", "tair_corrected",
+  "sp",     "Surf Pres", "sp_era",    "sp_trace",   "sp_final",
+  "wind",   "Wind",      "wind_era",  "wind_trace", "wind_final",
+  "swr",    "SW Rad",    "swr_era",   "swr_trace",  "swr_final",
+  "precip", "Precip",    "precip_era","precip_trace","precip_final",
+  "rh",     "RH",        "rh_era",    "rh_trace",   "rh_final"
+)
+```
+
+
+Maps!
+```{r}
+
+plot_variable_row <- function(compare_df, alaska, var_label, era_col, raw_col, corrected_col, 
+                               letter_start = 1) {
+  
+  cellwise <- compare_df %>%
+    group_by(lat, lon) %>%
+    summarise(
+      mean_era = mean(.data[[era_col]], na.rm = TRUE),
+      mean_raw = mean(.data[[raw_col]], na.rm = TRUE),
+      mean_corrected = mean(.data[[corrected_col]], na.rm = TRUE),
+      sd_era = sd(.data[[era_col]], na.rm = TRUE),
+      sd_raw = sd(.data[[raw_col]], na.rm = TRUE),
+      sd_corrected = sd(.data[[corrected_col]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      bias_before = mean_raw - mean_era,
+      bias_after = mean_corrected - mean_era,
+      var_ratio_before = sd_raw / sd_era,
+      var_ratio_after = sd_corrected / sd_era
+    )
+  
+  # Shared, symmetric-around-0 color scale across the 2 bias maps
+  bias_dev <- max(abs(c(cellwise$bias_before, cellwise$bias_after)), na.rm = TRUE)
+  bias_range <- c(-bias_dev, bias_dev)
+  
+  # Shared, symmetric-around-1 color scale across the 2 variance ratio maps
+  ratio_dev <- max(abs(c(cellwise$var_ratio_before, cellwise$var_ratio_after) - 1), na.rm = TRUE)
+  ratio_range <- c(1 - ratio_dev, 1 + ratio_dev)
+  
+  letters_seq <- letters[letter_start:(letter_start + 3)]
+  
+  base_map <- function(data, fill_var, panel_letter, legend_title, limits, midpoint) {
+    ggplot() +
+      geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3) +
+      geom_point(data = data, aes(x = lon, y = lat, color = .data[[fill_var]]), size = 3) +
+      coord_sf(xlim = c(-170, -130), ylim = c(51, 72)) +
+      scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                             midpoint = midpoint, limits = limits, name = legend_title) +
+      ggtitle(paste0("(", panel_letter, ")")) +
+      theme_minimal(base_size = 8) +
+      theme(
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        legend.title = element_text(size = 7),
+        legend.text = element_text(size = 6),
+        legend.key.height = unit(0.25, "cm"),
+        legend.key.width = unit(0.5, "cm"),
+        plot.title = element_text(size = 9, face = "bold"),
+        axis.title = element_blank(),
+        axis.text = element_text(size = 6)
+      ) +
+      guides(color = guide_colorbar(title.position = "top", title.hjust = 0.5))
+  }
+  
+  p1 <- base_map(cellwise, "bias_before", letters_seq[1],
+                  paste0(var_label, " mean bias before correction"), bias_range, midpoint = 0)
+  p2 <- base_map(cellwise, "bias_after", letters_seq[2],
+                  paste0(var_label, " mean bias after correction"), bias_range, midpoint = 0)
+  p3 <- base_map(cellwise, "var_ratio_before", letters_seq[3],
+                  paste0(var_label, " variance ratio before correction"), ratio_range, midpoint = 1)
+  p4 <- base_map(cellwise, "var_ratio_after", letters_seq[4],
+                  paste0(var_label, " variance ratio after correction"), ratio_range, midpoint = 1)
+  
+  p1 + p2 + p3 + p4 + plot_layout(nrow = 1)
+}
+
+# Build all 6 rows and stack them
+map_rows <- pmap(var_config, function(var, label, era_col, raw_col, corrected_col) {
+  plot_variable_row(compare_df, alaska, label, era_col, raw_col, corrected_col)
+})
+
+# Stack vertically (this will be a tall image - consider saving to file rather than viewing inline)
+full_map_grid <- wrap_plots(map_rows, ncol = 1)
+full_map_grid
+
+# Recommended: save at large size given 6x5 = 30 panels
+#ggsave("bias_correction_maps.png", full_map_grid, width = 16, height = 20, dpi = 200)
+```
+
+Try different metrics: 
+Rough, benchmarks (common conventions, not hard rules):
+
+Standardized bias: |SB| < 0.2 negligible, < 0.5 small/acceptable, > 0.8 large/concerning
+Log variance ratio: within ±0.1–0.2 is good (ratio ~0.8–1.25); beyond ±0.5 (ratio <0.6 or >1.6) is concerning
+Overlap coefficient: > 0.8 good, 0.6–0.8 acceptable, < 0.5 poor
+
+```{r}
+
+overlap_coef <- function(x, y) {
+  x <- x[!is.na(x)]; y <- y[!is.na(y)]
+  if (length(x) < 2 || length(y) < 2) return(NA_real_)
+  common_range <- range(c(x, y))
+  d1 <- density(x, from = common_range[1], to = common_range[2], n = 512)
+  d2 <- density(y, from = common_range[1], to = common_range[2], n = 512)
+  sum(pmin(d1$y, d2$y)) * diff(d1$x[1:2])
+}
+
+plot_variable_row <- function(compare_df, alaska, var_label, era_col, raw_col, corrected_col,
+                               letter_start = 1) {
+  
+  cellwise <- compare_df %>%
+    group_by(lat, lon) %>%
+    summarise(
+      mean_era = mean(.data[[era_col]], na.rm = TRUE),
+      mean_raw = mean(.data[[raw_col]], na.rm = TRUE),
+      mean_corrected = mean(.data[[corrected_col]], na.rm = TRUE),
+      sd_era = sd(.data[[era_col]], na.rm = TRUE),
+      sd_raw = sd(.data[[raw_col]], na.rm = TRUE),
+      sd_corrected = sd(.data[[corrected_col]], na.rm = TRUE),
+      ovl_before = overlap_coef(.data[[era_col]], .data[[raw_col]]),
+      ovl_after = overlap_coef(.data[[era_col]], .data[[corrected_col]]),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      std_bias_before = (mean_raw - mean_era) / sd_era,
+      std_bias_after = (mean_corrected - mean_era) / sd_era,
+      log_var_ratio_before = log(sd_raw / sd_era),
+      log_var_ratio_after = log(sd_corrected / sd_era)
+    )
+  
+  bias_dev <- max(abs(c(cellwise$std_bias_before, cellwise$std_bias_after)), na.rm = TRUE)
+  bias_range <- c(-bias_dev, bias_dev)
+  
+  ratio_dev <- max(abs(c(cellwise$log_var_ratio_before, cellwise$log_var_ratio_after)), na.rm = TRUE)
+  ratio_range <- c(-ratio_dev, ratio_dev)
+  
+  letters_seq <- letters[letter_start:(letter_start + 5)]
+  
+  diverging_map <- function(data, fill_var, panel_letter, legend_title, limits) {
+    ggplot() +
+      geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3) +
+      geom_point(data = data, aes(x = lon, y = lat, color = .data[[fill_var]]), size = 3) +
+      coord_sf(xlim = c(-170, -130), ylim = c(51, 72)) +
+      scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                             midpoint = 0, limits = limits, name = legend_title) +
+      ggtitle(paste0("(", panel_letter, ")")) +
+      theme_minimal(base_size = 8) +
+      theme(legend.position = "bottom", legend.direction = "horizontal",
+            legend.title = element_text(size = 6.5), legend.text = element_text(size = 6),
+            legend.key.height = unit(0.22, "cm"), legend.key.width = unit(0.45, "cm"),
+            plot.title = element_text(size = 9, face = "bold"),
+            axis.title = element_blank(), axis.text = element_text(size = 6)) +
+      guides(color = guide_colorbar(title.position = "top", title.hjust = 0.5))
+  }
+  
+  overlap_map <- function(data, fill_var, panel_letter, legend_title) {
+    ggplot() +
+      geom_sf(data = alaska, fill = NA, color = "black", linewidth = 0.3) +
+      geom_point(data = data, aes(x = lon, y = lat, color = .data[[fill_var]]), size = 3) +
+      coord_sf(xlim = c(-170, -130), ylim = c(51, 72)) +
+      scale_color_viridis_c(limits = c(0, 1), name = legend_title) +
+      ggtitle(paste0("(", panel_letter, ")")) +
+      theme_minimal(base_size = 8) +
+      theme(legend.position = "bottom", legend.direction = "horizontal",
+            legend.title = element_text(size = 6.5), legend.text = element_text(size = 6),
+            legend.key.height = unit(0.22, "cm"), legend.key.width = unit(0.45, "cm"),
+            plot.title = element_text(size = 9, face = "bold"),
+            axis.title = element_blank(), axis.text = element_text(size = 6)) +
+      guides(color = guide_colorbar(title.position = "top", title.hjust = 0.5))
+  }
+  
+  p1 <- diverging_map(cellwise, "std_bias_before", letters_seq[1],
+                       paste0(var_label, " standardized bias (before)"), bias_range)
+  p2 <- diverging_map(cellwise, "std_bias_after", letters_seq[2],
+                       paste0(var_label, " standardized bias (after)"), bias_range)
+  p3 <- diverging_map(cellwise, "log_var_ratio_before", letters_seq[3],
+                       paste0(var_label, " log variance ratio (before)"), ratio_range)
+  p4 <- diverging_map(cellwise, "log_var_ratio_after", letters_seq[4],
+                       paste0(var_label, " log variance ratio (after)"), ratio_range)
+  p5 <- overlap_map(cellwise, "ovl_before", letters_seq[5],
+                     paste0(var_label, " distribution overlap (before)"))
+  p6 <- overlap_map(cellwise, "ovl_after", letters_seq[6],
+                     paste0(var_label, " distribution overlap (after)"))
+  
+  p1 + p2 + p3 + p4 + p5 + p6 + plot_layout(nrow = 1)
+}
+
+letter_starts <- seq(1, by = 6, length.out = nrow(var_config))
+
+map_rows <- pmap(
+  list(var_config$var, var_config$label, var_config$era_col,
+       var_config$raw_col, var_config$corrected_col, letter_starts),
+  function(var, label, era_col, raw_col, corrected_col, ls) {
+    plot_variable_row(compare_df, alaska, label, era_col, raw_col, corrected_col, letter_start = ls)
+  }
+)
+
+full_map_grid <- wrap_plots(map_rows, ncol = 1)
+#ggsave("bias_correction_maps_v2.png", full_map_grid, width = 18, height = 20, dpi = 200)
+
+```
+
+
+Time series!
+```{r}
+plot_annual_summary <- function(compare_df, var_label, era_col, raw_col, corrected_col, connect_lines = TRUE) {
+  
+  yearly <- compare_df %>%
+    group_by(year) %>%
+    summarise(
+      era_mean = mean(.data[[era_col]], na.rm = TRUE),
+      era_sd = sd(.data[[era_col]], na.rm = TRUE),
+      raw_mean = mean(.data[[raw_col]], na.rm = TRUE),
+      raw_sd = sd(.data[[raw_col]], na.rm = TRUE),
+      corrected_mean = mean(.data[[corrected_col]], na.rm = TRUE),
+      corrected_sd = sd(.data[[corrected_col]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    pivot_longer(
+      cols = -year,
+      names_to = c("source", ".value"),
+      names_pattern = "(.*)_(mean|sd)"
+    ) %>%
+    mutate(source = dplyr::recode(source,
+                            era = "ERA5",
+                            raw = "TraCE (raw)",
+                            corrected = "TraCE (corrected)"),
+           source = factor(source, levels = c("ERA5", "TraCE (raw)", "TraCE (corrected)")))
+  
+  p <- ggplot(yearly, aes(x = year, y = mean, color = source)) +
+    geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.4, alpha = 0.4) +
+    geom_point(size = 1.3)
+  
+  if (connect_lines) {
+    p <- p + geom_line(alpha = 0.7)
+  }
+  
+  p +
+    scale_color_manual(values = c("ERA5" = "black", "TraCE (raw)" = "#E74C3C", "TraCE (corrected)" = "#2E86C1")) +
+    labs(title = var_label, x = "Year", y = "Mean ± SD", color = NULL) +
+    theme_minimal(base_size = 10)
+}
+
+# Run for all 6 variables, stacked
+ts_plots <- pmap(var_config, function(var, label, era_col, raw_col, corrected_col) {
+  plot_annual_summary(compare_df, label, era_col, raw_col, corrected_col, connect_lines = TRUE)
+})
+
+wrap_plots(ts_plots, ncol = 1) & theme(legend.position = "bottom")
+
+#ggsave("bias_correction_timeseries.png", wrap_plots(ts_plots, ncol = 1), width = 10, height = 22, dpi = 200)
+```
+
+
+```{r}
+plot_annual_summary <- function(compare_df, var_label, era_col, raw_col, corrected_col, connect_lines = TRUE) {
+  
+  yearly_stats <- compare_df %>%
+    dplyr::select(year, all_of(c(era_col, raw_col, corrected_col))) %>%
+    pivot_longer(-year, names_to = "source_col", values_to = "value") %>%
+    mutate(source = case_when(
+      source_col == era_col ~ "ERA5",
+      source_col == raw_col ~ "TraCE (raw)",
+      source_col == corrected_col ~ "TraCE (corrected)"
+    )) %>%
+    group_by(year, source) %>%
+    summarise(
+      q0 = min(value, na.rm = TRUE),
+      q25 = quantile(value, 0.25, na.rm = TRUE),
+      median = median(value, na.rm = TRUE),
+      q75 = quantile(value, 0.75, na.rm = TRUE),
+      q100 = max(value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(source = factor(source, levels = c("ERA5", "TraCE (raw)", "TraCE (corrected)")))
+  
+  dodge <- position_dodge(width = 0.6)
+  
+  p <- ggplot(yearly_stats, aes(x = year, color = source)) +
+    geom_linerange(aes(ymin = q0, ymax = q100), position = dodge, alpha = 0.3, linewidth = 0.5) +
+    geom_linerange(aes(ymin = q25, ymax = q75), position = dodge, linewidth = 1.6) +
+    geom_point(aes(y = median), position = dodge, size = 1.2)
+  
+  if (connect_lines) {
+    p <- p + geom_line(aes(y = median, group = source), position = dodge, alpha = 0.6)
+  }
+  
+  p +
+    scale_color_manual(values = c("ERA5" = "black", "TraCE (raw)" = "#E74C3C", "TraCE (corrected)" = "#2E86C1")) +
+    labs(title = var_label, x = "Year", y = "Median (thick = IQR, thin = min/max)", color = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(legend.position = "bottom")
+}
+
+ts_plots <- pmap(var_config, function(var, label, era_col, raw_col, corrected_col) {
+  plot_annual_summary(compare_df, label, era_col, raw_col, corrected_col, connect_lines = TRUE)
+})
+
+full_ts_grid <- wrap_plots(ts_plots, ncol = 1) & theme(legend.position = "bottom")
+#ggsave("bias_correction_timeseries_v2.png", full_ts_grid, width = 10, height = 24, dpi = 200)
+
+```
+
+Summary table
+```{r}
+compare_df_final <- era_agg %>%
+  inner_join(trace, by = c("lat", "lon", "year"), suffix = c("_era", "_trace"))
+
+# Confirm all expected corrected columns are present
+var_config$corrected_col %in% names(compare_df_final)
+
+skewness <- function(x) {
+  x <- x[!is.na(x)]
+  n <- length(x)
+  m <- mean(x)
+  s <- sd(x)
+  (sum((x - m)^3) / n) / s^3
+}
+
+overlap_coef <- function(x, y) {
+  x <- x[!is.na(x)]; y <- y[!is.na(y)]
+  if (length(x) < 2 || length(y) < 2) return(NA_real_)
+  common_range <- range(c(x, y))
+  d1 <- density(x, from = common_range[1], to = common_range[2], n = 512)
+  d2 <- density(y, from = common_range[1], to = common_range[2], n = 512)
+  sum(pmin(d1$y, d2$y)) * diff(d1$x[1:2])
+}
+
+compute_metrics <- function(era, raw, corrected) {
+  era <- era; raw <- raw; corrected <- corrected
+  n <- sum(!is.na(era) & !is.na(corrected))
+  
+  era_mean <- mean(era, na.rm = TRUE)
+  era_sd <- sd(era, na.rm = TRUE)
+  
+  metrics <- function(vals) {
+    resid <- vals - era
+    me <- mean(resid, na.rm = TRUE)
+    mae <- mean(abs(resid), na.rm = TRUE)
+    rmse <- sqrt(mean(resid^2, na.rm = TRUE))
+    std_bias <- me / era_sd
+    pbias <- 100 * sum(resid, na.rm = TRUE) / sum(era, na.rm = TRUE)
+    sd_ratio <- sd(vals, na.rm = TRUE) / era_sd
+    log_var_ratio <- log(sd_ratio)
+    r <- suppressWarnings(cor(vals, era, use = "complete.obs"))
+    nse <- 1 - sum(resid^2, na.rm = TRUE) / sum((era - era_mean)^2, na.rm = TRUE)
+    willmott_d <- 1 - sum(resid^2, na.rm = TRUE) /
+      sum((abs(vals - era_mean) + abs(era - era_mean))^2, na.rm = TRUE)
+    ks <- suppressWarnings(ks.test(vals, era)$statistic)
+    ovl <- overlap_coef(vals, era)
+    skew_diff <- skewness(vals) - skewness(era)
+    q10_bias <- quantile(vals, 0.1, na.rm = TRUE) - quantile(era, 0.1, na.rm = TRUE)
+    q50_bias <- quantile(vals, 0.5, na.rm = TRUE) - quantile(era, 0.5, na.rm = TRUE)
+    q90_bias <- quantile(vals, 0.9, na.rm = TRUE) - quantile(era, 0.9, na.rm = TRUE)
+    
+    tibble(me, mae, rmse, std_bias, pbias, sd_ratio, log_var_ratio,
+           r, nse, willmott_d, ks, ovl, skew_diff, q10_bias, q50_bias, q90_bias)
+  }
+  
+  bind_rows(
+    metrics(raw) %>% mutate(stage = "raw"),
+    metrics(corrected) %>% mutate(stage = "corrected")
+  ) %>% mutate(n = n)
+}
+
+diagnostic_table <- pmap_dfr(var_config, function(var, label, era_col, raw_col, corrected_col) {
+  compute_metrics(
+    compare_df_final[[era_col]],
+    compare_df_final[[raw_col]],
+    compare_df_final[[corrected_col]]
+  ) %>% mutate(variable = var, .before = 1)
+})
+
+diagnostic_table
+
+```
+
+
+```{r}
+
+metric_guide <- tribble(
+  ~metric, ~meaning, ~acceptable_range, ~notes,
+  "me", "Mean error (corrected - ERA5). Raw bias in original units.", "Close to 0", "Sign matters: + means TraCE runs high.",
+  "std_bias", "ME divided by ERA5's SD - bias expressed relative to natural variability (like Cohen's d).", "|std_bias| < 0.2 negligible, < 0.5 acceptable, > 0.8 concerning", "More interpretable than raw ME across variables with different units/scales.",
+  "pbias", "Percent bias: 100 x sum(error)/sum(observed).", "|PBIAS| < 10% very good, < 15% good, < 25% satisfactory (Moriasi et al. 2007 hydrology convention)", "Only meaningful for ratio-scale variables with a non-zero, physically-grounded baseline (e.g., precip, wind, sp). Avoid for tair unless in Kelvin.",
+  "mae", "Mean absolute error - average magnitude of error, ignoring direction.", "Smaller is better; compare raw vs corrected directly", "Less sensitive to outliers than RMSE.",
+  "rmse", "Root mean squared error - penalizes large errors more than MAE.", "Smaller is better; compare raw vs corrected directly", "RMSE >> MAE suggests a few large outlier errors are inflating it.",
+  "sd_ratio", "Ratio of corrected SD to ERA5 SD - are you preserving natural variability?", "0.8 - 1.25 good, < 0.6 or > 1.6 concerning", "< 1 means corrected data is too smooth/damped; > 1 means overdispersed.",
+  "log_var_ratio", "log(sd_ratio) - symmetric version of the variance ratio.", "Within +/-0.1-0.2 good; beyond +/-0.5 concerning", "Fixes the skew of raw ratios (0.5 and 2.0 are equally 'bad' but look very different as raw ratios).",
+  "r", "Pearson correlation between corrected TraCE and ERA5 across time/space.", "No hard threshold - context dependent", "Bias correction methods used here (regression + quantile mapping) do NOT target this; a flat r before/after is expected, not a failure.",
+  "nse", "Nash-Sutcliffe Efficiency: 1 = perfect, 0 = no better than using the ERA5 mean as a predictor, negative = worse than the mean.", "> 0.5 acceptable, > 0.65 good, > 0.75 very good (Moriasi et al. 2007)", "Sensitive to both bias and correlation - a strong single summary metric, but penalized heavily by low r given the correction methods used here.",
+  "willmott_d", "Index of agreement - normalized measure of prediction error, bounded 0-1.", "> 0.65 acceptable, > 0.8 good", "Less sensitive to low correlation than NSE; a fairer metric here given the correction methods don't target correlation.",
+  "ks", "Kolmogorov-Smirnov statistic - max distance between the two empirical CDFs (whole-distribution shape match).", "< 0.1 good, 0.1-0.2 moderate, > 0.2 poor", "Directly answers 'does the full distribution match', independent of mean/variance decomposition.",
+  "ovl", "Overlap coefficient - fraction of the two densities that overlap.", "> 0.8 good, 0.6-0.8 acceptable, < 0.5 poor", "Intuitive complement to KS; accounts for spread automatically the way you asked about.",
+  "skew_diff", "Difference in distribution skewness (corrected - ERA5).", "Close to 0", "Flags whether the corrected distribution's asymmetry (e.g., long tail) matches ERA5's.",
+  "q10_bias / q50_bias / q90_bias", "Bias at the 10th/50th/90th percentile specifically.", "Close to 0 at all three", "Mean-based metrics can look fine while the tails (extremes - relevant for fire/ignition risk) are still off. Check these especially for precip and wind."
+)
+
+print(metric_guide, n = Inf, width = Inf)
+```
+
+
+```{r}
+flags <- diagnostic_table %>%
+  filter(stage == "corrected") %>%
+  mutate(
+    flag_bias = abs(std_bias) > 0.5,
+    flag_variance = log_var_ratio < -0.5 | log_var_ratio > log(1.6),
+    flag_distribution = ks > 0.2 | ovl < 0.6,
+    flag_fit = nse < 0.5 & willmott_d < 0.65,
+    n_flags = flag_bias + flag_variance + flag_distribution + flag_fit
+  ) %>%
+  dplyr::select(variable, std_bias, log_var_ratio, ks, ovl, nse, willmott_d,
+         flag_bias, flag_variance, flag_distribution, flag_fit, n_flags) %>%
+  arrange(desc(n_flags))
+
+flags
+```
+Since TraCE was simulated from a gcm, and does not use proxy data to constrian it, there will never be perfect year-to-year correspondence between era5 and TraCE. 
+
+Since each variable's correction uses a different spatial predictor (elevation for sp, lat+lon for wind/swr, lat for rh, lon for precip), each variable's between-cell pattern got reshaped differently — which can shift the pooled correlation substantially, even while the within-cell temporal relationships (the part your shuffle check already confirmed is untouched) stay intact.
+
+What actually matters is realistic joint behavior across variables within TraCE's own simulated timeline. Really, I should prioritize checking whether the independent per-variable corrections have degraded cross-variable covariance, before investing in Schaake shuffle or MBCn. Quick diagnostic:
+In other words, does correcting TraCE alter interactions between climate variables that result from the simulation - ie hot, dry or wet cold. 
+```{r}
+# Compare correlation structure between variables, raw TraCE vs corrected TraCE
+vars_raw <- trace %>% dplyr::select(tair, wind, swr, precip, rh, sp)
+vars_corrected <- trace %>% dplyr::select(tair_corrected, wind_final, swr_final, precip_final, rh_final, sp_final)
+
+cor(vars_raw, use = "complete.obs")
+cor(vars_corrected, use = "complete.obs")
+```
+pair raw	corrected	change:
+wind–precip:	+0.694	-0.091; collapsed and flipped. this was the strongest raw relationship (storms bring wind + rain together), now essentially gone
+rh–sp:	-0.567	+0.381; sign flip, large magnitude change
+wind–sp:	-0.266	+0.455; sign flip
+swr–precip:	-0.547	+0.098; sign flip, mostly wiped out
+tair–rh:	-0.189	+0.416; sign flip
+
+```{r}
+
+decompose_cor <- function(df, v1, v2, lat_col = "lat", lon_col = "lon") {
+  df <- df %>%
+    group_by(.data[[lat_col]], .data[[lon_col]]) %>%
+    mutate(
+      v1_within = .data[[v1]] - mean(.data[[v1]], na.rm = TRUE),
+      v2_within = .data[[v2]] - mean(.data[[v2]], na.rm = TRUE),
+      v1_cellmean = mean(.data[[v1]], na.rm = TRUE),
+      v2_cellmean = mean(.data[[v2]], na.rm = TRUE)
+    ) %>%
+    ungroup()
+  
+  cellmeans <- df %>% distinct(.data[[lat_col]], .data[[lon_col]], v1_cellmean, v2_cellmean)
+  
+  tibble(
+    pair = paste(v1, v2, sep = "-"),
+    within_cell_r = cor(df$v1_within, df$v2_within, use = "complete.obs"),
+    between_cell_r = cor(cellmeans$v1_cellmean, cellmeans$v2_cellmean, use = "complete.obs")
+  )
+}
+
+pairs <- combn(c("tair_corrected", "wind_final", "swr_final", "precip_final", "rh_final", "sp_final"), 2, simplify = FALSE)
+pairs_raw <- combn(c("tair", "wind", "swr", "precip", "rh", "sp"), 2, simplify = FALSE)
+
+decomp_corrected <- map_dfr(pairs, ~decompose_cor(trace, .x[1], .x[2]))
+decomp_raw <- map_dfr(pairs_raw, ~decompose_cor(trace, .x[1], .x[2]))
+
+decomp_raw
+decomp_corrected
+```
+
+
+Between cell column is not preserved after correction. HOWERVER bias correction preserves within-location temporal co-occurrence of variables (verified above, within_cell_r) but does not preserve raw TraCE's cross-variable spatial covariance pattern (between_cell_r), since each variable's spatial correction uses an independently-chosen predictor set justified by its own diagnostics. Since the downstream use (fire modeling within specific grid cells over time) relies on the within-cell relationships rather than the cross-cell ones, this is okay.
+
+NOT NEEDED:
+Schaake shuffle reorders each variable's already-corrected values within each grid cell so that their rank order matches the rank order of TraCE's own raw output. - if within-location temporal co-curence of variables was not preserved after correction, then schaake shuffle would be the next step, below. However, we can skip this!
+```{r}
+# 
+# schaake_shuffle <- function(trace, vars_final, vars_raw) {
+#   # vars_final: named vector mapping variable -> corrected column name
+#   # vars_raw: named vector mapping variable -> raw column name
+#   # Shuffles within each lat/lon cell, using raw TraCE's own rank order as the target structure
+#   
+#   trace %>%
+#     group_by(lat, lon, year) %>%
+#     group_modify(function(df, key) {
+#       for (v in names(vars_final)) {
+#         raw_col <- vars_raw[[v]]
+#         final_col <- vars_final[[v]]
+#         
+#         # Rank order of this cell's RAW TraCE values (the structure we want to preserve)
+#         raw_rank <- rank(df[[raw_col]], ties.method = "first")
+#         
+#         # Sort this cell's corrected values, then reassign them according to raw's rank order
+#         sorted_corrected <- sort(df[[final_col]])
+#         df[[paste0(v, "_shuffled")]] <- sorted_corrected[raw_rank]
+#       }
+#       df
+#     }) %>%
+#     ungroup()
+# }
+# 
+# vars_final <- c(tair = "tair_corrected", wind = "wind_final", swr = "swr_final",
+#                  precip = "precip_final", rh = "rh_final", sp = "sp_final")
+# vars_raw <- c(tair = "tair", wind = "wind", swr = "swr",
+#               precip = "precip", rh = "rh", sp = "sp")
+# 
+# trace_shuffled <- schaake_shuffle(trace, vars_final, vars_raw)
+```
+
+re-check correlation after shuffle:
+```{r}
+# vars_shuffled <- trace_shuffled %>% 
+#   dplyr::select(tair_shuffled, wind_shuffled, swr_shuffled, precip_shuffled, rh_shuffled, sp_shuffled)
+# 
+# cor(vars_shuffled, use = "complete.obs")
+```
+
+Final notes:
+
+** What has been preserved after correction?
+
+1. Each cell's own climatological identity (central Alaska being hot/dry, a coastal cell being cool/wet). This comes from the mean bias correction, which was deliberately fit per-cell (using elevation/lat/lon as predictors) specifically so each cell's corrected values match that cell's own ERA5 climatology. This is intact and well-validated. It's not something the decomposition analysis was testing, it's just a direct consequence of doing spatially-varying mean correction well.
+
+2. Within-cell, year-to-year co-occurrence between variables — this is what the decomposition analysis actually tested: in a given cell, does a windy year also tend to be a rainy year, across the 16,000-year record, in roughly the same way it did in raw TraCE? That's what came back preserved (within_cell_r matching between raw and corrected). This is about temporal pairing of conditions at one location, not about which location has which climate.
+
+** What was not preserved?
+
+the spatial covariance between two variables' patterns across cells. Concretely: in raw TraCE, cells with high average wind also tended to have high average precipitation (r=0.93 between-cell). After correction, that's no longer true (r=-0.39), because wind's spatial correction used lat+lon while precip's used lon alone — two different, independently-fit spatial models that happened to reshape each variable's geography differently.
+
+Critically, this is not the same as saying a neighboring cell's fire risk affects another cell — it's a purely statistical artifact about how each variable's own spatial pattern was reshaped relative to each other variable's spatial pattern, nothing to do with cells influencing each other physically.Your reasoning is right, but the actual condition to check is different from what you stated: it's not about whether neighboring cells physically influence each other's fire risk — it's about whether your fire model, when estimating risk for cell X at year Y, ever needs to relate variable-A's value in cell X to variable-B's value in a different cell. Given your model structure (per-cell strike counts → ignition probability → burned area, driven by that cell's own climate/road/proximity predictors), each cell's fire probability is estimated from that cell's own driver values — so the broken between-cell cross-variable pattern genuinely doesn't enter the calculation anywhere.
+
+## The fire model estimates ignition and burned-area probability independently per grid cell, using only that cell's own climate driver values; therefore preservation of within-cell temporal co-occurrence between variables — confirmed via decomposition analysis — is the relevant validation criterion, while cross-cell spatial covariance between variables (not preserved) does not affect model inputs.
+
+** If realtionships like 'windy cells are often rainy' aren't preserverd, how is it that within-cell relatioships are still maintained?
+
+Within a cell: the correction is just "shift and stretch" — and that preserves correlation
+
+For any single grid cell, walk through what your correction actually does to that cell's ~40+ years (or full 16,000-year run) of values:
+
+Mean bias correction: subtracts one fixed number from every value in that cell (the regression's predicted bias for that cell's elevation/lat/lon — the same number every year, since the cell's coordinates don't change year to year).
+Variance rescaling: multiplies each value's deviation from the cell mean by one fixed ratio (again, the same ratio every year in that cell).
+
+
+Across cells: each cell gets a different shift/stretch, and that's where it breaks
+
+The between-cell comparison isn't "how do two variables move together over time." It's "does the level of variable A across the 23 cells line up with the level of variable B across those same 23 cells." That comparison depends entirely on the 23 shift amounts (a values) and 23 stretch amounts (b values) that got applied — and those were fit completely independently per variable, using different predictors:
+
+- sp's cell-to-cell shifts come from an elevation-based model
+- wind's come from a lat+lon-based model
+- precip's come from a lon-only model
+
+Since each variable's set of 23 per-cell adjustments was derived from its own, unrelated regression, there's no reason the pattern of those adjustments across cells should line up between variables — even though each individual cell's internal affine transform preserves that cell's own temporal correlation. It's the difference between "each cell gets internally rescaled consistently" (preserves within-cell relationships) and "the 23 rescaling recipes happen to be unrelated to each other across variables" (destroys the cross-variable pattern of those recipes when compared cell-to-cell).
+
+## within-cell correlation only cares about how a cell's own values move relative to each other over time, untouched by shift/stretch. Between-cell correlation cares about the specific shift/stretch amounts themselves — and those were deliberately, independently customized per variable, so of course they don't agree with each other.
+
+
+# Export models
+```{r}
+# In script 1's export block:
+bias_correction_models <- list(
+  tair = list(affine = tair_affine_model),
+  sp = list(mean_model = sp_bias_model, var_ratio_model = var_ratio_model_sp),
+  wind = list(mean_model = wind_bias_model, var_ratio_model = var_ratio_model_wind),
+  swr = list(mean_model = swr_bias_model),   # variance rescale removed
+  precip = list(mean_model = precip_bias_model, qm = qm_precip),
+  rh = list(mean_model = rh_bias_model, var_ratio_model = var_ratio_model_rh)
+)
+
+saveRDS(bias_correction_models, file.path(rds_root, "sp_bias_correction_models.rds"))
+
+# Also save the elevation lookup and TraCE's 23-cell grid - needed to reprocess the full record
+trace_cells <- trace %>% distinct(lat, lon)
+nrow(trace_cells)  # should be 23 - confirm before proceeding
+
+saveRDS(trace_cells, file.path(rds_root, "trace_cells.rds"))
+saveRDS(trace_elev_lookup, file.path(rds_root, "trace_elev_lookup.rds"))
+```

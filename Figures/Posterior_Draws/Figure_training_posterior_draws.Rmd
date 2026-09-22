@@ -1,0 +1,1393 @@
+---
+title: "Plotting posterior draws, training period"
+author: "Charlotte Uden"
+date: "2026-09-05"
+output: html_document
+---
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(data.table)
+library(raster)
+library(sp)
+library(patchwork)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+config <- read_properties(config_file_path)
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+
+figure_root <- file.path(figure_root, "Posterior_Draws")
+```
+
+Read in output from 500 draws of the posterior distribution for all parameters in pipeline:
+```{r}
+df <- fread(file.path(base_path, "Models/Pipeline/predictions_training_posterior_bb_no_outliers_cap.csv"))
+summary(df$n_strikes)
+```
+
+Get observed outcomes from training data
+```{r}
+strike_rates <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+strike_counts <- read.csv(file.path(drivers_root, "lightning_strike_count_climate_jja_2002_2011_no_outliers.csv"))
+fire_counts <- read.csv(file.path(drivers_root, "lightning_ignition_jja_2002_2011_new_no_outliers.csv"))
+burned_areas <- read.csv(file.path(drivers_root, "burned_area_jja_2002_2011_new.csv"))
+
+#need total burned area per gridcell-month. Though the model was trained on fire size per single fire, pipeline simulations sum sampled burned area per fire, so we need to compare the same aggregation in the training data. 
+burned_areas_agg <- burned_areas %>%
+  group_by(lat, lon, year, month) %>%
+  summarise(burned_area_km2_total = sum(burned_area_km2_total, na.rm = TRUE), .groups = "drop")
+
+strike_rates_join <- strike_rates %>%
+  dplyr::select(lat, lon, year, r_strike_obs = strikes) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+fire_counts <- fire_counts %>%
+  dplyr::select(lat, lon, year, month, fire_count) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+strike_counts <- strike_counts %>%
+  dplyr::select(lat, lon, year, month, n_strikes_obs = strike_count) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+obs <- fire_counts %>% left_join(strike_counts, by = c("lat", "lon", "year", "month")) 
+
+obs <- obs %>%
+  left_join(strike_rates_join, by = c("lat", "lon", "year")) %>%
+  left_join(burned_areas_agg, by = c("lat", "lon", "year", "month")) %>%
+  mutate(r_strike_obs = ifelse(is.na(r_strike_obs), 0, r_strike_obs)) %>%
+  mutate(burned_area_km2_total = ifelse(is.na(burned_area_km2_total), 0, burned_area_km2_total)) %>%
+  dplyr::select(lat, lon, year, month, r_strike_obs, n_strikes_obs, fire_count, burned_area_km2_total)
+
+#check
+nrow(obs) == nrow(fire_counts) #should be true
+sum(obs$burned_area_km2_total > 0)   # should be n_distinct(burned_areas gridcell-months), not raw fire count
+sum(is.na(obs$r_strike_obs))            # should be 0 if strike_rates covers the same lat/lon/year set
+
+summary(obs)
+
+#Remove rows where fire_count exceeds strike_count 
+obs <- obs %>%
+  filter(!(n_strikes_obs > 0 & fire_count > n_strikes_obs))
+  
+summary(obs)
+```
+
+Split 500 draws into test and train for calculating metrics:
+```{r}
+
+#1. Recreate the EXACT same df that was originally split
+#all training sets used the same seed, just need ot make sure to use a training set that includes month (ie. not lightnng strike rate drivers)
+df_train <- read.csv(file.path(drivers_root, "lightning_ignition_jja_2002_2011_new.csv"))
+
+sample_size <- floor(0.8 * nrow(df_train))
+set.seed(123)
+train_index <- sample(seq_len(nrow(df_train)), size = sample_size)
+
+#2. Extract identifying keys, not the data itself
+train_keys <- unique(df_train[train_index, c("lat", "lon", "year", "month")])
+test_keys  <- unique(df_train[-train_index, c("lat", "lon", "year", "month")])
+
+setDT(train_keys); setDT(test_keys)
+train_keys[, split := "train"]
+test_keys[,  split := "test"]
+split_lookup <- rbind(train_keys, test_keys)
+
+#3. Load predictions and join the split label in ONE pass
+
+df <- split_lookup[df, on = .(lat, lon, year, month)]
+setDT(df)
+# preds now has a `split` column ("train"/"test") on every row, across
+# all 500 draws, without ever materializing two separate copies of the
+# 66-million-row dataset in memory
+
+#apply same split to observed data:
+obs <- split_lookup[obs, on = .(lat, lon, year, month)]
+setDT(obs)
+
+#calculate observed ignition rate (fires/strikes)
+
+obs <- obs %>%
+  mutate(
+    ignition_efficiency = case_when(
+      n_strikes_obs == 0          ~ 0,
+      fire_count > n_strikes_obs  ~ 0,
+      TRUE                        ~ fire_count / n_strikes_obs
+    )
+  )
+
+```
+
+
+
+```{r}
+summary(df$r_strike)
+summary(obs$r_strike_obs)
+
+obs_label <- sprintf("Observed mean: %.4f", mean(obs$r_strike_obs))
+
+draw_totals <- df %>%
+  group_by(draw_id) %>%
+  summarise(r_strike = mean(r_strike, na.rm = TRUE))
+
+p1 <- ggplot(draw_totals, aes(x = r_strike)) +
+  geom_histogram(bins = 40, fill = "grey", color = "white") +
+  geom_vline(aes(xintercept = median(r_strike)), linetype = "dashed") +
+  labs(
+    title = "(a)",
+    x = "Mean strike rate (across all gridcell-months)", y = "Number of draws"
+  ) +
+      annotate("text", x = Inf, y = Inf, label = obs_label,
+             hjust = 1.05, vjust = 1.2, size = 3.2, color = "black") +
+  theme_minimal()
+p1
+
+# pick one gridcell-month - month with larges r_strike in observed data:
+max_row <- filter(obs, r_strike_obs == max(r_strike_obs))[1,]
+
+gridcell_month_draws <- df %>%
+  filter(lat == max_row$lat, lon == max_row$lon, year == max_row$year, month == max_row$month) 
+
+obs_value <- obs %>%
+  filter(lat == max_row$lat, lon == max_row$lon, year == max_row$year, month == max_row$month)
+
+ggplot(gridcell_month_draws, aes(x = r_strike)) +
+  geom_histogram(bins = 40, fill = "grey", color = "white") +
+  labs(title = "Posterior spread for one gridcell-month",
+       x = "r_strike", y = "Number of draws") +
+    geom_vline(aes(xintercept = obs_value$r_strike_obs), linetype = "dashed") +
+    annotate("text", x = Inf, y = Inf, label = obs_label,
+             hjust = 1.05, vjust = 1.2, size = 3.2, color = "black") +
+  theme_minimal()
+
+
+
+hist(df$r_strike)
+```
+
+```{r}
+summary(df$n_strikes)
+summary(obs$n_strikes_obs)
+
+obs_label <- sprintf("Observed total: %s", format(round(sum(obs$n_strikes_obs), 0), big.mark = ","))
+
+draw_totals <- df %>%
+  group_by(draw_id) %>%
+  summarise(n_strikes = sum(n_strikes, na.rm = TRUE))
+
+p2 <- ggplot(draw_totals, aes(x = n_strikes)) +
+  geom_histogram(bins = 40, fill = "grey", color = "white") +
+  geom_vline(aes(xintercept = median(n_strikes)), linetype = "dashed") +
+  labs(
+    title = "(c)",
+    x = "Total strike count (across all gridcell-months)", y = "Number of draws"
+  ) +
+    annotate("text", x = Inf, y = Inf, label = obs_label,
+             hjust = 1.05, vjust = 1.2, size = 3.2, color = "black") +
+  theme_minimal()
+p2
+
+hist(df$n_strikes)
+```
+
+```{r}
+summary(df$p_ignite_rate_cal)
+summary(obs$fire_count/filter(obs, n_strikes_obs>0)$n_strikes_obs)
+
+ig_rate <- obs %>% filter(n_strikes_obs > 0 & fire_count <= n_strikes_obs) %>% mutate(ig_rate = fire_count/n_strikes_obs) 
+
+obs_label <- sprintf("Observed mean: %.4f", sum(ig_rate$ig_rate)/nrow(obs))
+                                                   
+
+draw_totals <- df %>%
+  group_by(draw_id) %>%
+  summarise(p_ignite_rate_cal = mean(p_ignite_rate_cal, na.rm = TRUE))
+
+p3 <- ggplot(draw_totals, aes(x = p_ignite_rate_cal)) +
+  geom_histogram(bins = 40, fill = "grey", color = "white") +
+  geom_vline(aes(xintercept = median(p_ignite_rate_cal)), linetype = "dashed") +
+  labs(
+    title = "(c)",
+    x = "Mean ignition efficiency (across all gridcell-months)", y = "Number of draws"
+  ) +
+    annotate("text", x = Inf, y = Inf, label = obs_label,
+             hjust = 1.05, vjust = 1.2, size = 3.2, color = "black") +
+  theme_minimal()
+
+p3
+
+hist(df$p_ignite_rate_cal)
+```
+
+```{r}
+summary(df$fire_count_pred)
+summary(obs$fire_count)
+
+obs_label <- sprintf("Observed total: %s", format(round(sum(obs$fire_count), 0), big.mark = ","))
+
+draw_totals <- df %>%
+  group_by(draw_id) %>%
+  summarise(fire_count_pred = sum(fire_count_pred, na.rm = TRUE))
+
+p4 <- ggplot(draw_totals, aes(x = fire_count_pred)) +
+  geom_histogram(bins = 40, fill = "grey", color = "white") +
+  geom_vline(aes(xintercept = median(fire_count_pred)), linetype = "dashed") +
+  labs(
+    title = "(d)",
+    x = "Total fire count (across all gridcell-months)", y = "Number of draws"
+  ) +
+    annotate("text", x = Inf, y = Inf, label = obs_label,
+             hjust = 1.05, vjust = 1.2, size = 3.2, color = "black") +
+  theme_minimal()
+p4
+
+hist(df$fire_count_pred)
+```
+
+
+
+```{r}
+summary(df$total_burned_area_capped)
+summary(obs$burned_area_km2_total)
+
+# Version 2: posterior distribution of a SUMMARY statistic per draw
+# (e.g., total burned area summed across the whole training period, per draw)
+# -- this is usually the more useful plot for understanding parameter
+# uncertainty, since it shows the spread across 500 posterior replicates
+# rather than just pooling all gridcell-month values together
+obs_label <- sprintf("Observed total: %s", format(round(sum(obs$burned_area_km2_total), 0), big.mark = ","))
+
+draw_totals <- df %>%
+  group_by(draw_id) %>%
+  summarise(total_burned_area = sum(total_burned_area_capped, na.rm = TRUE))
+
+p5 <- ggplot(draw_totals, aes(x = total_burned_area)) +
+  geom_histogram(bins = 40, fill = "grey", color = "white") +
+  geom_vline(aes(xintercept = median(total_burned_area)), linetype = "dashed") +
+  labs(
+    title = "(e)",
+    x = "Total burned area (across all gridcell-months)", y = "Number of draws"
+  ) +
+  annotate("text", x = Inf, y = Inf, label = obs_label,
+             hjust = 1.05, vjust = 1.2, size = 3.2, color = "black") +
+  theme_minimal()
+p5
+
+hist(df$total_burned_area_capped)
+```
+
+
+```{r}
+
+final_fig <- p1 / p2 / p3 / p4 / p5
+
+final_fig
+
+ggsave(file.path(figure_root, "Figure_training_posterior_draws.png"), final_fig, width = 12, height = 12, dpi = 300)
+
+```
+Histograms: every one of the 66,315,000 raw draw-level values from df gets binned (no averaging per gridcell-month first — all 500 draws' worth of raw values go into the histogram). Dividing by n_draws rescales the height of each bin (dividing the count by 500) so it's on a comparable footing to obs, which only has one realization per gridcell-month
+
+S-score options:
+- equal_width: bins span the combined min-to-max range in equal-sized steps, with no regard for where the data's mass actually sits. Simple, but for skewed/zero-heavy variables it wastes most bins on empty stretches and crams all the real structure into one or two bins — this is what produced the misleadingly perfect S-score = 1.00 for ignition efficiency early on.
+- quantile_combined: bin edges are quantiles of predicted and observed values pooled together into one vector. Problem: predicted set has ~500× more rows than observed (500 draws vs. one dataset), so the pooled quantiles are almost entirely dictated by predicted's shape — observed's structure gets swamped. This is what produced the artificially harsh S-score ≈ 0.07.
+- quantile_observed: bin edges come from observed's quantiles alone (treating observed as the reference climatology), with only the two outermost edges stretched to cover predicted's full range so nothing falls outside and gets dropped. Good in principle, but if observed is heavily zero-inflated (like ignition efficiency), most of its quantile breakpoints collapse onto the same value, leaving one enormous first bin that swallows almost all of both distributions — producing the same misleadingly-high-score problem as equal_width, just for a different reason.
+- quantile_union: computes quantile breakpoints from predicted and observed independently, then takes the union of both sets as the shared bin structure. This is the fix for both problems above: predicted's huge sample size can't drown out observed's shape (since observed's breakpoints are computed on their own, not diluted by pooling), and observed's zero-inflation can't collapse the bins into one giant blob (since predicted's own quantiles still contribute fine-grained breakpoints across whatever range predicted's mass occupies). Resolution is preserved wherever either distribution has real structure — which is why this is the one   settled on for the final figure.
+
+```{r}
+
+setDT(df)
+setDT(obs)
+n_draws <- uniqueN(df$draw_id)
+
+# Both `df` and `obs` are assumed to already carry a `split` column
+# ("train"/"test") from the earlier train/test re-labeling step.
+
+compute_sscore <- function(pred_dt, obs_vals, sscore_bins = 15,
+                            bin_method = c("equal_width", "quantile_combined",
+                                           "quantile_observed", "quantile_union")) {
+  bin_method <- match.arg(bin_method)
+
+  combined_vals <- c(pred_dt$value, obs_vals)
+  probs <- seq(0, 1, length.out = sscore_bins + 1)
+
+  breaks <- switch(bin_method,
+
+    equal_width = {
+      rng <- range(combined_vals, na.rm = TRUE)
+      seq(rng[1], rng[2], length.out = sscore_bins + 1)
+    },
+
+    quantile_combined = {
+      b <- unique(quantile(combined_vals, probs = probs, na.rm = TRUE))
+      if (length(b) < 3) {
+        warning("Too few unique quantile breaks (combined) -- falling back to equal_width.")
+        rng <- range(combined_vals, na.rm = TRUE)
+        b <- seq(rng[1], rng[2], length.out = sscore_bins + 1)
+      }
+      b
+    },
+
+    quantile_observed = {
+      b <- unique(quantile(obs_vals, probs = probs, na.rm = TRUE))
+      if (length(b) < 3) {
+        warning("Too few unique quantile breaks (observed) -- falling back to equal_width.")
+        rng <- range(combined_vals, na.rm = TRUE)
+        b <- seq(rng[1], rng[2], length.out = sscore_bins + 1)
+      } else {
+        b[1]         <- min(combined_vals, na.rm = TRUE)
+        b[length(b)] <- max(combined_vals, na.rm = TRUE)
+      }
+      b
+    },
+
+    quantile_union = {
+      # Quantile breaks computed INDEPENDENTLY from each distribution, then
+      # unioned -- neither side's sample size dominates where the breaks
+      # land, and resolution is preserved wherever EITHER distribution has
+      # real structure (avoids quantile_observed's "everything predicted
+      # collapses into one giant bin" problem AND quantile_combined's
+      # "predicted's huge N drowns out observed's shape" problem).
+      b_obs  <- quantile(obs_vals, probs = probs, na.rm = TRUE)
+      b_pred <- quantile(pred_dt$value, probs = probs, na.rm = TRUE)
+      b <- sort(unique(c(b_obs, b_pred)))
+      b[1]         <- min(combined_vals, na.rm = TRUE)
+      b[length(b)] <- max(combined_vals, na.rm = TRUE)
+      if (length(b) < 3) {
+        warning("Too few unique quantile breaks (union) -- falling back to equal_width.")
+        rng <- range(combined_vals, na.rm = TRUE)
+        b <- seq(rng[1], rng[2], length.out = sscore_bins + 1)
+      }
+      b
+    }
+  )
+
+  bin_levels <- levels(cut(combined_vals, breaks = breaks, include.lowest = TRUE))
+
+  obs_bin <- factor(cut(obs_vals, breaks = breaks, include.lowest = TRUE), levels = bin_levels)
+  obs_counts <- table(obs_bin)
+  P_obs <- as.numeric(obs_counts) / sum(obs_counts)
+
+  pred_dt[, bin := factor(cut(value, breaks = breaks, include.lowest = TRUE), levels = bin_levels)]
+  pred_by_draw <- pred_dt[, .N, by = .(draw_id, bin)]
+  pred_by_draw[, P_pred := N / sum(N), by = draw_id]
+
+  full_grid <- CJ(draw_id = unique(pred_dt$draw_id), bin = bin_levels)
+  pred_by_draw <- pred_by_draw[full_grid, on = c("draw_id", "bin")]
+  pred_by_draw[is.na(P_pred), P_pred := 0]
+
+  P_obs_lookup <- setNames(P_obs, bin_levels)
+  pred_by_draw[, P_obs := P_obs_lookup[as.character(bin)]]
+
+  sscore_by_draw <- pred_by_draw[, .(sscore = sum(pmin(P_pred, P_obs))), by = draw_id]
+  sscore_by_draw$sscore
+}
+
+compute_zero_match <- function(pred_col, obs_col, df_test, obs_test) {
+  matched <- df_test[obs_test, on = .(lat, lon, year, month), nomatch = 0]
+  matched[, zero_match := (get(pred_col) == 0) == (get(obs_col) == 0)]
+  matched[, .(pct_match = mean(zero_match, na.rm = TRUE) * 100), by = draw_id]$pct_match
+}
+
+compare_distribution <- function(pred_col, obs_col, var_label, title = NULL,
+                                  bins = 50, sscore_bins = 15, log_x = FALSE,
+                                  remove_zeros = TRUE, report_zero_match = TRUE) {
+
+  # ---- Existing display histogram: unchanged, uses FULL period ----
+  pred_vals_raw <- df[[pred_col]]
+  obs_vals_raw  <- obs[[obs_col]]
+
+  pct_pred_zero <- mean(pred_vals_raw == 0, na.rm = TRUE) * 100
+  pct_obs_zero  <- mean(obs_vals_raw == 0, na.rm = TRUE) * 100
+
+  if (remove_zeros) {
+    pred_vals <- pred_vals_raw[pred_vals_raw != 0]
+    obs_vals  <- obs_vals_raw[obs_vals_raw != 0]
+  } else {
+    pred_vals <- pred_vals_raw
+    obs_vals  <- obs_vals_raw
+  }
+
+  rng <- range(c(pred_vals, obs_vals), na.rm = TRUE)
+  breaks <- seq(rng[1], rng[2], length.out = bins + 1)
+  bin_width <- diff(breaks)[1]
+
+  pred_binned <- data.table(bin = cut(pred_vals, breaks = breaks, include.lowest = TRUE))
+  obs_binned  <- data.table(bin = cut(obs_vals,  breaks = breaks, include.lowest = TRUE))
+
+  pred_counts <- pred_binned[, .(count = .N / n_draws), by = bin]
+  obs_counts  <- obs_binned[, .(count = .N), by = bin]
+
+  pred_counts[, source := "Predicted"]
+  obs_counts[, source  := "Observed"]
+
+  combined <- rbind(pred_counts, obs_counts)
+  combined[, bin_mid := breaks[as.integer(bin)] + bin_width / 2]
+
+  summary_stats <- rbind(
+    data.table(source = "Predicted", stat = "Max", value = max(pred_vals, na.rm = TRUE)),
+    data.table(source = "Observed",  stat = "Max", value = max(obs_vals,  na.rm = TRUE))
+  )
+
+  # ---- NEW: S-score + zero-match, computed on the TEST SET only ----
+  df_test  <- df[split == "test"]
+  obs_test <- obs[split == "test"]
+
+  pred_vals_test_raw <- df_test[[pred_col]]
+  obs_vals_test_raw  <- obs_test[[obs_col]]
+
+  if (remove_zeros) {
+    pred_test_dt <- data.table(draw_id = df_test$draw_id, value = pred_vals_test_raw)[value != 0]
+    obs_vals_test <- obs_vals_test_raw[obs_vals_test_raw != 0]
+  } else {
+    pred_test_dt <- data.table(draw_id = df_test$draw_id, value = pred_vals_test_raw)
+    obs_vals_test <- obs_vals_test_raw
+  }
+  pred_test_dt <- pred_test_dt[!is.na(value)]
+  obs_vals_test <- obs_vals_test[!is.na(obs_vals_test)]
+
+  sscore_draws <- compute_sscore(pred_test_dt, obs_vals_test, sscore_bins, bin_method = "quantile_union")
+  sscore_mean  <- mean(sscore_draws)
+  sscore_ci    <- quantile(sscore_draws, c(0.025, 0.975))
+
+  metric_label <- sprintf("S-score: %.2f [%.2f, %.2f]", sscore_mean, sscore_ci[1], sscore_ci[2])
+
+  if (report_zero_match) {
+    zero_match_draws <- compute_zero_match(pred_col, obs_col, df_test, obs_test)
+    zm_mean <- mean(zero_match_draws)
+    zm_ci   <- quantile(zero_match_draws, c(0.025, 0.975))
+    metric_label <- paste0(metric_label,
+                            sprintf("\nZero match: %.1f%% [%.1f, %.1f]", zm_mean, zm_ci[1], zm_ci[2]))
+  }
+
+  zero_label <- sprintf("Zeros removed:\nPredicted: %.1f%%\nObserved: %.1f%%\n%s",
+                         if (remove_zeros) pct_pred_zero else 0,
+                         if (remove_zeros) pct_obs_zero  else 0,
+                         metric_label)
+
+  p <- ggplot() +
+    geom_col(data = combined, aes(x = bin_mid, y = count, fill = source),
+              position = "dodge", width = bin_width * 0.85) +
+    geom_vline(data = summary_stats,
+               aes(xintercept = value, color = source, linetype = stat),
+               linewidth = 0.7) +
+    scale_fill_manual(values = c("Observed" = "firebrick", "Predicted" = "steelblue"), name = NULL) +
+    scale_color_manual(values = c("Observed" = "firebrick", "Predicted" = "steelblue"), guide = "none") +
+    scale_linetype_manual(values = c("Max" = "dotted"), name = NULL) +
+    guides(linetype = guide_legend(override.aes = list(color = "black"))) +
+    annotate("text", x = Inf, y = Inf, label = zero_label,
+             hjust = 1.05, vjust = 1.1, size = 3.0, color = "black") +
+    labs(title = title, x = var_label, y = "Count", fill = NULL) +
+    theme_minimal()
+
+  if (log_x) p <- p + scale_x_log10()
+  p
+}
+
+p1 <- compare_distribution(pred_col = "r_strike", obs_col = "r_strike_obs",
+                            var_label = "Lightning strike rate (strikes/km²/month)", title = "(a)",
+                            log_x = FALSE, remove_zeros = FALSE, report_zero_match = FALSE)
+cat("obs$n_strikes_obs max at plot time:", max(obs$n_strikes_obs, na.rm = TRUE), "\n")
+p2 <- compare_distribution(pred_col = "n_strikes", obs_col = "n_strikes_obs",
+                            var_label = "Strike count", title = "(b)", log_x = FALSE)
+# p3 <- compare_distribution(pred_col = "p_ignite_rate_cal", obs_col = "ignition_efficiency",
+#                             var_label = "Ignition efficiency", title = "(c)",
+#                             log_x = FALSE, remove_zeros = TRUE, report_zero_match = FALSE)
+p4 <- compare_distribution(pred_col = "fire_count_pred", obs_col = "fire_count",
+                            var_label = "Fire count", title = "(c)", log_x = FALSE)
+p5 <- compare_distribution(pred_col = "total_burned_area_capped", obs_col = "burned_area_km2_total",
+                            var_label = "Burned area (km²)", title = "(d)", log_x = FALSE)
+
+final_fig <- (p1 | p2) / (p4 | p5) 
+final_fig
+ggsave(file.path(figure_root, "Figure_training_histograms_metrics_no_outliers.png"), final_fig, width = 10, height = 8, dpi = 300)
+```
+observed ignition_efficiency and predicted p_ignite_rate_cal aren't estimating the same statistical object at the row level, so comparing their marginal distributions directly will never produce a meaningful score, regardless of how the bins are constructed.
+
+Here's the issue: summary() output shows the observed ratio is dominated by tiny-n cases — a great many gridcell-months have n_strikes_obs in the single digits, so fire_count/n_strikes_obs can only take values like 0, 1, 0.5, 0.33, 1/7, etc. — the raw outcome of a Bernoulli-ish process with very few trials. A 1-strike/1-fire month producing efficiency = 1.0 isn't evidence of a location with 100% ignition probability — it's what a low-probability event occasionally does when it only get one roll of the dice. Meanwhile, p_ignite_rate_cal is a smooth, continuous expected-value estimate, and a well-behaved model correctly should almost never predict anything near 1.0 — if it did, that would itself be a red flag. So comparing a noisy small-sample empirical ratio against a smooth expectation, and no amount of rebinning fixes that: the observed distribution has real mass out at values the model is correctly never supposed to reach, and S-score will always penalize that mismatch as if it were a modeling failure rather than irreducible sampling noise.
+
+The standard fix in probabilistic forecast verification for exactly this situation is a reliability (calibration) diagram, not a marginal-distribution comparison. Instead of comparing individual rows' noisy ratios, bin gridcell-months by predicted probability, then within each bin pool strikes and fires together and compute the true aggregate rate — this is the move that structurally cancels out the small-n noise, since its now dividing a sum of fires by a sum of strikes across many gridcell-months, not a single risky ratio.
+
+```{r}
+compute_reliability_by_draw <- function(df, obs, n_bins = 10) {
+  test_pred <- df[split == "test", .(draw_id, lat, lon, year, month, p_ignite_rate_cal)]
+  test_obs  <- obs[split == "test", .(lat, lon, year, month, n_strikes_obs, fire_count)]
+
+  merged <- test_pred[test_obs, on = .(lat, lon, year, month), nomatch = 0]
+
+  # Fixed bin edges across ALL draws pooled, so bins mean the same thing
+  # draw to draw -- same principle as fixing S-score bins once, not per draw
+  bin_probs <- seq(0, 1, length.out = n_bins + 1)
+  breaks <- unique(quantile(merged$p_ignite_rate_cal, probs = bin_probs, na.rm = TRUE))
+
+  merged[, bin := cut(p_ignite_rate_cal, breaks = breaks, include.lowest = TRUE)]
+
+  merged[, .(
+    mean_predicted = weighted.mean(p_ignite_rate_cal, w = n_strikes_obs),
+    observed_rate  = sum(fire_count) / sum(n_strikes_obs),
+    n_strikes      = sum(n_strikes_obs),
+    n_gridmonths   = .N
+  ), by = .(draw_id, bin)]
+}
+
+rel_by_draw <- compute_reliability_by_draw(df, obs, n_bins = 10)
+
+# Summarize across draws: mean + 95% CI per bin
+rel_summary <- rel_by_draw[, .(
+  mean_predicted_avg   = mean(mean_predicted),
+  mean_predicted_lower = quantile(mean_predicted, 0.025),
+  mean_predicted_upper = quantile(mean_predicted, 0.975),
+  observed_rate_avg    = mean(observed_rate),
+  observed_rate_lower  = quantile(observed_rate, 0.025),
+  observed_rate_upper  = quantile(observed_rate, 0.975),
+  n_strikes_avg        = mean(n_strikes)
+), by = bin][order(mean_predicted_avg)]
+
+p_rel <- ggplot(rel_summary, aes(x = mean_predicted_avg, y = observed_rate_avg)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_errorbar(aes(ymin = observed_rate_lower, ymax = observed_rate_upper), width = 0, color="red") +
+  geom_errorbarh(aes(xmin = mean_predicted_lower, xmax = mean_predicted_upper), height = 0, color="red") +
+  geom_point(aes(size = n_strikes_avg, alpha=0.1)) +
+  geom_line() +
+  labs(x = "Mean predicted ignition probability (bin)",
+       y = "Observed ignition rate (pooled fires / pooled strikes)",
+       size = "Mean observed total\nstrikes in bin") +
+guides(alpha = "none") +
+  theme_minimal()
+
+p_rel
+
+ggsave(file.path(figure_root, "Figure_ignition_reliability.png"), p_rel, width = 6, height = 6, dpi = 300)
+```
+
+Figure X. Reliability diagram for the ignition efficiency model, training period test set. Gridcell-month-strike-draw combinations are grouped into 10 bins by predicted ignition probability (bin edges calculated from quantiles of the predicted probabilities across all 500 posterior draws). Within each prediction bin and draw, observed ignition rate is calculated from the corresponding gricell-months as the pooled number of fires divided by the pooled number of strikes across. Points show the mean observed rate (y-axis) and predicted probability (x-axis) and point size shows the mean total number of observed strikes contributing to the bin. Red vertical error bars show the spread in observed ignition rates for that bin, across all draws, and red horizontal error bars show the spread in the predicted probability for that bin, across all draws. A wider error bar indicates greater posterior uncertainty, either in predicted probability (horizontal) or in draw-to-draw variability in the observed gridcell-months that are associated with a predicted probability bin (vertical). The dashed 1:1 line represents perfect calibration, i.e. the true fraction of strikes that led to a fire matches the model's predicted probability. Points falling below the line indicate overprediction (the model assigns higher ignition probability than strikes in that bin actually achieved); points above the line indicate underprediction.
+
+Plot interpretation: The plot illustrates that the ignition efficiency model generally tracks the 1:1 calibration line, predicting low probabilities when and where the observed fires/strikes are high, and vice versa. 
+
+At the high end of ignition probability bins, the model tends to underpredict, producing lower probabilities where ignition rates were observed to be higher. The greatest posterior uncertainty in predictions occurs at the largest bin value (0.0031:0.0216). Why might this be? 
+
+The fourth and fifth predicted quantile bins (0.000735:0.00097 and 0.00097:0.00124) are the only instances where the model overpredicts, with the third and fourth bins (0.000515:0.000735 and 0.000735,0.00097) showing the least draw-to-draw variation in their associated observed rates (i.e. when and where they predict that probabiility does not change as much as it does for other probability bins). 
+
+At the lowest end of predicted probability bins, the model again underpredicts, though vertical error bars have a wide interval, indicating that, for each posterior draw, predictions  vary greatly in their associated number of observed fire ignitions per strike count.
+
+Taken together, the ignition model struggles to capture extreme ignition gridcell-monhts, often underpredicting them. Looking at the the ignition efficiecy map (Figure Xg-i), you can see ignition predictions dot reach the maximim observed rates seen in Northwestern Alaska. The bias map (Figure Xi) provides a view of where instances of under and overprediciton are accurring.Mean prediction remains generally low and varies little, but does increase slightly where fires are generally observed. However, with consistantly flattened predictions, the model mostly overpredicts across space (red gridcells), except where a fire does actually happen, in which case it underpredicts (purple gridcells); though probablilities increase in that fire-prone regions, they are not enough to match the observed rates. 
+
+Brier score: Lower is better (0 = perfect), and unlike S-score it's directly interpretable as mean squared calibration error, weighted appropriately by trial count.
+
+```{r}
+brier_score <- function(pred_probs, strike_count, fire_count) {
+  sum(strike_count * (fire_count / strike_count - pred_probs)^2, na.rm = TRUE) /
+    sum(strike_count, na.rm = TRUE)
+}
+
+test_pred_full <- df[split == "test", .(draw_id, lat, lon, year, month, p_ignite_rate_cal)]
+test_obs_full  <- obs[split == "test", .(lat, lon, year, month, n_strikes_obs, fire_count)]
+merged_full <- test_pred_full[test_obs_full, on = .(lat, lon, year, month), nomatch = 0]
+
+brier_by_draw <- merged_full[, .(
+  brier = brier_score(p_ignite_rate_cal, n_strikes_obs, fire_count)
+), by = draw_id]
+
+mean(brier_by_draw$brier)
+quantile(brier_by_draw$brier, c(0.025, 0.975))
+```
+
+Observed vs. Predicted scatter plots:
+```{r}
+library(dplyr)
+library(ggplot2)
+
+compare_scatter <- function(pred_col, obs_col, var_label, title = NULL,
+                             ci_lower = 0.025, ci_upper = 0.975, log_scale = FALSE) {
+
+  pred_summary <- df %>%
+    group_by(lat, lon, year, month) %>%
+    summarise(
+      pred_mean  = mean(.data[[pred_col]], na.rm = TRUE),
+      pred_lower = quantile(.data[[pred_col]], ci_lower, na.rm = TRUE),
+      pred_upper = quantile(.data[[pred_col]], ci_upper, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  combined <- obs %>%
+    dplyr::select(lat, lon, year, month, obs_value = all_of(obs_col)) %>%
+    inner_join(pred_summary, by = c("lat", "lon", "year", "month"))
+
+  p <- ggplot(combined, aes(x = obs_value, y = pred_mean)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+    geom_errorbar(aes(ymin = pred_lower, ymax = pred_upper), width = 0, alpha = 0.25, color = "steelblue") +
+    geom_point(color = "black", size = 1.3, alpha = 0.7, shape=1) +
+    labs(
+      title = title,
+      x = paste("Observed", var_label),
+      y = paste("Predicted", var_label, "\n(posterior mean \u00b1 95% interval)")
+    ) +
+    theme_minimal()
+
+  if (log_scale) {
+    p <- p + scale_x_log10() + scale_y_log10()
+  }
+
+  p
+}
+
+p1 <- compare_scatter("r_strike", "r_strike_obs", "strike rate", title = "(a)")
+p2 <- compare_scatter("n_strikes", "n_strikes_obs", "strike count", title = "(b)")
+p3 <- compare_scatter("fire_count_pred", "fire_count", "fire count", title = "(c)")
+p4 <- compare_scatter("total_burned_area_capped", "burned_area_km2_total", "burned area (km²)", title = "(d)")
+```
+
+```{r}
+final_fig <- (p1 | p2 ) / ( p3 | p4 )
+
+#final_fig
+
+ggsave(file.path(figure_root, "Figure_training_obs_pred_scatter_2.png"), final_fig, width = 7, height = 7, dpi = 300)
+```
+
+
+Annual totals with bars showing distrubution across draws (mean for r_strike). 
+```{r}
+library(purrr)  # needed for map_dbl()
+
+time_series_plot <- function(pred_col, obs_col, var_label, title = NULL,
+                              ci_lower = 0.025, ci_upper = 0.975,
+                              remove_zeros = FALSE, annual = FALSE,
+                              summary_type = c("mean", "total"),
+                              pool_across_gridcells = TRUE,
+                              rmse_digits = 2) {
+
+  summary_type <- match.arg(summary_type)
+
+  df_filtered  <- if (remove_zeros) df  %>% filter(.data[[pred_col]] != 0) else df
+  obs_filtered <- if (remove_zeros) obs %>% filter(.data[[obs_col]]  != 0) else obs
+
+  # ---- Bars ----
+  if (summary_type == "total") {
+    pred_draw_totals <- df_filtered %>%
+      group_by(draw_id, year) %>%
+      summarise(annual_total = sum(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
+
+    pred_summary <- pred_draw_totals %>%
+      group_by(year) %>%
+      summarise(
+        value_mean  = mean(annual_total),
+        value_lower = quantile(annual_total, ci_lower),
+        value_upper = quantile(annual_total, ci_upper),
+        value_min   = min(annual_total),
+        value_max   = max(annual_total),
+        .groups = "drop"
+      ) %>%
+      mutate(source = "Predicted")
+
+    obs_summary <- obs_filtered %>%
+      group_by(year) %>%
+      summarise(value_mean = sum(.data[[obs_col]], na.rm = TRUE), .groups = "drop") %>%
+      mutate(value_lower = NA_real_, value_upper = NA_real_,
+             value_min = NA_real_, value_max = NA_real_,
+             source = "Observed")
+
+    group_vars <- c("year")
+
+  } else {
+    group_vars <- if (annual) c("year") else c("year", "month")
+
+    if (pool_across_gridcells) {
+      pred_summary <- df_filtered %>%
+        group_by(across(all_of(group_vars))) %>%
+        summarise(
+          value_mean  = mean(.data[[pred_col]], na.rm = TRUE),
+          value_lower = quantile(.data[[pred_col]], ci_lower, na.rm = TRUE),
+          value_upper = quantile(.data[[pred_col]], ci_upper, na.rm = TRUE),
+          value_min   = min(.data[[pred_col]], na.rm = TRUE),
+          value_max   = max(.data[[pred_col]], na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        mutate(source = "Predicted")
+    } else {
+      pred_draw_means <- df_filtered %>%
+        group_by(across(all_of(c("draw_id", group_vars)))) %>%
+        summarise(spatial_mean = mean(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
+
+      pred_summary <- pred_draw_means %>%
+        group_by(across(all_of(group_vars))) %>%
+        summarise(
+          value_mean  = mean(spatial_mean),
+          value_lower = quantile(spatial_mean, ci_lower),
+          value_upper = quantile(spatial_mean, ci_upper),
+          value_min   = min(spatial_mean),
+          value_max   = max(spatial_mean),
+          .groups = "drop"
+        ) %>%
+        mutate(source = "Predicted")
+    }
+
+    # Observed: bootstrap the spatial mean, matching how predicted's interval
+    # is built (uncertainty in the ESTIMATE of the mean, not the raw spatial
+    # spread of individual gridcell values).
+    n_boot <- 500
+    set.seed(123)
+
+    boot_obs_mean <- function(x, n_boot) {
+      replicate(n_boot, mean(sample(x, length(x), replace = TRUE), na.rm = TRUE))
+    }
+
+    obs_summary <- obs_filtered %>%
+      group_by(across(all_of(group_vars))) %>%
+      summarise(
+        boot_means = list(boot_obs_mean(.data[[obs_col]], n_boot)),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        value_mean  = map_dbl(boot_means, mean),
+        value_lower = map_dbl(boot_means, ~ quantile(.x, ci_lower)),
+        value_upper = map_dbl(boot_means, ~ quantile(.x, ci_upper)),
+        value_min   = map_dbl(boot_means, min),
+        value_max   = map_dbl(boot_means, max),
+        source = "Observed"
+      ) %>%
+      dplyr::select(-boot_means)
+  }
+
+  # ---- ACC / RMSE / reference line ----
+  if (summary_type == "total") {
+    pred_draw_annual <- df_filtered %>%
+      group_by(draw_id, year) %>%
+      summarise(value = sum(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
+    obs_annual <- obs_filtered %>%
+      group_by(year) %>%
+      summarise(obs_value = sum(.data[[obs_col]], na.rm = TRUE), .groups = "drop")
+  } else {
+    pred_draw_annual <- df_filtered %>%
+      group_by(draw_id, year) %>%
+      summarise(value = mean(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
+    obs_annual <- obs_filtered %>%
+      group_by(year) %>%
+      summarise(obs_value = mean(.data[[obs_col]], na.rm = TRUE), .groups = "drop")
+  }
+
+  obs_mean_all_years <- mean(obs_annual$obs_value, na.rm = TRUE)
+
+  skill_by_draw <- pred_draw_annual %>%
+    left_join(obs_annual, by = "year") %>%
+    group_by(draw_id) %>%
+    summarise(
+      acc  = cor(value - mean(value), obs_value - mean(obs_value)),
+      rmse = sqrt(mean(((value - mean(value)) - (obs_value - mean(obs_value)))^2)),
+      .groups = "drop"
+    )
+
+  acc_mean  <- mean(skill_by_draw$acc, na.rm = TRUE)
+  acc_ci    <- quantile(skill_by_draw$acc, c(ci_lower, ci_upper), na.rm = TRUE)
+  rmse_mean <- mean(skill_by_draw$rmse, na.rm = TRUE)
+  rmse_ci   <- quantile(skill_by_draw$rmse, c(ci_lower, ci_upper), na.rm = TRUE)
+
+  skill_label <- sprintf(
+    paste0("ACC: %.2f [%.2f, %.2f]\nRMSE: %.", rmse_digits, "f [%.", rmse_digits, "f, %.", rmse_digits, "f]"),
+    acc_mean, acc_ci[1], acc_ci[2], rmse_mean, rmse_ci[1], rmse_ci[2]
+  )
+
+  # ---- Assemble plot ----
+  combined <- bind_rows(pred_summary, obs_summary)
+  combined$year_factor <- factor(combined$year)
+
+  dodge_group <- if ("month" %in% group_vars) interaction(combined$source, combined$month) else combined$source
+
+  ggplot(combined, aes(x = year_factor, y = value_mean, color = source, group = dodge_group)) +
+    geom_hline(yintercept = obs_mean_all_years, linetype = "dotted", color = "black", linewidth = 0.6) +
+    geom_errorbar(aes(ymin = value_lower, ymax = value_upper),
+                  width = 0.15, position = position_dodge(width = 0.5), alpha = 0.6, na.rm = TRUE) +
+    geom_point(position = position_dodge(width = 0.5), size = 1.8, shape = 1) +
+    annotate("text", x = Inf, y = Inf, label = skill_label,
+             hjust = 1.05, vjust = 1.2, size = 3, color = "black") +
+    scale_color_manual(values = c("Observed" = "firebrick", "Predicted" = "steelblue"), name = NULL) +
+    labs(title = title, x = "Year", y = var_label) +
+    theme_minimal()
+}
+
+p1 <- time_series_plot("r_strike", "r_strike_obs", "Mean strike rate",
+                        title = "(a)", remove_zeros = FALSE, annual = TRUE,
+                        summary_type = "mean", pool_across_gridcells = FALSE)
+p2 <- time_series_plot("n_strikes", "n_strikes_obs", "Total strike count",
+                        title = "(b)", remove_zeros = FALSE, summary_type = "total")
+p3 <- time_series_plot("fire_count_pred", "fire_count", "Total fire count",
+                        title = "(d)", remove_zeros = FALSE, summary_type = "total")
+p4 <- time_series_plot("total_burned_area_capped", "burned_area_km2_total", "Total burned area",
+                        title = "(e)", remove_zeros = FALSE, summary_type = "total")
+
+p5 <- time_series_plot("p_ignite_rate_cal", "ignition_efficiency", "Ignition efficiency/rate",
+                        title = "(c)", remove_zeros = FALSE, annual = TRUE,
+                        summary_type = "mean", pool_across_gridcells = FALSE,
+                        rmse_digits = 5)
+
+
+final_fig <- (p1 / p2 / p5 / p3 / p4 ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+final_fig
+ggsave(file.path(figure_root, "Figure_training_obs_pred_time_2.png"), final_fig, width = 8, height = 12, dpi = 300)
+```
+
+
+Observed and predicted annual time series for five fire sub-model outcomes, training period (Alaska, June–August 2002–2011). (a) Annual mean strike rate (strikes/km2/month) and (c) annual mean ignition efficiency/rate show, for both observed (red) and predicted (blue), the estimated annual mean with a 95% interval reflecting uncertainty in the mean; bootstrap resampling for observed, and the spread across 500 posterior draws for predicted. (b) Total strike count, (d) total fire count, and (e) total burned area show observed as a single fixed annual total, against the predicted annual total's 95% interval across the 500 posterior draws. Dotted horizontal lines mark the observed mean across the 10 year training period. ACC (anomaly correlation coefficient): whether predicted and observed values track the same directional pattern, each measured relative to its own 10-year mean (1 = perfect tracking). RMSE of anomalies: magnitude of year-to-year deviation (0 = perfect).
+
+Given the short 10-year record, both metrics should be interpreted as indicative rather than precise, as they are sensitive to individual high-leverage years (e.g., 2004, 2007).
+
+MAPS!
+
+Figure X. Observed, predicted, and bias (predicted − observed) values for each fire model outcome across the training-period (Alaska, June–August 2002–2011). Predicted values represent the posterior mean across 500 draws of the fire-model pipeline; observed values are drawn from the corresponding training-period driver data. All Observed/Predicted panels are shown as weighted two-dimensional kernel density surfaces (R's ks::kde), weighted by each gridcell's outcome magnitude. Bias panels show the raw gridcell-level difference (predicted − observed), where blue = underprediction, red = overprediction, and white = zero. (a–c) Lightning strike rate (strikes km⁻² month⁻¹); mean value per gridcell across the full training period. (d–f) Lightning strike count; mean annual total strike count per gridcell. (g–i) Ignition rate/probability; mean fires/strikes (observed) or per-strike ignition probability (predicted) per gridcell across the full training period. (j–l) Fire count; total number of fires per gridcell, summed across the entire training period. (m–o) Burned area (km²); total burned area per gridcell, summed across the entire training period.
+
+
+```{r}
+library(terra)
+library(lubridate)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(geodata)
+# Get USA polygon
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+# Filter to Alaska only
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+
+# Download SRTM elevation data for Alaska
+# Alaska spans multiple tiles so we download by country
+
+# 1. Download and crop
+elev <- geodata::elevation_global(res = 10, path = tempdir())
+alaska_ext <- ext(-170, -130, 51, 72)
+elev_alaska <- crop(elev, alaska_ext)
+
+# 2. Mask to Alaska polygon
+alaska_vect <- terra::vect(alaska)
+elev_masked <- terra::mask(elev_alaska, alaska_vect)
+
+# 3. Convert to data frame — use elev_masked instead of elev_alaska
+elev_df <- as.data.frame(elev_masked, xy = TRUE)
+names(elev_df) <- c("lon", "lat", "elevation")
+elev_df <- elev_df %>% filter(!is.na(elevation), elevation >= 0)
+
+p_elevation <- ggplot() +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250)) +  # contour interval in metres
+  geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) +
+  xlim(-170, -130) +
+  ylim(51, 72) +
+  xlab("Lon") +
+  ylab("Lat") +
+  ggtitle("(h)") +
+  theme_minimal() +
+  theme(
+    axis.title.x     = element_text(size=11),
+    axis.title.y     = element_text(size=11),
+    axis.text.y      = element_text(size=11),
+    axis.text.x      = element_text(size=11),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2),
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2)
+  )
+
+p_elevation
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(ks)
+library(sf)
+
+# =============================================================================
+# HELPER 1: weighted 2D kernel density (ggplot2's stat_density_2d does NOT
+# support a weight aesthetic -- this uses ks::kde(), which does)
+# =============================================================================
+weighted_kde_grid <- function(data, fill_var, bandwidth = NULL, n_grid = 100,
+                               xlim = c(-170, -130), ylim = c(51, 72)) {
+  data <- data %>% filter(.data[[fill_var]] > 0)
+  coords <- as.matrix(data[, c("lon", "lat")])
+  w <- data[[fill_var]]
+  w <- w / sum(w) * nrow(data)   # ks::kde expects weights summing to n
+
+  H <- if (is.null(bandwidth)) {
+    tryCatch(ks::Hpi(coords), error = function(e) diag(c(2, 1)^2))  # fallback if plug-in selector fails
+  } else {
+    diag(bandwidth^2)
+  }
+
+  fit <- ks::kde(x = coords, w = w, H = H, gridsize = c(n_grid, n_grid),
+                 xmin = c(xlim[1], ylim[1]), xmax = c(xlim[2], ylim[2]))
+
+  data.frame(
+    lon = rep(fit$eval.points[[1]], times = n_grid),
+    lat = rep(fit$eval.points[[2]], each  = n_grid),
+    density = as.vector(fit$estimate)
+  )
+}
+
+# =============================================================================
+# HELPER 2: clip a lon/lat dataframe to only points falling within a polygon
+# (used to trim the KDE grid down to land, dropping ocean spillover)
+# =============================================================================
+clip_to_polygon <- function(data, polygon, lon_col = "lon", lat_col = "lat") {
+  if (is.null(polygon)) return(data)
+  pts <- st_as_sf(data, coords = c(lon_col, lat_col), crs = st_crs(polygon), remove = FALSE)
+  inside <- st_filter(pts, polygon)
+  st_drop_geometry(inside)
+}
+
+# =============================================================================
+# MAIN FUNCTION: Observed / Predicted / Bias, three panels per call
+# =============================================================================
+plot_obs_pred_bias <- function(pred_agg, obs_agg, var_label, title_prefix = NULL,
+                                plot_type = c("raster", "density"),
+                                elevation_data = NULL,
+                                alaska_outline = NULL,
+                                density_bandwidth = NULL,
+                                panel_labels = c("a", "b", "c"),
+                                obs_pred_palette = "viridis",
+                                bias_palette = c("blue", "white", "red")) {
+
+  plot_type <- match.arg(plot_type)
+
+  merged <- full_join(
+    pred_agg %>% rename(pred = value),
+    obs_agg  %>% rename(obs  = value),
+    by = c("lat", "lon")
+  ) %>%
+    mutate(across(c(pred, obs), ~ ifelse(is.na(.x), 0, .x)),
+           bias = pred - obs)
+
+  bias_limit <- max(abs(merged$bias), na.rm = TRUE)
+
+  overlay_layers <- function(p) {
+    if (!is.null(elevation_data)) {
+      p <- p + geom_contour(data = elevation_data, aes(x = lon, y = lat, z = elevation),
+                             color = "black", alpha = 0.5, linewidth = 0.2)
+    }
+    if (!is.null(alaska_outline)) {
+      p <- p + geom_sf(data = alaska_outline, fill = NA, color = "black",
+                        linewidth = 0.3, inherit.aes = FALSE)
+    }
+    p
+  }
+
+ finish <- function(p) {
+  overlay_layers(p) +
+    coord_sf(xlim = c(-170, -130), ylim = c(51, 72)) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      legend.text = element_text(angle = 45, hjust = 1, vjust = 1)
+    )
+}
+
+  if (plot_type == "raster") {
+    shared_limits <- range(c(merged$pred, merged$obs), na.rm = TRUE)
+
+    p_obs  <- finish(ggplot() + geom_tile(data = merged, aes(x = lon, y = lat, fill = obs)) +
+                        scale_fill_viridis_c(option = obs_pred_palette, limits = shared_limits, name = var_label)) +
+      labs(title = paste0(panel_labels[1], ")"))
+
+    p_pred <- finish(ggplot() + geom_tile(data = merged, aes(x = lon, y = lat, fill = pred)) +
+                        scale_fill_viridis_c(option = obs_pred_palette, limits = shared_limits, name = var_label)) +
+      labs(title = paste0(panel_labels[2], ")"))
+
+  } else {
+    dens_obs  <- weighted_kde_grid(merged, "obs",  bandwidth = density_bandwidth) %>%
+      clip_to_polygon(alaska_outline)
+    dens_pred <- weighted_kde_grid(merged, "pred", bandwidth = density_bandwidth) %>%
+      clip_to_polygon(alaska_outline)
+
+    # Density-specific shared limits, computed AFTER clipping so the color
+    # scale reflects only the on-land values actually being displayed --
+    # NOT the raw obs/pred magnitude range, which is a different quantity
+    dens_limits <- range(c(dens_obs$density, dens_pred$density), na.rm = TRUE)
+
+    p_obs  <- finish(ggplot() + geom_tile(data = dens_obs, aes(x = lon, y = lat, fill = density)) +
+                        scale_fill_viridis_c(option = obs_pred_palette, limits = dens_limits, name = paste(var_label, "\n(density)"))) +
+      labs(title = paste0(panel_labels[1], ")"))
+
+    p_pred <- finish(ggplot() + geom_tile(data = dens_pred, aes(x = lon, y = lat, fill = density)) +
+                        scale_fill_viridis_c(option = obs_pred_palette, limits = dens_limits, name = paste(var_label, "\n(density)"))) +
+      labs(title = paste0(panel_labels[2], ")"))
+  }
+
+  # Bias ALWAYS renders as a raster, regardless of plot_type -- it's a
+  # signed quantity (pred - obs), and KDE weighting requires non-negative
+  # weights, so density estimation isn't valid here
+  p_bias <- finish(ggplot() + geom_tile(data = merged, aes(x = lon, y = lat, fill = bias)) +
+                      scale_fill_gradient2(low = bias_palette[1], mid = bias_palette[2], high = bias_palette[3],
+                                           midpoint = 0, limits = c(-bias_limit, bias_limit), name = "Bias\n(pred - obs)")) +
+    labs(title = paste0(panel_labels[3], ")"))
+
+  (p_obs | p_pred | p_bias) + plot_layout(guides = "collect") & theme(legend.position = "bottom")
+}
+```
+
+
+
+
+```{r}
+elevation_data <- elev_df
+
+p1 <- plot_obs_pred_bias(pred_r_strike, obs_r_strike, "Strike rate\n(strikes/km²/month)",
+                          "(a)", plot_type = "density", elevation_data = elevation_data, alaska_outline = alaska,
+                         panel_labels = c("a", "b", "c"))
+
+p2 <- plot_obs_pred_bias(pred_n_strikes, obs_n_strikes, "Mean annual strike count",
+                          "(b)", plot_type = "density", elevation_data = elevation_data, alaska_outline = alaska,
+                         panel_labels = c("d", "e", "f"))
+
+p3 <- plot_obs_pred_bias(pred_ignite, obs_ignite, "Ignition rate/probability",
+                          "(c)", plot_type = "density", elevation_data = elevation_data, alaska_outline = alaska,
+                         panel_labels = c("g", "h", "i"))
+
+p4 <- plot_obs_pred_bias(pred_fire, obs_fire, "Total fire count",
+                          "(d)", plot_type = "density", elevation_data = elevation_data,
+                          alaska_outline = alaska, density_bandwidth = c(2, 1),
+                         panel_labels = c("j", "k", "l"))
+
+p5 <- plot_obs_pred_bias(pred_ba, obs_ba, "Total burned area (km²)",
+                          "(e)", plot_type = "density", elevation_data = elevation_data,
+                          alaska_outline = alaska, density_bandwidth = c(2, 1),
+                         panel_labels = c("m", "n", "o"))
+
+final_fig <- (p1 / p2 / p3 / p4 / p5)
+
+ggsave(file.path(figure_root, "Figure_training_obs_pred_map.png"),
+       final_fig, width = 10, height = 22, dpi = 300)
+
+```
+
+Fire regimes:
+
+Does the model ever capture severity and frequency simultaneously?
+
+Plot:
+a) Fire count vs. burned area by year, color by obs vs pred, training period
+b) Fire severity ratio by year: observed vs. predicted, training period
+
+Figure X. Relationship between fire frequency and fire severity by year, training period (Alaska, June–August 2002–2011). (a) Alaska-wide annual total fire count versus total burned area, observed (red) and predicted (blue, mean total across 500 posterior draws with 95% intervals on both axes); year labels identify each point. (b) Fire severity ratio (annual total burned area divided by total fire count), observed (x-axis) against predicted (y-axis, mean and 95% interval across posterior draws); the dashed line marks 1:1 agreement, where points above the line indicate the model predicts more severe (larger) fires than observed for that year, and points below indicate less severe fires than observed. 
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(data.table)
+
+setDT(df); setDT(obs)
+
+# ---- Predicted: per-draw annual totals, then summarize across draws ----
+pred_annual_by_draw <- df[, .(
+  fire_count_total = sum(fire_count_pred, na.rm = TRUE),
+  burned_area_total = sum(total_burned_area_capped, na.rm = TRUE)
+), by = .(draw_id, year)]
+
+pred_summary <- pred_annual_by_draw[, .(
+  fire_count_mean  = mean(fire_count_total),
+  fire_count_lower = quantile(fire_count_total, 0.025),
+  fire_count_upper = quantile(fire_count_total, 0.975),
+  burned_area_mean  = mean(burned_area_total),
+  burned_area_lower = quantile(burned_area_total, 0.025),
+  burned_area_upper = quantile(burned_area_total, 0.975)
+), by = year][order(year)]
+pred_summary[, source := "Predicted"]
+
+# ---- Observed: single fixed annual totals (no draws, no interval) ----
+obs_summary <- obs[, .(
+  fire_count_mean  = sum(fire_count, na.rm = TRUE),
+  burned_area_mean = sum(burned_area_km2_total, na.rm = TRUE)
+), by = year][order(year)]
+obs_summary[, `:=`(fire_count_lower = NA_real_, fire_count_upper = NA_real_,
+                    burned_area_lower = NA_real_, burned_area_upper = NA_real_,
+                    source = "Observed")]
+
+combined <- rbind(pred_summary, obs_summary, use.names = TRUE)
+
+p_ba_fire_count <- ggplot(combined, aes(x = fire_count_mean, y = burned_area_mean, color = source)) +
+  # Chronological path, one per source, so the year-to-year trajectory
+  # (and any directional reversals) is visible
+  geom_errorbar(aes(ymin = burned_area_lower, ymax = burned_area_upper),
+                width = 0, alpha = 0.4, na.rm = TRUE) +
+  geom_errorbarh(aes(xmin = fire_count_lower, xmax = fire_count_upper),
+                 height = 0, alpha = 0.4, na.rm = TRUE) +
+  geom_point(size = 2) +
+  geom_text_repel(aes(label = year), size = 3, show.legend = FALSE,
+                   max.overlaps = Inf, seed = 123) +
+  scale_color_manual(values = c("Observed" = "firebrick", "Predicted" = "steelblue"), name = NULL) +
+  labs(x = "Total fire count (year)", y = "Total burned area (km², year)",
+       title = "(a)") +
+  theme_minimal() +
+      theme(
+legend.position = "bottom",
+legend.direction = "horizontal"
+) 
+
+p_ba_fire_count
+
+setDT(df); setDT(obs)
+
+# ---- Predicted: per-draw annual ratio, summarized to mean + 95% CI ----
+pred_annual_by_draw <- df[, .(
+  fire_count_total  = sum(fire_count_pred, na.rm = TRUE),
+  burned_area_total = sum(total_burned_area_capped, na.rm = TRUE),
+  ratio = sum(total_burned_area_capped, na.rm = TRUE) / sum(fire_count_pred, na.rm = TRUE)
+), by = .(draw_id, year)]
+
+# 0 fires that year (in that draw) -> 0/0 -> NaN; drop before summarizing
+pred_annual_by_draw <- pred_annual_by_draw[is.finite(ratio)]
+
+pred_annual <- pred_annual_by_draw[, .(
+  ratio_mean  = mean(ratio),
+  ratio_lower = quantile(ratio, 0.025),
+  ratio_upper = quantile(ratio, 0.975),
+  n_draws_with_fire = .N
+), by = year]
+
+# ---- Observed: single fixed annual ratio ----
+obs_annual <- obs[, .(
+  fire_count_total  = sum(fire_count, na.rm = TRUE),
+  burned_area_total = sum(burned_area_km2_total, na.rm = TRUE),
+  ratio = sum(burned_area_km2_total, na.rm = TRUE) / sum(fire_count, na.rm = TRUE)
+), by = year]
+obs_annual <- obs_annual[is.finite(ratio)]
+
+# ---- Merge: only years with a valid ratio on BOTH sides ----
+merged <- obs_annual[, .(year, ratio_obs = ratio)][
+  pred_annual, on = "year", nomatch = 0
+]
+
+# ---- Plot: observed (x) vs predicted (y), 1:1 line for reference ----
+p_severity <- ggplot(merged, aes(x = ratio_obs, y = ratio_mean)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_errorbar(aes(ymin = ratio_lower, ymax = ratio_upper), width = 0, alpha = 0.4, color = "steelblue") +
+  geom_point(size = 2, color = "steelblue") +
+  geom_text_repel(aes(label = year), size = 3, seed = 123) +
+  labs(x = "Observed burned area : fire count (km² per fire)",
+       y = "Predicted burned area : fire count (km² per fire)",
+       title = "(b)") +
+  theme_minimal()
+
+p_severity
+
+final_fig <- p_ba_fire_count | p_severity
+final_fig
+
+ggsave(file.path(figure_root, "Figure_training_obs_pred_annual_fire_severity.png"), final_fig, width = 10, height = 5, dpi = 300)
+```
+Which years are excluded from (b)? none!
+```{r}
+# All years present in either source before the ratio-based filtering
+all_years <- sort(unique(c(pred_annual_by_draw$year, obs_annual$year)))
+
+# Years that survived into the final merged (plotted) data
+plotted_years <- sort(unique(merged$year))
+
+# Which years got dropped entirely from the panel (b) plot
+dropped_years <- setdiff(all_years, plotted_years)
+dropped_years
+
+# Breaking it down further: which side caused each drop --
+# was the year missing from obs_annual, from pred_annual (all draws had 0
+# fires that year), or partially present in pred_annual but with fewer
+# than 500 valid (non-NaN-ratio) draws?
+obs_years_with_ratio  <- unique(obs_annual$year)
+pred_years_with_ratio <- unique(pred_annual$year)
+
+cat("Years missing a valid OBSERVED ratio:", setdiff(all_years, obs_years_with_ratio), "\n")
+cat("Years missing a valid PREDICTED ratio (all 500 draws had 0 fires):",
+    setdiff(all_years, pred_years_with_ratio), "\n")
+
+# For years that DID make it into pred_annual, check how many of the 500
+# draws actually contributed (n_draws_with_fire < 500 means some draws
+# that year had zero fires and were silently excluded from that year's mean/CI)
+pred_annual[, .(year, n_draws_with_fire)][order(year)]
+```
+
+
+Spatially, how does fire count interact with burned area?
+```{r}
+library(dplyr)
+library(ggplot2)
+library(data.table)
+
+setDT(df); setDT(obs)
+
+# ---- Predicted: sum per gridcell WITHIN each draw first, then average
+# across draws (same "aggregate within draw, then summarize" pattern used
+# throughout this project) ----
+pred_by_gridcell_draw <- df[, .(
+  fire_count_total  = sum(fire_count_pred, na.rm = TRUE),
+  burned_area_total = sum(total_burned_area_capped, na.rm = TRUE)
+), by = .(draw_id, lat, lon)]
+
+pred_by_gridcell <- pred_by_gridcell_draw[, .(
+  fire_count_total  = mean(fire_count_total),
+  burned_area_total = mean(burned_area_total),
+), by = .(lat, lon)]
+pred_by_gridcell[, source := "Predicted"]
+
+# ---- Observed: single fixed total per gridcell ----
+obs_by_gridcell <- obs[, .(
+  fire_count_total  = sum(fire_count, na.rm = TRUE),
+  burned_area_total = sum(burned_area_km2_total, na.rm = TRUE)
+), by = .(lat, lon)]
+obs_by_gridcell[, source := "Observed"]
+
+combined <- rbind(pred_by_gridcell, obs_by_gridcell, use.names = TRUE)
+
+# Restrict to gridcells with SOME activity on at least one side -- otherwise
+# the huge share of true (0,0) gridcells dominates the density and hides
+# the actual relationship among cells that did burn
+combined_active <- combined[fire_count_total > 0 | burned_area_total > 0]
+
+ggplot(combined_active, aes(x = fire_count_total, y = burned_area_total, color = source)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  scale_color_manual(values = c("Observed" = "firebrick", "Predicted" = "steelblue"), name = NULL) + scale_y_log10() +
+  labs(x = "Total fire count",
+       y = "Total burned area (km², gridcell, log scale)",
+       title = "Fire count vs. burned area by gridcell, training period") +
+  theme_minimal()
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(data.table)
+
+setDT(df); setDT(obs)
+
+# ---- Predicted: every draw kept separate (one point per gridcell PER DRAW,
+# not averaged across draws) -- this is the full posterior spread, not a
+# summary of it ----
+pred_by_gridcell_draw <- df[, .(
+  fire_count_total  = sum(fire_count_pred, na.rm = TRUE),
+  burned_area_total = sum(total_burned_area_capped, na.rm = TRUE),
+  ratio = sum(total_burned_area_capped, na.rm = TRUE) / sum(fire_count_pred, na.rm = TRUE)
+), by = .(draw_id, lat, lon)]
+pred_by_gridcell_draw[, source := "Predicted"]
+
+# ---- Observed: single fixed total per gridcell (unchanged) ----
+obs_by_gridcell <- obs[, .(
+  fire_count_total  = sum(fire_count, na.rm = TRUE),
+  burned_area_total = sum(burned_area_km2_total, na.rm = TRUE),
+  ratio = sum(burned_area_km2_total, na.rm = TRUE) / sum(fire_count, na.rm = TRUE)
+), by = .(lat, lon)]
+obs_by_gridcell[, source := "Observed"]
+
+# Combine -- draw_id is NA for observed, which is fine since it's not used
+combined <- rbind(pred_by_gridcell_draw, obs_by_gridcell, use.names = TRUE, fill = TRUE)
+
+# Restrict to points with SOME activity on at least one side
+combined_active <- combined[fire_count_total > 0 | burned_area_total > 0]
+
+ggplot(combined_active, aes(x = fire_count_total, y = burned_area_total, color = source)) +
+  geom_point(alpha = 0.15, size = 0.6) +
+  scale_color_manual(values = c("Observed" = "firebrick", "Predicted" = "steelblue"), name = NULL) + scale_y_log10() +
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 2))) +
+  labs(x = "Total fire count",
+       y = "Total burned area (km², gridcell-draw, log scale)",
+       title = "Fire count vs. burned area by gridcell, all posterior draws") +
+  theme_minimal()
+
+
+```
+
+Ratio: burned area : fire count; high values = few large fires; low values = many small fires
+```{r}
+library(dplyr)
+library(ggplot2)
+library(data.table)
+
+setDT(df); setDT(obs)
+
+# ---- Predicted: per-draw ratio per gridcell, summarized to mean + 95% CI ----
+pred_by_gridcell_draw <- df[, .(
+  fire_count_total  = sum(fire_count_pred, na.rm = TRUE),
+  burned_area_total = sum(total_burned_area_capped, na.rm = TRUE),
+  ratio = sum(total_burned_area_capped, na.rm = TRUE) / sum(fire_count_pred, na.rm = TRUE)
+), by = .(draw_id, lat, lon)]
+
+# 0 fires -> 0/0 -> NaN; can't compute a ratio for a gridcell that never
+# burned in that draw, so these rows are dropped before summarizing
+pred_by_gridcell_draw <- pred_by_gridcell_draw[is.finite(ratio)]
+
+pred_by_gridcell <- pred_by_gridcell_draw[, .(
+  ratio_mean  = mean(ratio),
+  ratio_lower = quantile(ratio, 0.025),
+  ratio_upper = quantile(ratio, 0.975),
+  n_draws_with_fire = .N   # how many of the 500 draws had ANY fire here
+), by = .(lat, lon)]
+
+# ---- Observed: single fixed ratio per gridcell (unchanged, but drop NaN) --
+obs_by_gridcell <- obs[, .(
+  fire_count_total  = sum(fire_count, na.rm = TRUE),
+  burned_area_total = sum(burned_area_km2_total, na.rm = TRUE),
+  ratio = sum(burned_area_km2_total, na.rm = TRUE) / sum(fire_count, na.rm = TRUE)
+), by = .(lat, lon)]
+obs_by_gridcell <- obs_by_gridcell[is.finite(ratio)]
+
+# ---- Merge: only gridcells with a valid ratio on BOTH sides ----
+merged <- obs_by_gridcell[, .(lat, lon, ratio_obs = ratio)][
+  pred_by_gridcell, on = c("lat", "lon"), nomatch = 0 
+]
+
+# ---- Plot: observed (x) vs predicted (y), 1:1 line for reference ----
+#n_draws_with_fire: predicted fire count; flag gridcells where the predicted ratio is based on very few draws (and is therefore less reliable/noisier) versus gridcells where most draws had a fire.
+ggplot(merged, aes(x = ratio_obs, y = ratio_mean)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_errorbar(aes(ymin = ratio_lower, ymax = ratio_upper), width = 0, alpha = 0.3, color = "steelblue") +
+  geom_point(alpha = 0.5, size = 1, color = "steelblue") +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "Observed burned area : fire count (km² per fire, log scale)",
+       y = "Predicted burned area : fire count (km² per fire, log scale)",
+       title = "Fire severity ratio by gridcell: observed vs. predicted") +
+  theme_minimal()
+```
+
+

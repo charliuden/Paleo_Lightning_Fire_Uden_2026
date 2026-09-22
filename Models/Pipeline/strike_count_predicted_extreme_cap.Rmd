@@ -1,0 +1,283 @@
+---
+title: "strike_count_predicted_extreme_cap"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(data.table)
+library(raster)
+library(sp)
+library(patchwork)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+config <- read_properties(config_file_path)
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+
+figure_root <- file.path(figure_root, "Posterior_Draws")
+```
+
+Read in output from 500 draws of the posterior distribution for all parameters in pipeline. No cap has been applied to strike count. However, strike count predictions far exceed the observed. 
+```{r}
+df <- fread(file.path(base_path, "Models/Pipeline/predictions_training_posterior_bb_no_outliers.csv"))
+summary(df$n_strikes)
+```
+
+Get observed outcomes from training data
+```{r}
+strike_rates <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+strike_counts <- read.csv(file.path(drivers_root, "lightning_strike_count_climate_jja_2002_2011_no_outliers.csv"))
+fire_counts <- read.csv(file.path(drivers_root, "lightning_ignition_jja_2002_2011_new_no_outliers.csv"))
+burned_areas <- read.csv(file.path(drivers_root, "burned_area_jja_2002_2011_new.csv"))
+
+#need total burned area per gridcell-month. Though the model was trained on fire size per single fire, pipeline simulations sum sampled burned area per fire, so we need to compare the same aggregation in the training data. 
+burned_areas_agg <- burned_areas %>%
+  group_by(lat, lon, year, month) %>%
+  summarise(burned_area_km2_total = sum(burned_area_km2_total, na.rm = TRUE), .groups = "drop")
+
+strike_rates_join <- strike_rates %>%
+  dplyr::select(lat, lon, year, r_strike_obs = strikes) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+fire_counts <- fire_counts %>%
+  dplyr::select(lat, lon, year, month, fire_count) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+strike_counts <- strike_counts %>%
+  dplyr::select(lat, lon, year, month, n_strikes_obs = strike_count) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+obs <- fire_counts %>% left_join(strike_counts, by = c("lat", "lon", "year", "month")) 
+
+obs <- obs %>%
+  left_join(strike_rates_join, by = c("lat", "lon", "year")) %>%
+  left_join(burned_areas_agg, by = c("lat", "lon", "year", "month")) %>%
+  mutate(r_strike_obs = ifelse(is.na(r_strike_obs), 0, r_strike_obs)) %>%
+  mutate(burned_area_km2_total = ifelse(is.na(burned_area_km2_total), 0, burned_area_km2_total)) %>%
+  dplyr::select(lat, lon, year, month, r_strike_obs, n_strikes_obs, fire_count, burned_area_km2_total)
+
+#check
+nrow(obs) == nrow(fire_counts) #should be true
+sum(obs$burned_area_km2_total > 0)   # should be n_distinct(burned_areas gridcell-months), not raw fire count
+sum(is.na(obs$r_strike_obs))            # should be 0 if strike_rates covers the same lat/lon/year set
+
+summary(obs)
+
+#Remove rows where fire_count exceeds strike_count 
+obs <- obs %>%
+  filter(!(n_strikes_obs > 0 & fire_count > n_strikes_obs))
+  
+summary(obs)
+```
+
+What do observed fire count, burned areas, and strike counds look like?
+```{r}
+cap = 50
+nrow(filter(obs, n_strikes_obs>cap))
+nrow(filter(obs, n_strikes_obs>cap))/nrow(obs)
+ggplot(filter(obs, n_strikes_obs>cap), aes(x=n_strikes_obs, y=fire_count, size=burned_area_km2_total, alpha=0.1)) + geom_point()
+
+```
+
+How does extremem cap perform
+```{r}
+cap <- 1000
+nrow(filter(df, n_strikes>cap))
+nrow(filter(df, n_strikes>cap))/nrow(df)
+ggplot(filter(df, n_strikes > cap), aes(x=n_strikes, y=fire_count_pred, size=total_burned_area_capped, alpha=0.1)) + geom_point()
+```
+```{r}
+map_data_obs <- obs %>% group_by(lat, lon) %>% summarise(mean_n_strikes = mean(n_strikes_obs))
+
+ggplot(map_data_obs, aes(x=lon, y=lat, color=mean_n_strikes)) + geom_point() + ggtitle("oberved mean strike count")
+
+map_data_pred <- df %>% group_by(lat, lon) %>% summarise(mean_n_strikes = mean(n_strikes))
+
+ggplot(map_data_pred, aes(x=lon, y=lat, color=mean_n_strikes)) + geom_point() + ggtitle("predicted mean strike count")
+```
+How many times does strike count exceed a cap (pick a few)
+```{r}
+cap = 110
+nrow(filter(obs, n_strikes_obs>cap))
+nrow(obs)
+nrow(filter(obs, n_strikes_obs>cap))/nrow(obs)
+```
+
+Statistically define where the predicted strike count cap should go:
+
+fit a Generalized Pareto Distribution (GPD) to the clean observed strike-count tail, via peaks-over-threshold. This is the standard statistical framework for exactly this question (same one used for flood/rainfall return-period estimation). it finds a formally justified, probability-anchored cutoff from the observed data's own tail behavior, rather than picking a round number.
+```{r}
+library(ismev)  # or the POT package
+library(dplyr)
+
+# ---- 1. Work with the CLEAN observed nonzero strike counts ----
+strike_vals <- obs %>% filter(n_strikes_obs > 0) %>% pull(n_strikes_obs)
+
+# ---- 2. Choose a threshold u via mean residual life plot ----
+# Same tool you already used for outlier detection -- but now on clean
+# data, this is doing its proper job: identifying where the tail starts
+# behaving like a genuine Pareto-type extreme, not flagging contamination.
+mrl.plot(strike_vals, umin = 50, umax = 150)
+# Look for where the plot becomes roughly linear -- pick u at that point
+
+# ---- 3. Fit the GPD to exceedances above u ----
+#Looking for a value of u that sits below 1-10% of the data. (gpd_fit$rate around 0.01–0.10)
+u <- 100   # <-- set based on the mrl.plot, adjust to what you actually see
+gpd_fit <- gpd.fit(strike_vals, threshold = u)
+gpd.diag(gpd_fit)   # diagnostic plots -- check the fit looks reasonable
+
+# ---- 4. Compute a return level at a chosen exceedance probability ----
+# The key judgment call: what probability corresponds to "how extreme is
+# too extreme for my simulated ensemble to plausibly produce"?
+# A principled anchor: tie it to how many independent gridcell-month
+# trials your ensemble actually represents.
+n_gridcell_months_per_draw <- nrow(obs)     # ~132,630
+n_draws <- 500
+total_trials <- n_gridcell_months_per_draw * n_draws  # ~66,315,000
+
+# Return level for "expect to see this exceeded about ONCE across the
+# entire simulated ensemble" -- i.e. exceedance probability = 1/total_trials
+target_prob <- 100 / total_trials
+
+# Using the fitted GPD: return level formula
+xi    <- gpd_fit$mle[2]
+sigma <- gpd_fit$mle[1]
+zeta_u <- mean(strike_vals > u)  # probability of exceeding u at all, empirically
+
+return_level <- u + (sigma / xi) * (((target_prob / zeta_u)^(-xi)) - 1)
+cat("EVT-derived cap at exceedance probability", target_prob, ":", round(return_level), "strikes\n")
+```
+
+Reading your mrl plot: it isn't textbook-linear. It's roughly flat-ish from 50 up to about 95, then there's a bump peaking around u=105-110, then it declines. That hump is often a sign of a slightly heavier-than-expected cluster of moderate-large exceedances rather than a clean single-regime tail — not unusual for real geophysical data, and not a sign your analysis is broken. Given the plot doesn't hand an obvious answer, u=100 (sitting right at the start of that hump, where the curve visibly changes direction, as noted) is a defensible, honestly-justified choice — you're not claiming false precision,  picking the threshold where the behavior visibly shifts, which is a legitimate (if less clean-textbook) way to read this diagnostic.
+
+GPD-tail-replacement:
+any simulated draw that lands above 100 doesn't get chopped to a fixed ceiling — it gets replaced with a fresh random draw from the exact GPD you just validated against your real exceedance data. So the model can still produce a 150, a 180, even occasionally something near or above your historical max of 194 — because those values are genuinely consistent with the fitted tail shape — but it becomes essentially impossible to reproduce a 3,855, because that value is astronomically improbable under a GPD with xi = -0.14
+
+```{r}
+library(evd)
+
+# From your fitted GPD (u=100 fit):
+u_thresh <- 100
+sigma_gpd <- gpd_fit$mle[1]   # 25.59
+xi_gpd    <- gpd_fit$mle[2]   # -0.143
+
+apply_gpd_tail_correction <- function(raw_draws, u, sigma, xi) {
+  exceed_idx <- which(raw_draws > u)
+  if (length(exceed_idx) > 0) {
+    raw_draws[exceed_idx] <- u + rgpd(length(exceed_idx), loc = 0, scale = sigma, shape = xi)
+  }
+  raw_draws
+}
+```
+
+
+```{r}
+# For xi < 0, GPD has a finite upper endpoint at u - sigma/xi
+implied_max <- u_thresh - sigma_gpd / xi_gpd
+cat("GPD-implied theoretical maximum:", round(implied_max), "strikes\n")
+```
+
+draws exceeding the GPD threshold (u=100 strikes, fit via peaks-over-threshold on n=133 exceedances) were replaced with samples from the fitted Generalized Pareto Distribution (σ=25.6, ξ=−0.14), which has a finite theoretical upper bound of 279 strikes (GDP implied maximum), consistent with observed extremes. This added trail replacement prevents occasional negative binomial predictions exceeding realistic strike counts (% above predictions exceed the observed maximum of 194 strikes, reaching calues of 3,000 + strikes), while maintaining a statistically valid tail redraw. 
+
+
+Apply the GDP tail replacement to strike count predicitons:
+```{r}
+library(data.table)
+library(evd)
+
+setDT(df)
+
+# GPD parameters from your fitted model (u=100)
+u_thresh  <- 100
+sigma_gpd <- sigma_gpd #25.5900251
+xi_gpd    <- xi_gpd #-0.1429466
+
+# ---- Build the corrected value in a NEW column, leaving n_strikes untouched ----
+df[, n_strikes_gpd_corrected := n_strikes]
+
+exceed_idx <- df[, which(n_strikes > u_thresh)]
+n_exceed <- length(exceed_idx)
+
+cat(sprintf("Replacing %d exceedances above %d (%.4f%% of rows)\n",
+            n_exceed, u_thresh, 100 * n_exceed / nrow(df)))
+
+if (n_exceed > 0) {
+  df[exceed_idx, n_strikes_gpd_corrected := as.integer(round(
+    u_thresh + rgpd(n_exceed, loc = 0, scale = sigma_gpd, shape = xi_gpd)
+  ))]
+}
+
+# ---- Compare the two side by side ----
+summary(df$n_strikes)
+summary(df$n_strikes_gpd_corrected)
+
+max(df$n_strikes)                  # original -- should still show 3855
+max(df$n_strikes_gpd_corrected)    # corrected -- should be bounded near the implied max
+
+implied_max <- u_thresh - sigma_gpd / xi_gpd
+cat("GPD-implied theoretical max:", round(implied_max), "\n")
+
+# Quick look at exactly which rows changed, and by how much
+df[exceed_idx, .(n_strikes, n_strikes_gpd_corrected)][order(-n_strikes)] |> head(20)
+```
+
+```{r}
+# Distribution shape comparison (reuse your existing compare_distribution
+# machinery, treating both as "predicted" against the same observed column)
+library(ggplot2)
+ggplot(df[n_strikes > 20]) +   # zoom past the zero-heavy bulk to see the tail
+  geom_histogram(aes(x = n_strikes, fill = "Original"), alpha = 0.5, bins = 60) +
+  geom_histogram(aes(x = n_strikes_gpd_corrected, fill = "GPD-corrected"), alpha = 0.5, bins = 60) +
+  scale_x_log10() +
+  labs(x = "n_strikes (log scale)", fill = NULL) +
+  theme_minimal()
+
+# Aggregate effect on the totals you were tracking earlier
+cat("Total strikes, original:  ", sum(df$n_strikes), "\n")
+cat("Total strikes, corrected: ", sum(df$n_strikes_gpd_corrected), "\n")
+```
+
+
+
+

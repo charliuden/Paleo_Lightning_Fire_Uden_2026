@@ -1,0 +1,549 @@
+---
+title: "calibration_training_time_models"
+author: "Charlotte Uden"
+date: "2026-09-03"
+output: html_document
+---
+
+
+Temporal comparison between observations and predictions, where the model separately fits change in an outcome variable over time. 
+
+
+CALIBRATION --> TRAINING
+
+Observed data: calibration period (1950-1989) --> training period (2002-2011) thunderstorm data, (exclude the years between for now), annual fire count (this will need to be summed per year for the observed training data), annual total burned area (again, training period observed data will need to be summed for each year). 
+
+Predicted ERA5 data: ERA5 predictions for calibration period (1950-1989) --> ERA5 predictions for training period (2002-2011), lightning strike count, fire count, burned area. Lets do this for the raw gridcell-month data and the annual sums. 
+
+WITHIN-CALIBRATION: 1970 cutoff
+
+Predicted TRACE data: Since the trace data don't extend past 1990, we can only compare within the calibration period. The 1970 cutoff described by \citet{sanford_age_2015}, where fires activity begins to rise, can be used to look at the trace data's ability to capture this shift in lightnign and fire. So, the same model, this time the cutoff is pre-and post-1970. To compare with observed data, use the thunderstorm {menne_global_2012,menne_overview_2012}, fire count, and burned area {todd_wildland_2006} calibration period observations with the same 1970 cutoff.  Again, the annual totals will be calculated for slightly more direct comparison with the observed units. 
+
+Note on the thunderstorm data:
+Stations enter and leave the record over time (237 stations pre-1970 vs. 318 post-1970), so both the number of reporting stations and their spatial distribution change across years independent of any real climate signal. That's a confound requiring both lat/lon (to absorb spatial variation) and a per-year n_datapoints covariate (to absorb changing sample coverage).
+
+For trace/era5 predictions, there's no equivalent "changing coverage" problem because theyre on a continuous grid, so a n_datapoints-style covariate isn't needed.
+
+For training period, gridcell-month observations from the same gridcell across different years are still repeated measures (not independent) and lightning/fire physically vary with latitude. So I'd include a gridcell random intercept (analogous to your STATION random effect) to absorb repeated-measures non-independence, and latitude as a fixed effect to capture the real spatial gradient — but not a data-completeness covariate, since that issue is specific to the station network.
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(maps)
+library(readr)
+library(tidyr)
+
+library(glmmTMB)
+library(broom.mixed)
+library(purrr)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+modern_fire_stats_root <- config[["modern_fire_stats_root"]]
+calibration_thunderstorm <- config[["calibration_thunderstorm"]]
+```
+
+```{r}
+thunder_obs <- read.csv(file.path(calibration_thunderstorm, "thunderstorms_1950-2011.csv"))
+
+calib_fire_obs <- read.csv(file.path(modern_fire_stats_root, "alaska_lightning_fires_1950_1989.csv"))
+
+calib_pred_trace <- read.csv(file.path(predictions_root, "calibration_period_TRACE_predictions.csv"))
+calib_pred_era <- read.csv(file.path(predictions_root, "calibration_period_ERA5_predictions.csv"))
+
+train_pred_obs <- read.csv(file.path(predictions_root, "predictions_2002_2011_mixture.csv"))
+```
+
+
+
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 1 — CALIBRATION (1950-1989) → TRAINING (2002-2011), OBSERVED DATA
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── 1a. Thunderstorm — FIXED: new calib_train_period column, distinct from
+# the original pre_1970/post_1970 "period" column used in Part 3b ──────────
+
+thunder_n_per_year <- thunder_obs %>%
+  group_by(YEAR) %>%
+  summarise(n_datapoints_year = n(), .groups = "drop")
+
+thunder_obs_updated <- thunder_obs %>%
+  left_join(thunder_n_per_year, by = "YEAR") %>%
+  filter(YEAR <= 1989 | YEAR >= 2002) %>%   # exclude the 1990-2001 gap
+  mutate(
+    calib_train_period = factor(if_else(YEAR <= 1989, "calibration", "training"),
+                                 levels = c("calibration", "training")),
+    YEAR_c = YEAR - mean(YEAR),
+    n_datapoints_c = n_datapoints_year - mean(n_datapoints_year)
+  )
+
+model_calib_train_thunder <- glmmTMB(
+  thunderstorm_days ~ calib_train_period * YEAR_c + latitude + longitude + n_datapoints_c + (1 | STATION),
+  data = thunder_obs_updated,
+  family = nbinom2()
+)
+summary(model_calib_train_thunder)
+
+# ── 1b. Fire count, annual statewide totals — observed calibration vs training ──
+
+fire_obs_annual <- bind_rows(
+  calib_fire_obs %>% transmute(year, fire_count, period = "calibration"),
+  train_pred_obs %>% group_by(year) %>%
+    summarise(fire_count = sum(fire_count, na.rm = TRUE), .groups = "drop") %>%
+    mutate(period = "training")
+) %>%
+  mutate(period = factor(period, levels = c("calibration", "training")),
+         year_c = year - mean(year))
+
+model_calib_train_fire_obs <- glmmTMB(
+  fire_count ~ period,
+  data = fire_obs_annual,
+  family = nbinom2()
+)
+summary(model_calib_train_fire_obs)
+
+# ── 1c. Burned area, annual statewide totals (acres) — observed ────────────
+
+burned_obs_annual <- bind_rows(
+  calib_fire_obs %>% transmute(year, burned_acres, period = "calibration"),
+  train_pred_obs %>% group_by(year) %>%
+    summarise(burned_acres = sum(burned_area_km2_total, na.rm = TRUE) * 247.105, .groups = "drop") %>%
+    mutate(period = "training")
+) %>%
+  mutate(period = factor(period, levels = c("calibration", "training")))
+
+model_calib_train_burned_obs <- glmmTMB(
+  burned_acres ~ period,
+  data = burned_obs_annual,
+  family = Gamma(link = "log")
+)
+summary(model_calib_train_burned_obs)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 2 — CALIBRATION → TRAINING, ERA5-PREDICTED DATA
+# FIXED: gridcell-month models now include offset(log(area)) to account for
+# calib_pred_era being on the coarse TraCE-aligned grid while train_pred_obs
+# is on the native, much finer ERA5 grid — without this, raw counts per
+# gridcell-month are not comparable between the two periods.
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── Build combined gridcell-month ERA5 dataset (calibration + training),
+# carrying the "area" column through so the offset can be applied ──────────
+
+era_gmy <- bind_rows(
+  calib_pred_era %>% filter(year >= 1950, year <= 1989) %>%
+    transmute(lat, lon, year, month, area,
+              n_strikes, fire_count_pred,
+              burned_acres = total_burned_area_acres_capped,
+              period = "calibration"),
+  train_pred_obs %>%
+    transmute(lat, lon, year, month, area,
+              n_strikes = n_strikes,           # ERA5-predicted, training period
+              fire_count_pred,
+              burned_acres = total_burned_area * 247.105,
+              period = "training")
+) %>%
+  mutate(
+    period = factor(period, levels = c("calibration", "training")),
+    year_c = year - mean(year),
+    gridcell_id = paste(lat, lon)
+  )
+
+# Quick check worth running once, to confirm the resolution mismatch and
+# that the offset is actually doing meaningful work:
+# era_gmy %>% distinct(period, area) %>% arrange(period)
+# era_gmy %>% group_by(period) %>% summarise(n_gridcells = n_distinct(gridcell_id))
+
+# ── 2a. Lightning strike count — gridcell-month GLMM, with area offset ─────
+
+model_calib_train_lightning_gmy <- glmmTMB(
+  n_strikes ~ period * year_c + lat + offset(log(area)) + (1 | gridcell_id),
+  data = era_gmy,
+  family = nbinom2()
+)
+summary(model_calib_train_lightning_gmy)
+
+# ── Lightning — statewide annual sums ───────────────────────────────────────
+# (annual sums remain raw counts here, NOT area-normalized — see note below
+# the model registry about interpreting these alongside the gridcell-month
+# rate-based results)
+
+era_annual <- era_gmy %>%
+  group_by(year, period) %>%
+  summarise(
+    n_strikes_total    = sum(n_strikes, na.rm = TRUE),
+    fire_count_total   = sum(fire_count_pred, na.rm = TRUE),
+    burned_acres_total = sum(burned_acres, na.rm = TRUE),
+    total_area         = sum(area, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(year_c = year - mean(year))
+
+model_calib_train_lightning_annual <- glmmTMB(
+  n_strikes_total ~ period + offset(log(total_area)),
+  data = era_annual,
+  family = nbinom2()
+)
+summary(model_calib_train_lightning_annual)
+
+# ── 2b. Fire count — gridcell-month GLMM, with area offset ─────────────────
+
+model_calib_train_fire_gmy <- glmmTMB(
+  fire_count_pred ~ period * year_c + lat + offset(log(area)) + (1 | gridcell_id),
+  data = era_gmy,
+  family = nbinom2()
+)
+summary(model_calib_train_fire_gmy)
+
+# ── Fire count — statewide annual sums, with area offset ───────────────────
+
+model_calib_train_fire_annual <- glmmTMB(
+  fire_count_total ~ period + offset(log(total_area)),
+  data = era_annual,
+  family = nbinom2()
+)
+summary(model_calib_train_fire_annual)
+
+# ── 2c. Burned area — gridcell-month GLMM (Tweedie), with area offset ──────
+
+model_calib_train_burned_gmy <- glmmTMB(
+  burned_acres ~ period * year_c + lat + offset(log(area)) + (1 | gridcell_id),
+  data = era_gmy,
+  family = tweedie(link = "log")
+)
+summary(model_calib_train_burned_gmy)
+
+# ── Burned area — statewide annual sums, with area offset ──────────────────
+
+model_calib_train_burned_annual <- glmmTMB(
+  burned_acres_total ~ period + offset(log(total_area)),
+  data = era_annual,
+  family = Gamma(link = "log")
+)
+summary(model_calib_train_burned_annual)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 3 — WITHIN-CALIBRATION, 1970 CUTOFF (TraCE-predicted)
+# No area offset needed here: same coarse grid used throughout 1950-1989,
+# so gridcell area is constant within this comparison.
+# ══════════════════════════════════════════════════════════════════════════
+
+trace_gmy <- calib_pred_trace %>%
+  filter(year >= 1950, year <= 1989) %>%
+  mutate(
+    period70 = factor(if_else(year < 1970, "pre_1970", "post_1970"),
+                       levels = c("pre_1970", "post_1970")),
+    year_c = year - mean(year),
+    gridcell_id = paste(lat, lon),
+    burned_acres = total_burned_area_acres_capped
+  )
+
+model_1970_lightning_gmy <- glmmTMB(
+  n_strikes ~ period70 * year_c + lat + (1 | gridcell_id),
+  data = trace_gmy,
+  family = nbinom2()
+)
+summary(model_1970_lightning_gmy)
+
+trace_annual <- trace_gmy %>%
+  group_by(year, period70) %>%
+  summarise(
+    n_strikes_total    = sum(n_strikes, na.rm = TRUE),
+    fire_count_total   = sum(fire_count_pred, na.rm = TRUE),
+    burned_acres_total = sum(burned_acres, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+model_1970_lightning_annual <- glmmTMB(n_strikes_total ~ period70, data = trace_annual, family = nbinom2())
+model_1970_fire_annual      <- glmmTMB(fire_count_total ~ period70, data = trace_annual, family = nbinom2())
+
+# Tweedie, not Gamma: confirmed earlier that burned_acres_total contains
+# exact zeros in years with zero simulated fires (see zero-fire-year
+# discussion above) — Gamma cannot handle those.
+model_1970_burned_annual    <- glmmTMB(burned_acres_total ~ period70, data = trace_annual, family = tweedie(link = "log"))
+
+summary(model_1970_lightning_annual)
+summary(model_1970_fire_annual)
+summary(model_1970_burned_annual)
+
+model_1970_fire_gmy <- glmmTMB(
+  fire_count_pred ~ period70 * year_c + lat + (1 | gridcell_id),
+  data = trace_gmy,
+  family = nbinom2()
+)
+model_1970_burned_gmy <- glmmTMB(
+  burned_acres ~ period70 * year_c + lat + (1 | gridcell_id),
+  data = trace_gmy,
+  family = tweedie(link = "log")
+)
+summary(model_1970_fire_gmy)
+summary(model_1970_burned_gmy)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PART 3b — WITHIN-CALIBRATION, 1970 CUTOFF, OBSERVED DATA
+# ══════════════════════════════════════════════════════════════════════════
+
+thunder_calib_only <- thunder_obs %>%
+  left_join(thunder_n_per_year, by = "YEAR") %>%
+  filter(YEAR <= 1989) %>%
+  mutate(
+    period = factor(if_else(YEAR < 1970, "pre_1970", "post_1970"),
+                     levels = c("pre_1970", "post_1970")),
+    YEAR_c = YEAR - mean(YEAR),
+    n_datapoints_c = n_datapoints_year - mean(n_datapoints_year)
+  )
+
+model_1970_thunder <- glmmTMB(
+  thunderstorm_days ~ period * YEAR_c + latitude + longitude + n_datapoints_c + (1 | STATION),
+  data = thunder_calib_only,
+  family = nbinom2()
+)
+summary(model_1970_thunder)
+
+calib_fire_obs_1970 <- calib_fire_obs %>%
+  mutate(period70 = factor(if_else(year < 1970, "pre_1970", "post_1970"),
+                            levels = c("pre_1970", "post_1970")))
+
+model_1970_fire_obs   <- glmmTMB(fire_count   ~ period70, data = calib_fire_obs_1970, family = nbinom2())
+model_1970_burned_obs <- glmmTMB(burned_acres ~ period70, data = calib_fire_obs_1970, family = Gamma(link = "log"))
+
+summary(model_1970_fire_obs)
+summary(model_1970_burned_obs)
+```
+
+
+test whether 1970_1989 and training are statistically indistinguishable from each other (supporting the plateau story) while both differ from pre_1970
+```{r}
+fire_obs_three_group <- calib_fire_obs %>%
+  transmute(year, fire_count, group = if_else(year < 1970, "pre_1970", "1970_1989")) %>%
+  bind_rows(
+    train_pred_obs %>% group_by(year) %>%
+      summarise(fire_count = sum(fire_count, na.rm = TRUE), .groups = "drop") %>%
+      mutate(group = "training")
+  ) %>%
+  mutate(group = factor(group, levels = c("pre_1970", "1970_1989", "training")))
+
+model_three_group_fire <- glmmTMB(fire_count ~ group, data = fire_obs_three_group, family = nbinom2())
+summary(model_three_group_fire)
+```
+
+```{r}
+
+# ══════════════════════════════════════════════════════════════════════════
+# SUMMARY TABLE — all models compiled together
+# ══════════════════════════════════════════════════════════════════════════
+
+extract_model_summary <- function(model, model_name, year_interval, part, description,
+                                   variable, resolution) {
+
+  tidy(model, effects = "fixed", conf.int = TRUE) %>%
+    filter(grepl("period", term)) %>%
+    mutate(
+      pct_change = (exp(estimate) - 1) * 100,
+      pct_change_lwr = (exp(conf.low)  - 1) * 100,
+      pct_change_upr = (exp(conf.high) - 1) * 100,
+      model_name    = model_name,
+      year_interval = year_interval,
+      part          = part,
+      description   = description,
+      variable      = variable,
+      resolution    = resolution
+    ) %>%
+    select(part, year_interval, description, variable, resolution, model_name,
+           term, estimate, std.error, statistic, p.value,
+           pct_change, pct_change_lwr, pct_change_upr)
+}
+
+model_registry <- list(
+
+  # PART 1 — calibration -> training, OBSERVED
+  list(model = model_calib_train_thunder,      name = "calib_train_thunder_obs",
+       year_interval = "1950-1989 -> 2002-2011", part = "1",
+       description = "Full calibration to training period, observed",
+       variable = "Thunderstorm days", resolution = "Station-year"),
+
+  list(model = model_calib_train_fire_obs,     name = "calib_train_fire_obs",
+       year_interval = "1950-1989 -> 2002-2011", part = "1",
+       description = "Full calibration to training period, observed",
+       variable = "Fire count", resolution = "Statewide annual total"),
+
+  list(model = model_calib_train_burned_obs,   name = "calib_train_burned_obs",
+       year_interval = "1950-1989 -> 2002-2011", part = "1",
+       description = "Full calibration to training period, observed",
+       variable = "Burned area (acres)", resolution = "Statewide annual total"),
+
+  # PART 2 — calibration -> training, ERA5 PREDICTED (gridcell-month, area-adjusted rate)
+  list(model = model_calib_train_lightning_gmy, name = "calib_train_lightning_era5_gmy",
+       year_interval = "1950-1989 -> 2002-2011", part = "2",
+       description = "Full calibration to training period, ERA5 predicted (area-adjusted rate)",
+       variable = "Lightning strike count", resolution = "Gridcell-month"),
+
+  list(model = model_calib_train_fire_gmy,      name = "calib_train_fire_era5_gmy",
+       year_interval = "1950-1989 -> 2002-2011", part = "2",
+       description = "Full calibration to training period, ERA5 predicted (area-adjusted rate)",
+       variable = "Fire count", resolution = "Gridcell-month"),
+
+  list(model = model_calib_train_burned_gmy,    name = "calib_train_burned_era5_gmy",
+       year_interval = "1950-1989 -> 2002-2011", part = "2",
+       description = "Full calibration to training period, ERA5 predicted (area-adjusted rate)",
+       variable = "Burned area (acres)", resolution = "Gridcell-month"),
+
+  # PART 2 — calibration -> training, ERA5 PREDICTED (statewide annual sums, area-adjusted)
+  list(model = model_calib_train_lightning_annual, name = "calib_train_lightning_era5_annual",
+       year_interval = "1950-1989 -> 2002-2011", part = "2",
+       description = "Full calibration to training period, ERA5 predicted (area-adjusted rate)",
+       variable = "Lightning strike count", resolution = "Statewide annual total"),
+
+  list(model = model_calib_train_fire_annual,      name = "calib_train_fire_era5_annual",
+       year_interval = "1950-1989 -> 2002-2011", part = "2",
+       description = "Full calibration to training period, ERA5 predicted (area-adjusted rate)",
+       variable = "Fire count", resolution = "Statewide annual total"),
+
+  list(model = model_calib_train_burned_annual,    name = "calib_train_burned_era5_annual",
+       year_interval = "1950-1989 -> 2002-2011", part = "2",
+       description = "Full calibration to training period, ERA5 predicted (area-adjusted rate)",
+       variable = "Burned area (acres)", resolution = "Statewide annual total"),
+
+  # PART 3 — within-calibration, 1970 cutoff, TraCE PREDICTED (gridcell-month)
+  list(model = model_1970_lightning_gmy, name = "within_calib_lightning_trace_gmy",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3",
+       description = "Within-calibration period, 1970 cutoff, TraCE predicted",
+       variable = "Lightning strike count", resolution = "Gridcell-month"),
+
+  list(model = model_1970_fire_gmy,      name = "within_calib_fire_trace_gmy",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3",
+       description = "Within-calibration period, 1970 cutoff, TraCE predicted",
+       variable = "Fire count", resolution = "Gridcell-month"),
+
+  list(model = model_1970_burned_gmy,    name = "within_calib_burned_trace_gmy",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3",
+       description = "Within-calibration period, 1970 cutoff, TraCE predicted",
+       variable = "Burned area (acres)", resolution = "Gridcell-month"),
+
+  # PART 3 — within-calibration, 1970 cutoff, TraCE PREDICTED (statewide annual sums)
+  list(model = model_1970_lightning_annual, name = "within_calib_lightning_trace_annual",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3",
+       description = "Within-calibration period, 1970 cutoff, TraCE predicted",
+       variable = "Lightning strike count", resolution = "Statewide annual total"),
+
+  list(model = model_1970_fire_annual,      name = "within_calib_fire_trace_annual",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3",
+       description = "Within-calibration period, 1970 cutoff, TraCE predicted",
+       variable = "Fire count", resolution = "Statewide annual total"),
+
+  list(model = model_1970_burned_annual,    name = "within_calib_burned_trace_annual",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3",
+       description = "Within-calibration period, 1970 cutoff, TraCE predicted",
+       variable = "Burned area (acres)", resolution = "Statewide annual total"),
+
+  # PART 3b — within-calibration, 1970 cutoff, OBSERVED
+  list(model = model_1970_thunder,     name = "within_calib_thunder_obs",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3b",
+       description = "Within-calibration period, 1970 cutoff, observed",
+       variable = "Thunderstorm days", resolution = "Station-year"),
+
+  list(model = model_1970_fire_obs,    name = "within_calib_fire_obs",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3b",
+       description = "Within-calibration period, 1970 cutoff, observed",
+       variable = "Fire count", resolution = "Statewide annual total"),
+
+  list(model = model_1970_burned_obs,  name = "within_calib_burned_obs",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3b",
+       description = "Within-calibration period, 1970 cutoff, observed",
+       variable = "Burned area (acres)", resolution = "Statewide annual total"),
+  
+    list(model = model_three_group_fire,  name = "within_calib_fire_obs",
+       year_interval = "1950-1989 (pre/post 1970)", part = "3b",
+       description = "Within-calibration period, 1970 cutoff, observed",
+       variable = "Fire count", resolution = "Statewide annual total")
+)
+
+model_comparison_table <- model_registry %>%
+  map_dfr(~ extract_model_summary(
+    model         = .x$model,
+    model_name    = .x$name,
+    year_interval = .x$year_interval,
+    part          = .x$part,
+    description   = .x$description,
+    variable      = .x$variable,
+    resolution    = .x$resolution
+  )) %>%
+  arrange(part, variable, resolution)
+
+print(select(model_comparison_table, -description), n = Inf)
+```
+
+
+
+```{r}
+# Does the rate of zero-fire years differ before/after 1970?
+trace_annual %>%
+  group_by(period70) %>%
+  summarise(
+    n_years = n(),
+    n_zero_fire_years = sum(fire_count_total == 0),
+    pct_zero_fire_years = round(100 * n_zero_fire_years / n_years, 1)
+  )
+
+compare_years <- trace_annual %>% filter(fire_count_total == 0) %>% pull(year)
+#for years predicted by trace as 0 burn/fire years, how does p_ignite prediction from era5 compare?
+bind_rows(
+  calib_pred_trace %>% filter(year %in% compare_years) %>%
+    summarise(mean_p_ignite = mean(p_ignite_rate_cal, na.rm = TRUE), driver = "TraCE"),
+  calib_pred_era %>% filter(year %in% compare_years) %>%
+    summarise(mean_p_ignite = mean(p_ignite_rate_cal, na.rm = TRUE), driver = "ERA5")
+)
+```
+
+
+the pre/post-1970 split (25% vs. 10% zero-fire years) points in exactly the direction Sanford et al. and your thunderstorm breakpoint model suggest — fewer "dead" fire years after 1970, consistent with a genuine increase in fire-conducive conditions. That's a nice independent line of evidence, distinct from the mean-trend estimate your period70 coefficient captures, since it's about the tail (complete absence of ignition) rather than the average.
+
+The limitation reading, which matters more for how you report this: the fact that this happens only under TraCE and never under ERA5 or the observed record — despite TraCE years having substantial lightning activity (hundreds to 13,000+ strikes in the zero-fire years) — is evidence that this is at least partly a TraCE-specific artifact of the simulation pipeline, not purely a real climate signal. Two mechanisms are worth distinguishing, and you likely can't fully separate them without more digging:
+
+Genuine signal: TraCE-driven climate in pre-1970 years really does sit in a lower-ignition-probability regime than ERA5-driven climate in the same years, and the simulation is correctly reflecting that.
+Simulation artifact: independent per-gridcell-month Binomial draws using very small p_ignite_rate_cal values are more likely to all fail simultaneously by chance under TraCE than under ERA5 — possibly because TraCE-driven ignition probabilities are systematically slightly lower or noisier than ERA5's (even a small systematic downward shift in per-cell probability compounds multiplicatively across hundreds of independent draws), making a true statewide zero far more probable under simulation even if it's physically implausible.
+
+Given that ERA5 and the actual historical record never hit zero even once across their combined ~50 years, and TraCE hits it 7/40 times, I'd be cautious about presenting the pre/post-1970 zero-year contrast as clean, unqualified evidence of a real historical fire-activity shift — it's likely a mix of true signal and pipeline sensitivity, and the manuscript should say so rather than picking one story.
+
+Suggested path forward:
+
+Compare TraCE vs. ERA5 ignition probabilities directly for the zero-fire years, to see whether TraCE's p_ignite_rate_cal is systematically lower than ERA5's in those specific years (not just noisier) — that would tell you whether this is a bias-correction issue versus genuine multiplicative variance amplification:

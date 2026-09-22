@@ -1,0 +1,209 @@
+---
+title: "Trace_gridcell_area"
+author: "Charlotte Uden"
+date: "2026-08-10"
+output: html_document
+---
+
+
+```{r}
+library(dplyr)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggplot2)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+```{r}
+trace_cells <- readRDS(file.path(rds_root, "trace_cells.rds"))
+```
+
+# ── 1. Get Alaska's coastline/boundary polygon ───────────────────────────────
+# rnaturalearth's state-level data includes Alaska as a US state polygon,
+# already handling the coastline (not just a bounding box).
+```{r}
+
+usa_states <- ne_states(country = "United States of America", returnclass = "sf")
+alaska_boundary <- usa_states %>% filter(name == "Alaska")
+
+if (nrow(alaska_boundary) == 0) {
+  stop("Alaska boundary not found — check the 'name' field in usa_states (try View(usa_states) to inspect).")
+}
+
+```
+
+# ── 2. Reproject to an equal-area CRS suitable for Alaska ───────────────────
+# EPSG:3338 (NAD83 / Alaska Albers) is the standard equal-area projection for
+# Alaska and handles the antimeridian (180° longitude) crossing cleanly —
+# critical since Alaska's Aleutian chain crosses the date line, and plain
+# lat/lon-based area math breaks down there.
+```{r}
+
+ALASKA_CRS <- 3338
+
+alaska_proj <- st_transform(alaska_boundary, ALASKA_CRS)
+```
+
+
+# ── 3. Rebuild grid cell polygons from your TraCE lat/lon centers ───────────
+# Reuses dlat/dlon computed in the previous script (from trace_lats/trace_lons).
+# If not already in your environment, recompute:
+```{r}
+trace_lats <- sort(unique(trace_cells$lat))
+trace_lons <- sort(unique(trace_cells$lon))
+dlat <- median(diff(trace_lats))
+dlon <- median(diff(trace_lons))
+
+# Unique gridcell centers actually present in the data
+grid_centers <- n_strike_scaled %>%
+  dplyr::select(lat, lon) %>%
+  distinct()
+
+cat(sprintf("Building %d gridcell polygons...\n", nrow(grid_centers)))
+
+# Build one rectangular polygon per gridcell center, in lon/lat space (EPSG:4326)
+make_cell_polygon <- function(lon, lat, dlon, dlat) {
+  lon_min <- lon - dlon / 2
+  lon_max <- lon + dlon / 2
+  lat_min <- max(lat - dlat / 2, -90)
+  lat_max <- min(lat + dlat / 2,  90)
+
+  st_polygon(list(rbind(
+    c(lon_min, lat_min),
+    c(lon_max, lat_min),
+    c(lon_max, lat_max),
+    c(lon_min, lat_max),
+    c(lon_min, lat_min)
+  )))
+}
+
+grid_polygons <- lapply(seq_len(nrow(grid_centers)), function(i) {
+  make_cell_polygon(grid_centers$lon[i], grid_centers$lat[i], dlon, dlat)
+})
+
+grid_sf <- st_sf(
+  lat = grid_centers$lat,
+  lon = grid_centers$lon,
+  geometry = st_sfc(grid_polygons, crs = 4326)
+)
+```
+# NOTE: if your TraCE lon values are in 0-360 convention rather than -180/180,
+# reproject/wrap them before this step, e.g.:
+#   grid_centers$lon <- ifelse(grid_centers$lon > 180, grid_centers$lon - 360, grid_centers$lon)
+# Do this consistently for both grid_centers and n_strike_scaled$lon before joining later.
+
+# ── 4. Reproject grid polygons to the same equal-area CRS ───────────────────
+```{r}
+grid_proj <- st_transform(grid_sf, ALASKA_CRS)
+
+# Fix any invalid geometries before intersecting (common with lon/lat rectangles
+# reprojected near the antimeridian or poles)
+grid_proj <- st_make_valid(grid_proj)
+alaska_proj <- st_make_valid(alaska_proj)
+```
+# ── 5. Clip each gridcell polygon to Alaska's actual land boundary ──────────
+# st_intersection cuts each rectangle down to only the portion overlapping land.
+# Cells entirely outside Alaska will simply not appear in the output (0 area).
+```{r}
+alaska_union <- st_union(alaska_proj)   # dissolve multi-part Alaska geometry into one
+
+clipped <- st_intersection(grid_proj, st_sf(geometry = alaska_union))
+```
+# ── 6. Compute clipped area in km² ───────────────────────────────────────────
+```{r}
+clipped <- clipped %>%
+  mutate(area_clipped_km2 = as.numeric(st_area(geometry)) / 1e6)   # m² -> km²
+
+clipped_areas <- clipped %>%
+  st_drop_geometry() %>%
+  dplyr::select(lat, lon, area_clipped_km2)
+
+cat(sprintf("Gridcells with land overlap: %d / %d\n",
+            nrow(clipped_areas), nrow(grid_centers)))
+```
+# ── 7. Join clipped area back to full grid (cells with 0 land overlap get 0) ─
+```{r}
+grid_with_area <- grid_centers %>%
+  left_join(clipped_areas, by = c("lat", "lon")) %>%
+  mutate(area_clipped_km2 = ifelse(is.na(area_clipped_km2), 0, area_clipped_km2))
+
+cat("\nClipped area summary (km²):\n")
+print(summary(grid_with_area$area_clipped_km2))
+```
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PLOT: Alaska outline, clipped grid, and gridcell center points
+# ═══════════════════════════════════════════════════════════════════════════
+```{r}
+# Reproject the full (unclipped) grid polygons too, for outline reference
+grid_full_proj <- grid_proj   # already reprojected above
+
+# Center points, as an sf object in the same projected CRS
+centers_sf <- st_as_sf(grid_centers, coords = c("lon", "lat"), crs = 4326) %>%
+  st_transform(ALASKA_CRS)
+
+p <- ggplot() +
+  # Alaska outline
+  geom_sf(data = alaska_proj, fill = NA, color = "black", linewidth = 0.6) +
+  # Full (unclipped) grid cell borders, light, for reference
+  geom_sf(data = grid_full_proj, fill = NA, color = "grey70", linewidth = 0.2) +
+  # Clipped gridcells (actual land-overlap polygons), shaded
+  geom_sf(data = clipped, aes(fill = area_clipped_km2), color = "steelblue", linewidth = 0.3, alpha = 0.5) +
+  # Gridcell center points
+  geom_sf(data = centers_sf, color = "red", size = 0.8) +
+  scale_fill_viridis_c(name = "Clipped\narea (km²)", option = "viridis") +
+  labs(
+    title = "TraCE-21ka gridcells clipped to Alaska coastline",
+    subtitle = "Grey = full gridcell extent, blue = land-clipped area, red = gridcell centers"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.title = element_blank(),
+    panel.grid = element_blank()
+  )
+
+print(p)
+
+# ggsave("trace_alaska_clipped_grid.png", p, width = 9, height = 7, dpi = 300)
+```
+
+```{r}
+write.csv(grid_with_area, file.path(paleoclimate_data_root, "TraCE_21ka_gridcell_area.csv"))
+```
+

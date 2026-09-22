@@ -1,0 +1,1097 @@
+---
+title: "Posterior_predictions_validation_period"
+output: html_document
+---
+
+The goal here is in two parts:
+
+- First, to guage wether the model pipeline captures changes in lightning, fire count, and burned area activity between the period used to bias correct the trace data (years of trace and era5 overlap: 1950-1989), and the training period (2002-2011). I have coarse observational data that can be used to check whether there is even a change: thunderstorm data for 1950-2011, Alaska-wide annual total lightning-caused fire count for the validation period, and gridcell-month level fire count data for the training period, and Alsaska-wide annual lightning-caused total burned area for the validation period and gridcell-month level burned area for the training period. I want to see if there is a difference between the two periods in the observed data. Then I want to see if era5 predictions capture these observed differences across periods (validation versus training).
+- Then, I need to quantify how well the trace predictions capture observations during the validation period. How similar are predictions to the era5 data? Does it capture year-to-year changes, or does it consistantly produce flat underestimates?
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(maps)
+library(readr)
+library(tidyr)
+
+library(glmmTMB)
+library(broom.mixed)
+library(purrr)
+library(data.table)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+modern_fire_stats_root <- config[["modern_fire_stats_root"]]
+calibration_thunderstorm <- config[["calibration_thunderstorm"]]
+```
+Observed data
+```{r}
+thunder_obs <- read.csv(file.path(calibration_thunderstorm, "thunderstorms_1950-2011.csv"))
+
+calib_fire_obs <- read.csv(file.path(modern_fire_stats_root, "alaska_lightning_fires_1950_1989.csv"))
+
+#Get observed outcomes from training data
+
+strike_rates <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+strike_counts <- read.csv(file.path(drivers_root, "lightning_strike_count_climate_jja_2002_2011_no_outliers.csv"))
+fire_counts <- read.csv(file.path(drivers_root, "lightning_ignition_jja_2002_2011_new_no_outliers.csv"))
+burned_areas <- read.csv(file.path(drivers_root, "burned_area_jja_2002_2011_new.csv"))
+
+#need total burned area per gridcell-month. Though the model was trained on fire size per single fire, pipeline simulations sum sampled burned area per fire, so we need to compare the same aggregation in the training data. 
+burned_areas_agg <- burned_areas %>%
+  group_by(lat, lon, year, month) %>%
+  summarise(burned_area_km2_total = sum(burned_area_km2_total, na.rm = TRUE), .groups = "drop")
+
+strike_rates_join <- strike_rates %>%
+  dplyr::select(lat, lon, year, r_strike_obs = strikes) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+fire_counts <- fire_counts %>%
+  dplyr::select(lat, lon, year, month, fire_count) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+strike_counts <- strike_counts %>%
+  dplyr::select(lat, lon, year, month, n_strikes_obs = strike_count) %>%
+  mutate(lat = round(lat, 2), lon = round(lon, 2))
+
+obs <- fire_counts %>% left_join(strike_counts, by = c("lat", "lon", "year", "month")) 
+
+obs <- obs %>%
+  left_join(strike_rates_join, by = c("lat", "lon", "year")) %>%
+  left_join(burned_areas_agg, by = c("lat", "lon", "year", "month")) %>%
+  mutate(r_strike_obs = ifelse(is.na(r_strike_obs), 0, r_strike_obs)) %>%
+  mutate(burned_area_km2_total = ifelse(is.na(burned_area_km2_total), 0, burned_area_km2_total)) %>%
+  dplyr::select(lat, lon, year, month, r_strike_obs, n_strikes_obs, fire_count, burned_area_km2_total)
+
+#check
+nrow(obs) == nrow(fire_counts) #should be true
+sum(obs$burned_area_km2_total > 0)   # should be n_distinct(burned_areas gridcell-months), not raw fire count
+sum(is.na(obs$r_strike_obs))            # should be 0 if strike_rates covers the same lat/lon/year set
+
+summary(obs)
+
+#Remove rows where fire_count exceeds strike_count 
+# obs <- obs %>%
+#   filter(!(n_strikes_obs > 0 & fire_count > n_strikes_obs))
+  
+summary(obs)
+
+```
+
+Predictions
+```{r}
+calib_pred_trace <- fread(file.path(base_path, "Calibration_Training_Comparison/predictions_calibration_posterior_trace_no_outliers_cap.csv"))
+
+calib_pred_era <- fread(file.path(base_path, "Calibration_Training_Comparison/predictions_calibration_posterior_era5_no_outliers_cap.csv"))
+
+train_pred_era <- fread(file.path(base_path, "Models/Pipeline/predictions_training_posterior_bb_no_outliers_cap.csv"))
+```
+
+```{r}
+train_trace_grid_pred <- fread(file.path(base_path, "Models/Pipeline/predictions_training_posterior_era5_trace_grid_DIAGNOSTIC.csv"))
+
+pred_fire_train_coarse <- train_trace_grid_pred[, .(fire_count = sum(fire_count_pred, na.rm = TRUE)), by = .(draw_id, year)]
+pred_fire_train_coarse_mean <- pred_fire_train_coarse[, .(fire_count = mean(fire_count)), by = draw_id]
+
+cat("Fine-grid training mean:  ", mean(pred_fire_train_annual_mean$fire_count), "\n")
+cat("Coarse-grid training mean:", mean(pred_fire_train_coarse_mean$fire_count), "\n")
+cat("Calibration mean:         ", mean(pred_fire_calib_annual_mean$fire_count), "\n")
+
+ratio_fine_to_calib   <- mean(pred_fire_train_annual_mean$fire_count) / mean(pred_fire_calib_annual_mean$fire_count)
+ratio_coarse_to_calib <- mean(pred_fire_train_coarse_mean$fire_count) / mean(pred_fire_calib_annual_mean$fire_count)
+
+cat(sprintf("Fine-grid training / calibration ratio:   %.1fx\n", ratio_fine_to_calib))
+cat(sprintf("Coarse-grid training / calibration ratio: %.1fx\n", ratio_coarse_to_calib))
+```
+
+```{r}
+# Is the remaining coarse-grid training vs. calibration gap itself
+# statistically distinguishable from noise, the same way TraCE's bias
+# ratio was tested earlier?
+set.seed(123)
+boot_ratios <- replicate(2000, {
+  train_resample <- sample(pred_fire_train_coarse_mean$fire_count, nrow(pred_fire_train_coarse_mean), replace = TRUE)
+  calib_resample <- sample(pred_fire_calib_annual_mean$fire_count, nrow(pred_fire_calib_annual_mean), replace = TRUE)
+  mean(train_resample) / mean(calib_resample)
+})
+quantile(boot_ratios, c(0.025, 0.975))
+```
+re-run part 1 using training period era5 predicitons on trace grid
+```{r}
+calib_pred_trace <- train_trace_grid_pred
+```
+
+
+```{r}
+library(dplyr)
+library(data.table)
+library(tidyr)
+
+setDT(obs); setDT(thunder_obs); setDT(calib_fire_obs)
+setDT(calib_pred_trace); setDT(calib_pred_era); setDT(train_pred_era)
+
+acres_to_km2 <- function(acres) acres * 0.00404686
+```
+# =============================================================================
+# PART 1a: Is there a real difference in OBSERVED activity between the
+# calibration period (1950-1989) and training period (2002-2011)?
+# =============================================================================
+with only 40 calibration years and 10 training years, distributional assumptions matter, and trust the Wilcoxon result more given likely skew in fire/burned-area data; report both, but lean on Wilcoxon in write-up.
+
+```{r}
+## ---- Lightning: thunderstorm days, station-level, spans BOTH periods -----
+# Aggregate to one Alaska-wide annual mean per year first (station variability
+# within a year isn't the question here -- period-to-period difference is)
+thunder_annual <- thunder_obs[YEAR %in% c(1950:1989, 2002:2011),
+                                .(mean_thunder_days = mean(thunderstorm_days, na.rm = TRUE)),
+                                by = YEAR]
+thunder_annual[, period := ifelse(YEAR <= 1989, "calibration", "training")]
+
+# Descriptive comparison
+thunder_annual[, .(mean = mean(mean_thunder_days), sd = sd(mean_thunder_days), n_years = .N), by = period]
+
+# Formal test: is the training period's mean thunderstorm activity
+# significantly different from the calibration period's?
+t.test(mean_thunder_days ~ period, data = thunder_annual)
+wilcox.test(mean_thunder_days ~ period, data = thunder_annual)  # robust alternative, given small n and likely skew
+```
+
+```{r}
+## ---- Fire count: Alaska-wide annual totals, both periods -----------------
+# calib_fire_obs already IS Alaska-wide annual (1950-1989). obs needs
+# aggregating UP from gridcell-month to Alaska-wide annual for training.
+train_fire_annual <- obs[, .(fire_count = sum(fire_count, na.rm = TRUE)), by = year]
+train_fire_annual[, period := "training"]
+
+calib_fire_annual <- calib_fire_obs[, .(year, fire_count)]
+calib_fire_annual[, period := "calibration"]
+
+fire_combined <- rbind(calib_fire_annual, train_fire_annual)
+
+fire_combined[, .(mean = mean(fire_count), sd = sd(fire_count), n_years = .N), by = period]
+t.test(fire_count ~ period, data = fire_combined)
+wilcox.test(fire_count ~ period, data = fire_combined)
+```
+
+Observed fire counts in calibration period are greater. Could this be a regime change, or is there a single year or decade in the calibration period thats masking a rise from calibration to training?
+```{r}
+library(dplyr)
+library(data.table)
+
+setDT(calib_fire_obs)
+
+sum(obs$fire_count)
+
+# ---- Bin calibration years into decades ----
+calib_fire_obs[, decade := paste0(floor(year / 10) * 10, "s")]
+
+decade_summary <- calib_fire_obs[, .(
+  n_years         = .N,
+  total_fire_count = sum(fire_count, na.rm = TRUE),
+  mean_fire_count  = mean(fire_count, na.rm = TRUE),
+  sd_fire_count    = sd(fire_count, na.rm = TRUE),
+  max_fire_count   = max(fire_count, na.rm = TRUE),
+  max_year         = year[which.max(fire_count)]
+), by = decade][order(decade)]
+
+print(decade_summary)
+
+# ---- Compare directly against the training period as its own "decade" ----
+train_summary <- data.table(
+  decade           = "2002-2011 (training)",
+  n_years          = uniqueN(obs$year),
+  total_fire_count = sum(obs$fire_count, na.rm = TRUE),
+  mean_fire_count  = obs[, sum(fire_count, na.rm = TRUE), by = year][, mean(V1)],
+  sd_fire_count    = obs[, sum(fire_count, na.rm = TRUE), by = year][, sd(V1)],
+  max_fire_count   = obs[, sum(fire_count, na.rm = TRUE), by = year][, max(V1)],
+  max_year         = obs[, sum(fire_count, na.rm = TRUE), by = year][which.max(V1), year]
+)
+
+comparison <- rbind(decade_summary, train_summary, fill = TRUE)
+print(comparison)
+
+# ---- Flag which single years are the biggest contributors within each
+# decade, to spot whether one or two years are doing most of the lifting ----
+calib_fire_obs[, .(year, fire_count, decade)][order(-fire_count)][1:10]
+
+# ---- What fraction of each decade's total comes from its single biggest year? ----
+decade_summary[, top_year_share := calib_fire_obs[, .(max_val = max(fire_count)), by = decade][
+  decade_summary, on = "decade", max_val
+] / total_fire_count]
+print(decade_summary[, .(decade, total_fire_count, max_fire_count, top_year_share)])
+```
+
+
+
+```{r}
+## ---- Burned area: Alaska-wide annual totals, both periods, in km^2 -------
+train_ba_annual <- obs[, .(burned_area_km2 = sum(burned_area_km2_total, na.rm = TRUE)), by = year]
+train_ba_annual[, period := "training"]
+
+calib_ba_annual <- calib_fire_obs[, .(year, burned_area_km2 = acres_to_km2(burned_acres))]
+calib_ba_annual[, period := "calibration"]
+
+ba_combined <- rbind(calib_ba_annual, train_ba_annual)
+
+ba_combined[, .(mean = mean(burned_area_km2), sd = sd(burned_area_km2), n_years = .N), by = period]
+t.test(burned_area_km2 ~ period, data = ba_combined)
+wilcox.test(burned_area_km2 ~ period, data = ba_combined)
+```
+
+
+```{r}
+# =============================================================================
+# PART 1b: Do ERA5-driven pipeline predictions capture the SAME period
+# difference seen in the observed data above? Compare PREDICTED calibration
+# vs PREDICTED training, per draw (preserving spread), then check whether the
+# predicted period-difference matches the observed period-difference's
+# direction/magnitude from Part 1a.
+# =============================================================================
+
+## ---- Predicted fire count: Alaska-wide annual total, per draw ----
+pred_fire_calib <- calib_pred_era[, .(fire_count = sum(fire_count_pred, na.rm = TRUE)), by = .(draw_id, year)]
+pred_fire_calib_annual_mean <- pred_fire_calib[, .(fire_count = mean(fire_count)), by = draw_id]  # mean across calib years, per draw
+pred_fire_calib_annual_mean[, period := "calibration"]
+
+pred_fire_train <- train_pred_era[, .(fire_count = sum(fire_count_pred, na.rm = TRUE)), by = .(draw_id, year)]
+pred_fire_train_annual_mean <- pred_fire_train[, .(fire_count = mean(fire_count)), by = draw_id]
+pred_fire_train_annual_mean[, period := "training"]
+
+# Per-draw predicted period DIFFERENCE (training - calibration), with CI
+pred_fire_diff_by_draw <- merge(
+  pred_fire_train_annual_mean[, .(draw_id, fire_count_train = fire_count)],
+  pred_fire_calib_annual_mean[, .(draw_id, fire_count_calib = fire_count)],
+  by = "draw_id"
+)
+pred_fire_diff_by_draw[, diff := fire_count_train - fire_count_calib]
+
+cat("Predicted fire count difference (training - calibration):\n")
+cat(sprintf("  mean = %.1f, 95%% CI = [%.1f, %.1f]\n",
+            mean(pred_fire_diff_by_draw$diff),
+            quantile(pred_fire_diff_by_draw$diff, 0.025),
+            quantile(pred_fire_diff_by_draw$diff, 0.975)))
+cat(sprintf("  Observed difference (mean training - mean calibration): %.1f\n",
+            mean(train_fire_annual$fire_count) - mean(calib_fire_annual$fire_count)))
+
+## ---- Predicted burned area: same pattern ----
+pred_ba_calib <- calib_pred_era[, .(burned_area = sum(total_burned_area_capped, na.rm = TRUE)), by = .(draw_id, year)]
+pred_ba_calib_annual_mean <- pred_ba_calib[, .(burned_area = mean(burned_area)), by = draw_id]
+
+pred_ba_train <- train_pred_era[, .(burned_area = sum(total_burned_area_capped, na.rm = TRUE)), by = .(draw_id, year)]
+pred_ba_train_annual_mean <- pred_ba_train[, .(burned_area = mean(burned_area)), by = draw_id]
+
+pred_ba_diff_by_draw <- merge(
+  pred_ba_train_annual_mean[, .(draw_id, ba_train = burned_area)],
+  pred_ba_calib_annual_mean[, .(draw_id, ba_calib = burned_area)],
+  by = "draw_id"
+)
+pred_ba_diff_by_draw[, diff := ba_train - ba_calib]
+
+cat("\nPredicted burned area difference (training - calibration):\n")
+cat(sprintf("  mean = %.1f, 95%% CI = [%.1f, %.1f]\n",
+            mean(pred_ba_diff_by_draw$diff),
+            quantile(pred_ba_diff_by_draw$diff, 0.025),
+            quantile(pred_ba_diff_by_draw$diff, 0.975)))
+cat(sprintf("  Observed difference (mean training - mean calibration): %.1f\n",
+            mean(train_ba_annual$burned_area_km2) - mean(calib_ba_annual$burned_area_km2)))
+
+## ---- Predicted lightning: strike rate, Alaska-wide annual mean, per draw ----
+pred_strike_calib <- calib_pred_era[, .(r_strike = mean(r_strike, na.rm = TRUE)), by = .(draw_id, year)]
+pred_strike_calib_mean <- pred_strike_calib[, .(r_strike = mean(r_strike)), by = draw_id]
+
+pred_strike_train <- train_pred_era[, .(r_strike = mean(r_strike, na.rm = TRUE)), by = .(draw_id, year)]
+pred_strike_train_mean <- pred_strike_train[, .(r_strike = mean(r_strike)), by = draw_id]
+
+pred_strike_diff_by_draw <- merge(
+  pred_strike_train_mean[, .(draw_id, r_strike_train = r_strike)],
+  pred_strike_calib_mean[, .(draw_id, r_strike_calib = r_strike)],
+  by = "draw_id"
+)
+pred_strike_diff_by_draw[, diff := r_strike_train - r_strike_calib]
+
+cat("\nPredicted strike rate difference (training - calibration):\n")
+cat(sprintf("  mean = %.5f, 95%% CI = [%.5f, %.5f]\n",
+            mean(pred_strike_diff_by_draw$diff),
+            quantile(pred_strike_diff_by_draw$diff, 0.025),
+            quantile(pred_strike_diff_by_draw$diff, 0.975)))
+
+
+```
+
+
+Do predictions reproduce the same observed step change in fire COUNT after the 1960's?
+```{r}
+library(dplyr)
+library(data.table)
+
+setDT(calib_pred_era)
+
+# ---- Predicted fire count by decade, per draw (preserving spread) --------
+calib_pred_era[, decade := paste0(floor(year / 10) * 10, "s")]
+
+pred_decade_by_draw <- calib_pred_era[, .(
+  total_fire_count = sum(fire_count_pred, na.rm = TRUE)
+), by = .(draw_id, decade)]
+
+pred_decade_summary <- pred_decade_by_draw[, .(
+  mean  = mean(total_fire_count),
+  lower = quantile(total_fire_count, 0.025),
+  upper = quantile(total_fire_count, 0.975)
+), by = decade][order(decade)]
+
+print(pred_decade_summary)
+
+# ---- Side-by-side: observed vs. predicted, by decade -----------------------
+obs_decade <- decade_summary[, .(decade, observed_total = total_fire_count)]
+
+decade_comparison <- merge(obs_decade, pred_decade_summary, by = "decade", all = TRUE)
+setnames(decade_comparison, c("mean", "lower", "upper"), c("predicted_mean", "predicted_lower", "predicted_upper"))
+decade_comparison[, bias_ratio := predicted_mean / observed_total]
+
+print(decade_comparison)
+
+# ---- Does the MODEL itself show a step-change after the 1960s, the same
+# shape as observed (flat 1950s/60s, then a jump to a higher, roughly
+# stable 1970s/80s level)? Compare predicted 1950s+1960s mean against
+# predicted 1970s+1980s mean, per draw, with a CI on the ratio -----------
+pred_early_late <- calib_pred_era[, .(total_fire_count = sum(fire_count_pred, na.rm = TRUE)),
+                                    by = .(draw_id, decade)]
+pred_early_late[, era := ifelse(decade %in% c("1950s", "1960s"), "early (1950s-60s)", "late (1970s-80s)")]
+
+pred_era_totals <- pred_early_late[, .(total = sum(total_fire_count)), by = .(draw_id, era)]
+pred_era_wide <- dcast(pred_era_totals, draw_id ~ era, value.var = "total")
+pred_era_wide[, step_ratio := `late (1970s-80s)` / `early (1950s-60s)`]
+
+cat(sprintf("Predicted step-change ratio (late/early): mean = %.2f, 95%% CI = [%.2f, %.2f]\n",
+            mean(pred_era_wide$step_ratio),
+            quantile(pred_era_wide$step_ratio, 0.025),
+            quantile(pred_era_wide$step_ratio, 0.975)))
+
+# Compare against the OBSERVED step-change ratio for reference
+obs_early_total <- decade_summary[decade %in% c("1950s", "1960s"), sum(total_fire_count)]
+obs_late_total  <- decade_summary[decade %in% c("1970s", "1980s"), sum(total_fire_count)]
+cat(sprintf("Observed step-change ratio (late/early): %.2f\n", obs_late_total / obs_early_total))
+```
+
+While the pipeline correctly captures the direction of the long-term lightning increase between the calibration and training periods (Part 1a), it substantially understates a documented mid-calibration-period regime shift: observed fire count increased nearly threefold from the 1950s–60s to the 1970s–80s (ratio = 2.88), while predicted fire count showed no statistically distinguishable change over the same transition (ratio = 1.17, 95% CI [0.82, 1.63]). This indicates the model's sensitivity to real interdecadal variability in fire activity is substantially weaker than the historical record demonstrates, independent of the aggregate underestimation bias already identified.
+
+Is this a failure on the model's side, or missing information in lightning data feeding the model ... or the climate data driving the entire pipeline? start with strike rate:
+```{r}
+# Does the underlying PREDICTOR data itself (not the model's fire-count
+# output) show a comparable step-change? If strike rate/count don't shift
+# much either, the flat fire-count response may be honestly propagating a
+# flat climate signal -- if strike rate DOES shift but fire count doesn't,
+# that points more specifically to the ignition/fire-count stage failing
+# to translate a real climate signal into a proportional fire response.
+calib_pred_era[, era := ifelse(decade %in% c("1950s", "1960s"), "early", "late")]
+
+strike_step <- calib_pred_era[, .(mean_r_strike = mean(r_strike, na.rm = TRUE)), by = .(draw_id, era)]
+strike_step_wide <- dcast(strike_step, draw_id ~ era, value.var = "mean_r_strike")
+strike_step_wide[, step_ratio := late / early]
+
+cat(sprintf("Predicted STRIKE RATE step-change ratio (late/early): mean = %.2f, 95%% CI = [%.2f, %.2f]\n",
+            mean(strike_step_wide$step_ratio),
+            quantile(strike_step_wide$step_ratio, 0.025),
+            quantile(strike_step_wide$step_ratio, 0.975)))
+```
+
+There is little change in strike rate before and after 1960. strike rate's step-change ratio (1.12 [0.88, 1.44]) sits in essentially the same "no real change" range as fire count's (1.17 [0.82, 1.63]), while the real world shows 2.88... so its not an issue with how the model works internally. Check the climate data - is there a step change in any of them?
+
+```{r}
+drivers <- read_parquet(file.path(era5_data_root, "bias_correction/processed_parquet/era_calib_period_monthly_with_lags.parquet"))
+drivers <- na.omit(drivers)
+library(dplyr)
+library(data.table)
+
+setDT(drivers)
+
+# Restrict to the calibration window and bin into decades/eras, same
+# convention as the observed/predicted step-change checks above
+drivers_calib <- drivers[year >= 1950 & year <= 1989]
+drivers_calib[, decade := paste0(floor(year / 10) * 10, "s")]
+drivers_calib[, era := ifelse(decade %in% c("1950s", "1960s"), "early", "late")]
+
+predictor_cols <- c("rh", "tair", "precip", "wind", "swr", "sp",
+                     "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                     "tair_1m", "tair_2m", "tair_3m", "tair_5y")
+
+# ---- For each predictor: Alaska-wide annual mean, then early vs. late ----
+check_predictor_step_change <- function(col) {
+  annual <- drivers_calib[, .(value = mean(get(col), na.rm = TRUE)), by = .(year, era)]
+
+  early_vals <- annual[era == "early", value]
+  late_vals  <- annual[era == "late", value]
+
+  t_result <- t.test(late_vals, early_vals)
+  w_result <- wilcox.test(late_vals, early_vals)
+
+  data.table(
+    predictor     = col,
+    mean_early    = mean(early_vals),
+    mean_late     = mean(late_vals),
+    ratio         = mean(late_vals) / mean(early_vals),
+    diff          = mean(late_vals) - mean(early_vals),
+    t_p_value     = t_result$p.value,
+    wilcox_p_value = w_result$p.value,
+    significant   = t_result$p.value < 0.05 | w_result$p.value < 0.05
+  )
+}
+
+step_change_results <- rbindlist(lapply(predictor_cols, check_predictor_step_change))
+step_change_results[order(t_p_value)]
+
+# ---- Quick visual flag: which predictors show a real, significant shift? ----
+cat("Predictors with a significant early-vs-late step change:\n")
+print(step_change_results[significant == TRUE, .(predictor, mean_early, mean_late, ratio, t_p_value, wilcox_p_value)])
+
+cat("\nPredictors with NO significant step change:\n")
+print(step_change_results[significant == FALSE, .(predictor, mean_early, mean_late, ratio, t_p_value, wilcox_p_value)])
+```
+
+none of the ERA5 climate predictors contain a signal large enough to explain the observed 1970s/80s increase. ie no predictors see a significant step change after 1960, except precip_5y and tair_5y. ie the step change isn't present in the data the model is being asked to predict from, so it makes sense that the a significant step change isnt being reported in the predictions as in the observations. The apparent step-change in fire activity between the early (1950s–60s) and late (1970s–80s) calibration decades (observed ratio 2.88) is not attributable to a shift in the pipeline's climate predictors: of 14 ERA5-derived covariates tested, only two (precip_5y, tair_5y) showed a statistically significant early-to-late difference, and both were of negligible magnitude (ratios of 0.95 and 1.0007, respectively) given the very large sample size involved. This indicates the pipeline's inability to reproduce the magnitude of this historical regime shift (predicted ratio 1.12–1.17, both consistent with no change) reflects an absence of relevant signal in the current climate-only predictor set, rather than a fitted-model sensitivity limitation — consistent with the broader paleoclimate limitation discussed above, in which non-climate drivers of fire frequency and severity (e.g., fuel condition, vegetation state) are not represented in either the training or calibration data.
+
+The absence of a detectable step-change in the pipeline's climate predictors is consistent with the broader literature on this period: the observed mid 20th century increase in Alaska fire activity has been attributed primarily to a shift in the Pacific Decadal Oscillation to its warm phase in the late 1970s and a sustained rise in summer temperatures beginning around 1970 (Sousa et al., 2022), rather than to changes in seasonal precipitation, which showed little trend or even increased over the same period. Independently, substantial improvements in fire detection and reporting infrastructure through the 1970s–80s, alongside a 1984 shift in fire management policy, are documented to have influenced the recorded fire record itself (Kasischke et al., 2002, 2006; Todd & Jewkes, 2006), suggesting that at least part of the apparent step change reflects improved observation rather than a change in the underlying fire regime. Together, these findings indicate that the flat response of both the climate predictors and the pipeline's predictions across this transition is unlikely to be resolved by the current climate-only predictor set, and may partly reflect a genuine data-quality asymmetry in the historical record rather than a purely physical process.
+
+
+
+```{r}
+# =============================================================================
+# PART 2: How well do TraCE predictions match ERA5 predictions during the
+# calibration period (1949-1989)? Both are on the SAME 23-cell TraCE grid,
+# so this IS a valid direct comparison, unlike Part 1's cross-resolution work.
+# =============================================================================
+
+## ---- Annual Alaska-wide totals, per draw, for both climate sources -------
+build_annual_by_draw <- function(dt, value_col, agg_fun = "sum") {
+  if (agg_fun == "sum") {
+    dt[, .(value = sum(get(value_col), na.rm = TRUE)), by = .(draw_id, year)]
+  } else {
+    dt[, .(value = mean(get(value_col), na.rm = TRUE)), by = .(draw_id, year)]
+  }
+}
+
+era_fire_annual   <- build_annual_by_draw(calib_pred_era,   "fire_count_pred", "sum")
+trace_fire_annual <- build_annual_by_draw(calib_pred_trace, "fire_count_pred", "sum")
+
+era_ba_annual   <- build_annual_by_draw(calib_pred_era,   "total_burned_area_capped", "sum")
+trace_ba_annual <- build_annual_by_draw(calib_pred_trace, "total_burned_area_capped", "sum")
+
+era_strike_annual   <- build_annual_by_draw(calib_pred_era,   "r_strike", "mean")
+trace_strike_annual <- build_annual_by_draw(calib_pred_trace, "r_strike", "mean")
+
+## ---- Summarize each source to mean + 95% CI per year, for direct plotting/inspection ----
+summarize_annual <- function(dt) {
+  dt[, .(mean = mean(value), lower = quantile(value, 0.025), upper = quantile(value, 0.975)), by = year][order(year)]
+}
+
+era_fire_summary   <- summarize_annual(era_fire_annual)
+trace_fire_summary <- summarize_annual(trace_fire_annual)
+
+era_ba_summary   <- summarize_annual(era_ba_annual)
+trace_ba_summary <- summarize_annual(trace_ba_annual)
+
+era_strike_summary   <- summarize_annual(era_strike_annual)
+trace_strike_summary <- summarize_annual(trace_strike_annual)
+
+## ---- Overall + temporal agreement: TraCE vs ERA5 (treating ERA5 as the
+## reference, since it's the closer-to-observed climate source) ------------
+compute_source_agreement <- function(era_dt, trace_dt, label) {
+  era_by_year   <- era_dt[, .(era_mean = mean(value)), by = year]
+  trace_by_year <- trace_dt[, .(trace_mean = mean(value)), by = year]
+  m <- merge(era_by_year, trace_by_year, by = "year")
+
+  overall_pearson  <- cor(m$trace_mean, m$era_mean)
+  overall_spearman <- cor(m$trace_mean, m$era_mean, method = "spearman")
+  overall_rmse     <- sqrt(mean((m$trace_mean - m$era_mean)^2))
+  overall_bias     <- sum(m$trace_mean) / sum(m$era_mean)
+
+  acc   <- cor(m$trace_mean - mean(m$trace_mean), m$era_mean - mean(m$era_mean))
+  rmse_anom <- sqrt(mean(((m$trace_mean - mean(m$trace_mean)) - (m$era_mean - mean(m$era_mean)))^2))
+
+  cat(sprintf("\n=== %s: TraCE vs ERA5 (calibration period, 1949-1989) ===\n", label))
+  cat(sprintf("  Overall  -- Pearson r: %.3f | Spearman rho: %.3f | RMSE: %.2f | Bias ratio: %.3f\n",
+              overall_pearson, overall_spearman, overall_rmse, overall_bias))
+  cat(sprintf("  Temporal -- ACC: %.3f | RMSE of anomalies: %.2f\n", acc, rmse_anom))
+
+  # "Flat underestimate" check: is TraCE's bias roughly CONSTANT across years,
+  # or does the gap (era - trace) itself trend with year? A flat/non-trending
+  # residual supports "consistent underestimate"; a trending residual means
+  # TraCE diverges progressively rather than just being uniformly offset.
+  m[, residual := era_mean - trace_mean]
+  trend_test <- summary(lm(residual ~ year, data = m))
+  cat(sprintf("  Residual (ERA5 - TraCE) trend with year: slope = %.4f, p = %.3f %s\n",
+              trend_test$coefficients["year", "Estimate"],
+              trend_test$coefficients["year", "Pr(>|t|)"],
+              ifelse(trend_test$coefficients["year", "Pr(>|t|)"] < 0.05,
+                     "(significant trend -- NOT a flat offset)",
+                     "(no significant trend -- consistent with a flat offset)")))
+
+  invisible(m)
+}
+
+fire_agreement   <- compute_source_agreement(era_fire_annual, trace_fire_annual, "Fire count")
+ba_agreement     <- compute_source_agreement(era_ba_annual, trace_ba_annual, "Burned area")
+strike_agreement <- compute_source_agreement(era_strike_annual, trace_strike_annual, "Strike rate")
+```
+
+```{r}
+# =============================================================================
+# PART 2b: Is TraCE's bias ratio significantly different from 1, or could it
+# be draw-to-draw noise around no real bias?
+# 
+# draw_id is NOT paired between era_dt and trace_dt (each script samples its
+# own independent posterior draw), so this bootstraps era and trace draws
+# SEPARATELY, then computes the ratio of resampled means each iteration --
+# the correct approach for comparing two independent draw distributions,
+# rather than assuming any row-to-row correspondence between them.
+# =============================================================================
+
+test_bias_ratio <- function(era_dt, trace_dt, label, n_boot = 2000) {
+  # Total across all calibration years, per draw (500 totals for each source)
+  era_draw_totals   <- era_dt[, .(total = sum(value)), by = draw_id]$total
+  trace_draw_totals <- trace_dt[, .(total = sum(value)), by = draw_id]$total
+
+  observed_ratio <- mean(trace_draw_totals) / mean(era_draw_totals)
+
+  set.seed(123)
+  boot_ratios <- replicate(n_boot, {
+    era_resample   <- sample(era_draw_totals, length(era_draw_totals), replace = TRUE)
+    trace_resample <- sample(trace_draw_totals, length(trace_draw_totals), replace = TRUE)
+    mean(trace_resample) / mean(era_resample)
+  })
+
+  ci <- quantile(boot_ratios, c(0.025, 0.975))
+  excludes_1 <- !(ci[1] <= 1 & ci[2] >= 1)
+
+  cat(sprintf("\n=== %s: bias ratio significance test ===\n", label))
+  cat(sprintf("  Observed ratio (TraCE mean total / ERA5 mean total): %.3f\n", observed_ratio))
+  cat(sprintf("  Bootstrap 95%% CI: [%.3f, %.3f]\n", ci[1], ci[2]))
+  cat(sprintf("  %s\n", ifelse(excludes_1,
+                                "CI excludes 1.0 -- bias is statistically significant",
+                                "CI includes 1.0 -- cannot rule out no real bias")))
+
+  invisible(list(observed_ratio = observed_ratio, ci = ci, boot_ratios = boot_ratios))
+}
+
+fire_bias_test   <- test_bias_ratio(era_fire_annual, trace_fire_annual, "Fire count")
+ba_bias_test     <- test_bias_ratio(era_ba_annual, trace_ba_annual, "Burned area")
+strike_bias_test <- test_bias_ratio(era_strike_annual, trace_strike_annual, "Strike rate")
+```
+
+TraCE-driven predictions during the calibration period show a statistically significant, non-trending underestimate relative to ERA5-driven predictions (bias ratios of 0.46–0.83, bootstrap 95% CIs excluding 1.0), consistent with a stable multiplicative bias rather than degrading skill over time, though the near-zero year-to-year correlation (ACC ≈ 0.06 to −0.04) indicates this bias correction would not recover TraCE's ability to reproduce which specific years were more or less active.
+
+TraCE-driven predictions during the calibration period show a statistically significant, non-trending underestimate relative to ERA5-driven predictions across all three outcomes: strike rate (bias ratio 0.680, 95% CI [0.675, 0.685]), fire count (0.826, [0.812, 0.838]), and burned area (0.462, [0.441, 0.484]) — all bootstrap intervals tightly excluding 1.0. Combined with the non-significant year-trend tests reported above, this indicates a stable, precisely-estimated multiplicative underestimate rather than degrading skill over the 1949–1989 window. However, the near-zero-to-negative year-to-year correlation between TraCE and ERA5 (ACC ranging from 0.064 for fire count to −0.043 for strike rate) indicates that a simple bias correction would not restore TraCE's ability to reproduce which specific years were more or less active — TraCE's predictions during this period are consistently offset in magnitude but do not track ERA5's actual interannual variability.
+
+
+Are bias ratios a result of bias accumulating through the pipeline?
+strike rate is underestimated by ~32%, fire count (which depends on strike rate and ignition probability) by ~17%, and burned area (which depends on fire count and per-fire size) by ~54%. Burned area's underestimate is roughly proportional to what you'd expect if two independent ~30-45% shortfalls compounded multiplicatively (strike rate's underestimate feeding into fire count, then a further shortfall in per-fire severity)
+```{r}
+# Does burned area's bias approximately equal fire count's bias times an
+# implied per-fire-severity bias?
+implied_severity_bias <- ba_bias_test$observed_ratio / fire_bias_test$observed_ratio
+cat(sprintf("Fire count bias: %.3f\n", fire_bias_test$observed_ratio))
+cat(sprintf("Implied per-fire severity bias (burned area bias / fire count bias): %.3f\n", implied_severity_bias))
+
+```
+If implied_severity_bias comes out somewhere in the 0.5–0.6 range, that's a genuinely interesting, citable secondary finding: TraCE isn't just underpredicting how many fires occur, it's independently underpredicting how large each fire gets too. Meaning there are two separate, compounding sources of the same directional bias, rather than one stage's error simply propagating through unchanged.
+
+Findings:
+1. observational data show an increase in lightning (thunderstorm data as a proxy) and burned area, noting that there is also a shift in data quality and detection across these two periods, potentially influencing these findings. FIre count does not show a significant shift between the two periods, but does show a shift within the calibration period after 1960.
+2. some of these patterns are captured in predictions from era5 data, (but only when predictions are on the same grid): lightning activity and burned area. though fire count shows no change in predictions from the calibration to training period, nor at the 1960 step change in the observed fire counts.
+3. The flat/no change in within-calibration period fire count predictions are mirrored in both lightning predictions and in the climate predictors themselves, suggesting that this is a limitation of the drivers, not an internal modeling limitation.
+4. While predictions from era5 data capture some shifts in the observed outcomes, predicitons from the trace data during the calibration period show no within-period shift. Instead, they consistantly underpredict, with no fluctuations (might be worth checking the 1960s step statistically, in case lightning and burned area predictions do respond)
+
+Figures:
+
+** plot % deviation from each series' own long-run mean
+```{r}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(patchwork)
+library(gridExtra)
+library(grid)
+
+# =============================================================================
+# STEP 1: tag every row with its period, and build a group key that breaks
+# geom_line() across the 1989-2002 gap (a shared "source" alone would draw
+# a straight interpolated line across the missing years in between)
+# =============================================================================
+tag_period <- function(dt) {
+  dt[, period := ifelse(year <= 1989, "calibration", "training")]
+  dt[, line_group := interaction(source, period, drop = TRUE)]
+  dt
+}
+
+strike_combined <- tag_period(strike_combined[source != "Predicted (TraCE)"])
+fire_combined   <- tag_period(fire_combined[source != "Predicted (TraCE)"])
+ba_combined     <- tag_period(ba_combined[source != "Predicted (TraCE)"])
+
+# =============================================================================
+# STEP 2: per-outcome statistics table -- observed ratio + Wilcoxon p,
+# predicted ratio + bootstrap-based p (paired-independent-samples style,
+# same method used earlier for the TraCE-vs-ERA5 bias-ratio significance
+# test). Predicted uses the PER-DRAW annual totals (draw_id retained),
+# not the already-collapsed mean/CI columns in *_combined.
+# =============================================================================
+n_boot <- 2000
+set.seed(123)
+
+build_stats_table <- function(obs_combined, pred_all_by_draw, obs_source_label,
+                               pred_source_label = "Predicted (ERA5, grid-matched)") {
+
+  ## ---- Observed: raw annual values, Wilcoxon test, ratio of means ----
+  obs_vals <- obs_combined[source == obs_source_label]
+  obs_calib <- obs_vals[period == "calibration", value]
+  obs_train <- obs_vals[period == "training", value]
+
+  obs_ratio <- mean(obs_train) / mean(obs_calib)
+  obs_wilcox <- wilcox.test(obs_train, obs_calib)$p.value
+
+  ## ---- Predicted: per-draw pooled totals, bootstrap ratio + p ----
+  pred_all_by_draw[, period := ifelse(year <= 1989, "calibration", "training")]
+  pred_calib_vals <- pred_all_by_draw[period == "calibration", value]
+  pred_train_vals <- pred_all_by_draw[period == "training", value]
+
+  pred_ratio <- mean(pred_train_vals) / mean(pred_calib_vals)
+
+  boot_ratios <- replicate(n_boot, {
+    c_resample <- sample(pred_calib_vals, length(pred_calib_vals), replace = TRUE)
+    t_resample <- sample(pred_train_vals, length(pred_train_vals), replace = TRUE)
+    mean(t_resample) / mean(c_resample)
+  })
+  # Two-sided bootstrap p-value: proportion of resampled ratios at least as
+  # extreme as a null of "no change" (ratio = 1), doubled for two-sidedness
+  boot_centered <- boot_ratios - mean(boot_ratios) + 1
+  pred_p <- 2 * min(mean(boot_centered >= 1), mean(boot_centered <= 1))
+  pred_p <- min(pred_p, 1)
+
+  data.frame(
+    Series    = c("Observed", "Predicted (ERA5)"),
+    Ratio     = sprintf("%.2f", c(obs_ratio, pred_ratio)),
+    `p-value` = c(sprintf("%.3f", obs_wilcox), sprintf("%.3f", pred_p)),
+    check.names = FALSE
+  )
+}
+
+strike_stats <- build_stats_table(strike_combined, copy(pred_strike_era_all),
+                                    "Observed (thunderstorm days, proxy)")
+fire_stats   <- build_stats_table(fire_combined, copy(pred_fire_era_all), "Observed")
+ba_stats     <- build_stats_table(ba_combined, copy(pred_ba_era_all), "Observed")
+
+# =============================================================================
+# STEP 3: build each panel -- y-axis label instead of facet title, panel
+# label (a)/(b)/(c), 5-year x breaks, solid black zero line, line broken
+# at the calibration/training gap via `group = line_group`
+# =============================================================================
+build_timeline_panel <- function(dt, panel_label, y_label) {
+  ggplot(dt, aes(x = year, y = index, color = source, fill = source, group = line_group)) +
+    geom_hline(yintercept = 0, linewidth = 0.3, color = "black") +
+    geom_ribbon(
+      data = dt[!is.na(index_lower) & !is.na(index_upper)],
+      aes(ymin = index_lower, ymax = index_upper),
+      alpha = 0.15, color = NA
+    ) +
+    geom_errorbar(aes(ymin = index_lower, ymax = index_upper), width = 0, alpha = 0.4, na.rm = TRUE) +
+    geom_line(na.rm = TRUE) +
+    geom_point(size = 1, na.rm = TRUE) +
+    scale_color_manual(values = source_colors, name = NULL) +
+    scale_fill_manual(values = source_colors, name = NULL) +
+    scale_x_continuous(breaks = seq(1950, 2010, by = 5)) +
+    labs(title = panel_label, x = "Year", y = y_label) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+source_colors <- c(
+  "Observed"                             = "firebrick",
+  "Observed (thunderstorm days, proxy)"  = "firebrick",
+  "Predicted (ERA5, grid-matched)"       = "steelblue"
+)
+
+p_strike <- build_timeline_panel(strike_combined, "(a)", "% deviation\n(strike rate / thunderstorm proxy)")
+p_fire   <- build_timeline_panel(fire_combined,   "(b)", "% deviation\n(fire count)")
+p_ba     <- build_timeline_panel(ba_combined,     "(c)", "% deviation\n(burned area)")
+
+# =============================================================================
+# STEP 4: build a table grob per outcome, then combine panel + table
+# side by side, stacked vertically
+# =============================================================================
+build_table_grob <- function(stats_df) {
+  tableGrob(stats_df, rows = NULL,
+            theme = ttheme_minimal(core = list(fg_params = list(fontsize = 9)),
+                                    colhead = list(fg_params = list(fontsize = 9, fontface = "bold"))))
+}
+
+t_strike <- wrap_elements(full = build_table_grob(strike_stats))
+t_fire   <- wrap_elements(full = build_table_grob(fire_stats))
+t_ba     <- wrap_elements(full = build_table_grob(ba_stats))
+
+row_strike <- p_strike + t_strike + plot_layout(widths = c(4, 1))
+row_fire   <- p_fire   + t_fire   + plot_layout(widths = c(4, 1))
+row_ba     <- p_ba     + t_ba     + plot_layout(widths = c(4, 1))
+
+p_full_timeline <- (row_strike / row_fire / row_ba) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+p_full_timeline
+```
+
+```{r}
+# =============================================================================
+# FIGURE 2: calibration period only (1950-1989) -- OBSERVED (firebrick) vs.
+# PREDICTED (steelblue), with ERA5 and TraCE distinguished by linetype/shape
+# within the "Predicted" color. Climate predictors moved out to Figure 3.
+# =============================================================================
+calib_pred_trace <- fread(file.path(base_path, "Calibration_Training_Comparison/predictions_calibration_posterior_trace_no_outliers_cap.csv"))
+range(calib_pred_trace$year)   # confirm this now reads 1949-1989
+library(dplyr)
+library(data.table)
+library(ggplot2)
+
+acres_to_km2 <- function(acres) acres * 0.00404686
+n_boot <- 500
+set.seed(123)
+
+index_to_own_mean <- function(dt, value_col, lower_col = NULL, upper_col = NULL) {
+  m <- mean(dt[[value_col]], na.rm = TRUE)
+  dt[, index := 100 * (get(value_col) - m) / m]
+  if (!is.null(lower_col)) dt[, index_lower := 100 * (get(lower_col) - m) / m]
+  if (!is.null(upper_col)) dt[, index_upper := 100 * (get(upper_col) - m) / m]
+  dt
+}
+
+setDT(calib_pred_era); setDT(calib_pred_trace); setDT(calib_fire_obs); setDT(thunder_obs)
+
+# =============================================================================
+# STRIKE RATE / LIGHTNING PROXY -- calibration period (1950-1989) only
+# =============================================================================
+
+## Observed: thunderstorm days, bootstrap CI across stations, per year
+thunder_calib <- thunder_obs[YEAR %in% 1950:1989]
+obs_strike_calib <- thunder_calib[, .(
+  value = mean(thunderstorm_days, na.rm = TRUE),
+  lower = quantile(replicate(n_boot, mean(sample(thunderstorm_days, .N, replace = TRUE), na.rm = TRUE)), 0.025),
+  upper = quantile(replicate(n_boot, mean(sample(thunderstorm_days, .N, replace = TRUE), na.rm = TRUE)), 0.975)
+), by = .(year = YEAR)]
+obs_strike_calib <- index_to_own_mean(obs_strike_calib, "value", "lower", "upper")
+obs_strike_calib[, `:=`(source = "Observed", outcome = "Lightning (strike rate / thunderstorm proxy)")]
+
+## ERA5 predicted r_strike, calibration period
+pred_strike_era_calib <- calib_pred_era[, .(value = mean(r_strike, na.rm = TRUE)), by = .(draw_id, year)][
+  , .(value = mean(value), lower = quantile(value, 0.025), upper = quantile(value, 0.975)), by = year
+]
+pred_strike_era_calib <- index_to_own_mean(pred_strike_era_calib, "value", "lower", "upper")
+pred_strike_era_calib[, `:=`(source = "Predicted (ERA5, grid-matched)", outcome = "Lightning (strike rate / thunderstorm proxy)")]
+
+## TraCE predicted r_strike, calibration period
+pred_strike_trace_calib <- calib_pred_trace[, .(value = mean(r_strike, na.rm = TRUE)), by = .(draw_id, year)][
+  , .(value = mean(value), lower = quantile(value, 0.025), upper = quantile(value, 0.975)), by = year
+]
+pred_strike_trace_calib <- index_to_own_mean(pred_strike_trace_calib, "value", "lower", "upper")
+pred_strike_trace_calib[, `:=`(source = "Predicted (TraCE)", outcome = "Lightning (strike rate / thunderstorm proxy)")]
+
+# =============================================================================
+# FIRE COUNT -- calibration period only
+# =============================================================================
+
+obs_fire_calib <- calib_fire_obs[, .(year, value = fire_count)]
+obs_fire_calib[, `:=`(lower = NA_real_, upper = NA_real_)]
+obs_fire_calib <- index_to_own_mean(obs_fire_calib, "value")
+obs_fire_calib[, `:=`(source = "Observed", outcome = "Fire count")]
+
+pred_fire_era_calib <- calib_pred_era[, .(value = sum(fire_count_pred, na.rm = TRUE)), by = .(draw_id, year)][
+  , .(value = mean(value), lower = quantile(value, 0.025), upper = quantile(value, 0.975)), by = year
+]
+pred_fire_era_calib <- index_to_own_mean(pred_fire_era_calib, "value", "lower", "upper")
+pred_fire_era_calib[, `:=`(source = "Predicted (ERA5, grid-matched)", outcome = "Fire count")]
+
+pred_fire_trace_calib <- calib_pred_trace[, .(value = sum(fire_count_pred, na.rm = TRUE)), by = .(draw_id, year)][
+  , .(value = mean(value), lower = quantile(value, 0.025), upper = quantile(value, 0.975)), by = year
+]
+pred_fire_trace_calib <- index_to_own_mean(pred_fire_trace_calib, "value", "lower", "upper")
+pred_fire_trace_calib[, `:=`(source = "Predicted (TraCE)", outcome = "Fire count")]
+
+# =============================================================================
+# BURNED AREA -- calibration period only
+# =============================================================================
+
+obs_ba_calib <- calib_fire_obs[, .(year, value = acres_to_km2(burned_acres))]
+obs_ba_calib[, `:=`(lower = NA_real_, upper = NA_real_)]
+obs_ba_calib <- index_to_own_mean(obs_ba_calib, "value")
+obs_ba_calib[, `:=`(source = "Observed", outcome = "Burned area")]
+
+pred_ba_era_calib <- calib_pred_era[, .(value = sum(total_burned_area_capped, na.rm = TRUE)), by = .(draw_id, year)][
+  , .(value = mean(value), lower = quantile(value, 0.025), upper = quantile(value, 0.975)), by = year
+]
+pred_ba_era_calib <- index_to_own_mean(pred_ba_era_calib, "value", "lower", "upper")
+pred_ba_era_calib[, `:=`(source = "Predicted (ERA5, grid-matched)", outcome = "Burned area")]
+
+pred_ba_trace_calib <- calib_pred_trace[, .(value = sum(total_burned_area_capped, na.rm = TRUE)), by = .(draw_id, year)][
+  , .(value = mean(value), lower = quantile(value, 0.025), upper = quantile(value, 0.975)), by = year
+]
+pred_ba_trace_calib <- index_to_own_mean(pred_ba_trace_calib, "value", "lower", "upper")
+pred_ba_trace_calib[, `:=`(source = "Predicted (TraCE)", outcome = "Burned area")]
+
+# =============================================================================
+# COMBINE + VERIFY before plotting
+# =============================================================================
+
+calib_outcomes <- rbind(
+  obs_strike_calib, pred_strike_era_calib, pred_strike_trace_calib,
+  obs_fire_calib, pred_fire_era_calib, pred_fire_trace_calib,
+  obs_ba_calib, pred_ba_era_calib, pred_ba_trace_calib,
+  fill = TRUE
+)
+calib_outcomes[, source := as.character(source)]
+calib_outcomes[, outcome := factor(outcome, levels = c(
+  "Lightning (strike rate / thunderstorm proxy)", "Fire count", "Burned area"
+))]
+
+# Sanity check BEFORE plotting -- confirm all three sources are present
+# for all three outcomes
+table(calib_outcomes$outcome, calib_outcomes$source)
+
+calib_outcomes[, source := as.character(source)]
+
+calib_outcomes[, color_group := ifelse(source == "Observed", "Observed", "Predicted")]
+
+calib_outcomes[, source_type := fcase(
+  source == "Observed",                        "Observed",
+  source == "Predicted (ERA5, grid-matched)",   "Predicted (ERA5)",
+  source == "Predicted (TraCE)",                "Predicted (TraCE)",
+  default = "UNMATCHED"
+)]
+
+table(calib_outcomes$source_type)   # confirm no "UNMATCHED" before proceeding
+# Fixed, controlled horizontal offset per source -- NOT random jitter, so
+# the connecting lines stay clean and reproducible across renders rather
+# than breaking into a jagged random path each time
+calib_outcomes[, x_offset := fcase(
+  source_type == "Observed",          -0.2,
+  source_type == "Predicted (ERA5)",   0,
+  source_type == "Predicted (TraCE)",  0.2
+)]
+calib_outcomes[, year_plot := year + x_offset]
+
+build_calib_panel <- function(outcome_name, panel_label, y_label) {
+  d <- calib_outcomes[outcome == outcome_name]
+
+  ggplot(d, aes(x = year_plot, y = index,
+                color = color_group, linetype = source_type, shape = source_type)) +
+    geom_hline(yintercept = 0, linewidth = 0.3, color = "black") +
+    geom_errorbar(aes(ymin = index_lower, ymax = index_upper), width = 0, alpha = 0.3, na.rm = TRUE) +
+    geom_line(na.rm = TRUE) +
+    geom_point(size = 1.3, na.rm = TRUE) +
+    scale_color_manual(values = c("Observed" = "firebrick", "Predicted" = "steelblue"), guide = "none") +
+    scale_linetype_manual(values = c("Observed" = "solid",
+                                       "Predicted (ERA5)" = "solid",
+                                       "Predicted (TraCE)" = "dashed"),
+                           name = NULL) +
+    scale_shape_manual(values = c("Observed" = 16,
+                                    "Predicted (ERA5)" = 16,
+                                    "Predicted (TraCE)" = 17),
+                        name = NULL) +
+    scale_x_continuous(breaks = seq(1950, 1990, by = 5)) +
+    labs(title = panel_label, x = "Year", y = y_label) +
+    theme_minimal()
+}
+
+p_a <- build_calib_panel("Lightning (strike rate / thunderstorm proxy)", "(a)", "Strike rate / thunderstorm proxy")
+p_b <- build_calib_panel("Fire count", "(b)", "Fire count")
+p_c <- build_calib_panel("Burned area", "(c)", "Bburned area")
+
+p_calib_outcomes <- (p_a / p_b / p_c) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+p_calib_outcomes
+```
+
+```{r}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+
+index_to_own_mean <- function(dt, value_col) {
+  m <- mean(dt[[value_col]], na.rm = TRUE)
+  dt[, index := 100 * (get(value_col) - m) / m]
+  dt
+}
+
+setDT(drivers)
+drivers_calib <- drivers[year >= 1950 & year <= 1989]
+
+# ---- ALL 14 predictors originally tested, not just the 6-variable subset ----
+predictor_cols_all <- c("rh", "tair", "precip", "wind", "swr", "sp",
+                         "precip_1m", "precip_2m", "precip_3m", "precip_5y",
+                         "tair_1m", "tair_2m", "tair_3m", "tair_5y")
+
+predictor_annual <- rbindlist(lapply(predictor_cols_all, function(col) {
+  d <- drivers_calib[, .(value = mean(get(col), na.rm = TRUE)), by = year]
+  d <- index_to_own_mean(d, "value")
+  d[, source := col]
+  d
+}))
+
+# =============================================================================
+# FIGURE 3: calibration-period CLIMATE PREDICTORS -- all 14, indexed to
+# % deviation from own mean. Solid = statistically significant early/late
+# shift (precip_5y, tair_5y, per the step-change test); dashed = not
+# significant.
+# =============================================================================
+
+significant_predictors <- c("precip_5y", "tair_5y")
+predictor_annual[, sig_group := ifelse(source %in% significant_predictors, "solid", "dashed")]
+
+# 14 distinct colors -- Dark2/Set1 alone don't have enough levels
+predictor_colors <- c(
+  "rh" = "#1B9E77", "tair" = "#D95F02", "precip" = "#7570B3", "wind" = "#E7298A",
+  "swr" = "#66A61E", "sp" = "#E6AB02",
+  "precip_1m" = "#A6761D", "precip_2m" = "#666666", "precip_3m" = "#1F78B4",
+  "precip_5y" = "#B2182B", "tair_1m" = "#33A02C", "tair_2m" = "#FB9A99",
+  "tair_3m" = "#CAB2D6", "tair_5y" = "#6A3D9A"
+)
+
+p_calib_predictors <- ggplot(predictor_annual, aes(x = year, y = index,
+                                                      color = source,
+                                                      linetype = sig_group)) +
+  geom_hline(yintercept = 0, linewidth = 0.3, color = "black") +
+  geom_line(na.rm = TRUE) +
+  scale_color_manual(values = predictor_colors, name = "Predictor") +
+  scale_linetype_manual(values = c("solid" = "solid", "dashed" = "dashed"),
+                         labels = c("solid" = "Significant shift (p < 0.05)",
+                                    "dashed" = "No significant shift"),
+                         name = NULL) +
+  scale_x_continuous(breaks = seq(1950, 1990, by = 5)) +
+  labs(x = "Year", y = "% deviation from own calibration-period mean",
+       title = "Calibration-period (1950-1989) climate predictors relative to their own mean") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(nrow = 4), linetype = guide_legend(nrow = 2))
+
+p_calib_predictors
+```
+
+
+Split temp predictors into their own plot - its hard to see tari_5y move, even though it was found to have a significant cahnge at the 1970 step
+```{r}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(patchwork)
+
+setDT(drivers)
+drivers_calib <- drivers[year >= 1950 & year <= 1989]
+
+precip_wind_cols <- c("rh", "precip", "wind", "swr", "sp",
+                       "precip_1m", "precip_2m", "precip_3m", "precip_5y")
+tair_cols <- c("tair", "tair_1m", "tair_2m", "tair_3m", "tair_5y")
+
+# ---- Precip/wind/radiation/pressure family: % deviation, as before ----
+index_to_own_mean <- function(dt, value_col) {
+  m <- mean(dt[[value_col]], na.rm = TRUE)
+  dt[, index := 100 * (get(value_col) - m) / m]
+  dt
+}
+
+predictor_annual_pct <- rbindlist(lapply(precip_wind_cols, function(col) {
+  d <- drivers_calib[, .(value = mean(get(col), na.rm = TRUE)), by = year]
+  d <- index_to_own_mean(d, "value")
+  d[, source := col]
+  d
+}))
+
+# ---- Temperature family: ABSOLUTE anomaly in degrees C (converted from
+# Kelvin, and expressed as difference from own mean, NOT %) -- Kelvin's
+# large absolute offset makes % deviation systematically misleading for
+# temperature, crushing even real swings to near-invisible percentages ----
+anomaly_from_own_mean_celsius <- function(dt, value_col) {
+  m <- mean(dt[[value_col]], na.rm = TRUE)
+  dt[, index := (get(value_col) - m)]   # already in Kelvin degrees = Celsius degrees for a DIFFERENCE
+  dt
+}
+
+predictor_annual_tair <- rbindlist(lapply(tair_cols, function(col) {
+  d <- drivers_calib[, .(value = mean(get(col), na.rm = TRUE)), by = year]
+  d <- anomaly_from_own_mean_celsius(d, "value")
+  d[, source := col]
+  d
+}))
+
+significant_predictors <- c("precip_5y", "tair_5y")
+predictor_annual_pct[, sig_group  := ifelse(source %in% significant_predictors, "solid", "dashed")]
+predictor_annual_tair[, sig_group := ifelse(source %in% significant_predictors, "solid", "dashed")]
+
+pct_colors <- c("rh" = "#1B9E77", "precip" = "#7570B3", "wind" = "#E7298A",
+                 "swr" = "#66A61E", "sp" = "#E6AB02", "precip_1m" = "#A6761D",
+                 "precip_2m" = "#666666", "precip_3m" = "#1F78B4", "precip_5y" = "#B2182B")
+tair_colors <- c("tair" = "#D95F02", "tair_1m" = "#33A02C", "tair_2m" = "#FB9A99",
+                  "tair_3m" = "#CAB2D6", "tair_5y" = "#6A3D9A")
+
+p_precip_family <- ggplot(predictor_annual_pct, aes(x = year, y = index, color = source, linetype = sig_group)) +
+  geom_hline(yintercept = 0, linewidth = 0.3, color = "black") +
+  geom_line(na.rm = TRUE) +
+  scale_color_manual(values = pct_colors, name = "Predictor") +
+  scale_linetype_manual(values = c("solid" = "solid", "dashed" = "dashed"),
+                         labels = c("solid" = "Significant shift (p < 0.05)", "dashed" = "No significant shift"),
+                         name = NULL) +
+  scale_x_continuous(breaks = seq(1950, 1990, by = 5)) +
+  labs(title = "(a) Precipitation, wind, radiation, pressure",
+       x = "Year", y = "% deviation from own mean") +
+  theme_minimal() + theme(legend.position = "bottom")
+
+p_tair_family <- ggplot(predictor_annual_tair, aes(x = year, y = index, color = source, linetype = sig_group)) +
+  geom_hline(yintercept = 0, linewidth = 0.3, color = "black") +
+  geom_line(na.rm = TRUE) +
+  scale_color_manual(values = tair_colors, name = "Predictor") +
+  scale_linetype_manual(values = c("solid" = "solid", "dashed" = "dashed"),
+                         labels = c("solid" = "Significant shift (p < 0.05)", "dashed" = "No significant shift"),
+                         name = NULL) +
+  scale_x_continuous(breaks = seq(1950, 1990, by = 5)) +
+  labs(title = "(b) Temperature",
+       x = "Year", y = "Anomaly from own mean (\u00b0C)") +
+  theme_minimal() + theme(legend.position = "bottom")
+
+p_calib_predictors <- (p_precip_family / p_tair_family) +
+  plot_layout(guides = "collect") & theme(legend.position = "bottom")
+
+p_calib_predictors
+```
+
+

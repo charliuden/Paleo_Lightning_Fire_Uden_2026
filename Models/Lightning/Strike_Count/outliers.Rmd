@@ -1,0 +1,136 @@
+---
+title: "Outliers"
+output: html_document
+---
+
+
+```{r, echo=FALSE, include=FALSE}
+library(rstan)
+library(dplyr)
+library(stats)
+library(caret)
+library(tidyr)
+library(patchwork)
+library(ggplot2)
+library(gridExtra)
+library(terra)
+library(lubridate)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+```
+
+
+```{r}
+df <- read.csv(file.path(drivers_root, "lightning_strike_count_climate_jja_2002_2011.csv"))
+head(df)
+```
+
+What's expected?
+Number reported from Bieniek: "The gridded monthly averaged observed lightning over 1986–2015 is shown for May, June, July, and August in [Fig. 3](https://journals.ametsoc.org/view/journals/apme/59/6/JAMC-D-19-0209.1.xml#fig3). Most lightning activity occurs in June and July, with some 20-km grid cells in the interior of Alaska receiving more than 30 strikes per month on average." 
+
+Bienek's gridcells are a little larger (20x20=400 km2)
+```{r}
+area <- read.csv(file.path(paleoclimate_data_root, "era5_grid_area.csv"))
+alaska_max_rate_per_km2 <- 30 / 400   # Bieniek's peak interior rate, per km²
+physical_cap <- alaska_max_rate_per_km2 * max(area$area)
+physical_cap
+```
+
+
+
+Location
+```{r}
+filter(df, strike_count > 1000) %>%
+  count(lat, lon) %>%
+  arrange(desc(n))
+
+filter(df, strike_count > 100) %>%
+  count(lat, lon) %>%
+  arrange(desc(n))
+```
+
+Years
+```{r}
+nrow(filter(df, strike_count > 1000))
+filter(df, strike_count > 1000) %>%
+  count(year) %>%
+  arrange(desc(n))
+
+nrow(filter(df, strike_count > 100))
+filter(df, strike_count > 100) %>%
+  count(year) %>%
+  arrange(desc(n))
+```
+
+
+Are extreme clusters non random?
+```{r}
+library(data.table)
+setDT(df)
+
+# How many unique gridcells exist in the dataset overall?
+n_total_gridcells <- df[, uniqueN(paste(lat, lon))]
+
+# Observed: 7 gridcells account for how many of the >1000 rows?
+top7 <- df[strike_count > 1000, .N, by = .(lat, lon)][order(-N)][1:7]
+pct_from_top7 <- sum(top7$N) / nrow(df[strike_count > 1000])
+
+# Compare to what you'd expect if >1000 events were spread randomly across
+# all gridcells with equal probability
+expected_pct_if_random <- 7 / n_total_gridcells
+cat(sprintf("Observed: %.1f%% of extreme rows from top 7 gridcells\n", pct_from_top7 * 100))
+cat(sprintf("Expected if random: %.4f%%\n", expected_pct_if_random * 100))
+```
+observed concentration is (orders of magnitude) above the random-expectation baseline, likely given 7 out of ~88 rows above 1000 all falling into just 7 of presumably thousands of gridcells. this isn't random weather signal, worth reporting as a stated justification rather than an eyeball judgment.
+
+Where should the threshold be set?
+
+point where the plot's slope changes noticeably or the confidence band widens erratically are where the EVT-suggested threshold above which the data stops following the bulk distribution's tail behavior.
+```{r}
+library(ismev)  # or POT package — either works
+strike_vals <- df[strike_count > 0, strike_count]
+
+mrl.plot(strike_vals, umin = 50, umax = 5000)
+
+mrl.plot(strike_vals, umin = 50, umax = 1100)
+```
+
+
+The physically expected maximum based on Bieniek et al.'s peak interior lightning rate scaled to ERA5 grid area (~35 strikes/month/gridcell), the extreme value threshold identified via mean residual life analysis (~1,000), and the strong spatial non-randomness of exceedances (100% concentrated in 7 of 15,041 gridcells, versus 0.0465% expected under random occurrence) jointly motivated a cap of 1,000 strikes per gridcell-month. Strike count observations exceeding this cap were excluded from the training data (rather than truncated). 

@@ -1,0 +1,287 @@
+---
+title: "Maps of Paleo Predictions"
+author: "Charlotte Uden"
+date: "2026-08-11"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(geodata)
+library(terra)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+```{r}
+df <- read_parquet(file.path(predictions_root, "paleo_fire_lightning_predictions.parquet"))
+```
+
+Alaska polygon and Elevation plot
+```{r}
+# Get USA polygon
+usa <- ne_states(country = "United States of America", returnclass = "sf")
+# Filter to Alaska only
+alaska <- usa[usa$name == "Alaska", ]
+alaska <- st_transform(alaska, crs = 4326)
+
+
+
+# Download SRTM elevation data for Alaska
+# Alaska spans multiple tiles so we download by country
+
+# 1. Download and crop
+elev <- geodata::elevation_global(res = 10, path = tempdir())
+alaska_ext <- ext(-170, -130, 51, 72)
+elev_alaska <- crop(elev, alaska_ext)
+
+# 2. Mask to Alaska polygon
+alaska_vect <- terra::vect(alaska)
+elev_masked <- terra::mask(elev_alaska, alaska_vect)
+
+# 3. Convert to data frame — use elev_masked instead of elev_alaska
+elev_df <- as.data.frame(elev_masked, xy = TRUE)
+names(elev_df) <- c("lon", "lat", "elevation")
+elev_df <- elev_df %>% filter(!is.na(elevation), elevation >= 0)
+```
+
+
+```{r}
+p_elevation <- ggplot() +
+  geom_contour(data = elev_df,
+               aes(x = lon, y = lat, z = elevation),
+               color = "black",
+               linewidth = 0.1,
+               breaks = seq(0, 3000, by = 250)) +  # contour interval in metres
+  geom_sf(data = alaska, fill = NA, color = "black",
+          linewidth = 0.3, inherit.aes = FALSE) +
+  xlim(-170, -130) +
+  ylim(51, 72) +
+  xlab("Lon") +
+  ylab("Lat") +
+  theme_minimal() +
+  theme(
+    axis.title.x     = element_text(size=11),
+    axis.title.y     = element_text(size=11),
+    axis.text.y      = element_text(size=11),
+    axis.text.x      = element_text(size=11),
+    panel.grid.major = element_line(color = "darkgray", size = 0.2),
+    panel.grid.minor = element_line(color = "darkgray", size = 0.2)
+  )
+
+p_elevation
+```
+
+
+Where is fire occurring?
+```{r}
+main="year < -8000"
+
+year_min = NA
+year_max= -800
+
+map_data <- df %>%
+    dplyr::select(year, lat, lon, area, total_burned_area_acres, B, C, U) %>%
+  filter(year < year_max) %>%
+    group_by(lat, lon) %>%
+    summarise(
+      holocene_mean = mean(total_burned_area_acres, na.rm = TRUE),
+      area   = first(area),
+      mean_B = mean(B, na.rm = TRUE),
+      mean_C = mean(C, na.rm = TRUE),
+      mean_U = mean(U, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(holocene_percent_burned = holocene_mean / area)
+
+p1 <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=holocene_mean, size=1)) + labs(title=main)
+p1B <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_B, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p1C <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_C, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p1U <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_U, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+
+main="year > -8000 & year < -4300"
+
+year_min = -8000
+year_max= -4300
+
+map_data <- df %>%
+    dplyr::select(year, lat, lon, area, total_burned_area_acres, B, C, U) %>%
+  filter(year > year_min & year < year_max) %>%
+    group_by(lat, lon) %>%
+    summarise(
+      holocene_mean = mean(total_burned_area_acres, na.rm = TRUE),
+      area   = first(area),
+      mean_B = mean(B, na.rm = TRUE),
+      mean_C = mean(C, na.rm = TRUE),
+      mean_U = mean(U, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(holocene_percent_burned = holocene_mean / area)
+
+p2 <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=holocene_mean, size=1)) + labs(title=main)
+p2B <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_B, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p2C <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_C, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p2U <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_U, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+
+main="year > -4300 & year < -2300"
+
+year_min = -4300
+year_max= -2300
+
+map_data <- df %>%
+    dplyr::select(year, lat, lon, area, total_burned_area_acres, B, C, U) %>%
+  filter(year > year_min & year < year_max) %>%
+    group_by(lat, lon) %>%
+    summarise(
+      holocene_mean = mean(total_burned_area_acres, na.rm = TRUE),
+      area   = first(area),
+      mean_B = mean(B, na.rm = TRUE),
+      mean_C = mean(C, na.rm = TRUE),
+      mean_U = mean(U, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(holocene_percent_burned = holocene_mean / area)
+
+p3 <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=holocene_mean, size=1)) + labs(title=main)
+p3B <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_B, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p3C <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_C, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p3U <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_U, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+
+main="year > -2300 & year < -700"
+
+year_min = -2300
+year_max= -700
+
+map_data <- df %>%
+    dplyr::select(year, lat, lon, area, total_burned_area_acres, B, C, U) %>%
+  filter(year > year_min & year < year_max) %>%
+    group_by(lat, lon) %>%
+    summarise(
+      holocene_mean = mean(total_burned_area_acres, na.rm = TRUE),
+      area   = first(area),
+      mean_B = mean(B, na.rm = TRUE),
+      mean_C = mean(C, na.rm = TRUE),
+      mean_U = mean(U, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(holocene_percent_burned = holocene_mean / area)
+
+p4 <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=holocene_mean, size=1)) + labs(title=main)
+p4B <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_B, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p4C <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_C, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p4U <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_U, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+
+main="year > -700 & year < 1900"
+
+year_min = -700
+year_max= 1900
+
+map_data <- df %>%
+    dplyr::select(year, lat, lon, area, total_burned_area_acres, B, C, U) %>%
+  filter(year > year_min & year < year_max) %>%
+    group_by(lat, lon) %>%
+    summarise(
+      holocene_mean = mean(total_burned_area_acres, na.rm = TRUE),
+      area   = first(area),
+      mean_B = mean(B, na.rm = TRUE),
+      mean_C = mean(C, na.rm = TRUE),
+      mean_U = mean(U, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(holocene_percent_burned = holocene_mean / area)
+
+p5 <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=holocene_mean, size=1)) + labs(title=main)
+p5B <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_B, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p5C <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_C, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+p5U <- p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_U, size=1)) + labs(title=main) + scale_color_viridis_c(limits = c(0, 1))
+
+```
+
+
+
+```{r}
+combined_plot <- (p1 | p2 | p3 | p4 | p5) / (p1B | p2B | p3B | p4B | p5B) / (p1C | p2C | p3C | p4C | p5C) / (p1U | p2U | p3U | p4U | p5U)
+
+ggsave(
+  filename = file.path(figure_root, "Figure_map_paleo_burn_cover.png"),
+  plot = combined_plot,
+  width = 20,
+  height = 16,     
+  units = "in",
+  dpi = 600
+)
+```
+
+Map the year with the greatest burned area
+```{r}
+annual_totals <- df %>%
+  dplyr::select(year, total_burned_area) %>%
+  group_by(year) %>%
+  summarise(
+    year_total = sum(total_burned_area, na.rm = TRUE), .groups = "drop") 
+
+max_year <- annual_totals %>% filter(year_total == max(year_total))
+year <- max_year$year
+
+map_data <- df %>%
+  dplyr::select(lat, lon, area, total_burned_area, B, C, U) %>%
+  filter(year==year) %>%
+  group_by(lat, lon) %>%
+  summarise(
+    year_total = sum(total_burned_area, na.rm = TRUE),
+    area   = first(area),
+    mean_B = first(B),
+    mean_C = first(C),
+    mean_U = first(U),
+    .groups = "drop"
+  ) %>%
+  mutate(percent_burned = year_total / area)
+  
+  p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=year_total, size=1)) 
+    p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_B, size=1)) 
+      p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_C, size=1)) 
+        p_elevation + geom_point(data=map_data, aes(x=lon, y=lat, color=mean_U, size=1)) 
+```
+

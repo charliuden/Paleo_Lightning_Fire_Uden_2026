@@ -1,0 +1,1921 @@
+---
+title: "Fire pipeline using calibration data"
+output: html_document
+---
+
+
+Apply models to just the overlapping calibration period (1950-1989) to look at how fire predicitons differ between ERA5 versus corrected trace data. This could be used to adjust paleo predictions. 
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(arrow)
+library(formattable)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+modern_fire_stats_root <- config[["modern_fire_stats_root"]]
+```
+
+##########################################
+#####       LIGHTNING    (r_strike)  #####
+##########################################
+
+r_strike ~ Gamma(alpha, beta)
+
+alpha = exp(a_alpha + b_alpha * X)
+
+beta = exp(a_beta + b_beta * X)
+
+a_alpha, b_alpha, a_beta, b_beta ~ Normal(0, 1)
+
+r_strike: lightning strikes / km2 / month
+X: temperature, precipitation, relative humidity, shortwave radiation, surface pressure
+
+exp(): ensures alpha and beta stay positive, which the gamma distribution requires. 
+
+Read in summer TRACE data for calibration period
+```{r}
+#corrected trace data:
+trace_summer_calib <- read_parquet(file.path(paleoclimate_data_root,("trace21ka_processed/trace_calibration_lightning_seasonal_corrected.parquet")))
+trace_summer_calib <-  trace_summer_calib %>% filter(year >=1949)
+```
+
+Read in observations and predictions from ERA5 data for training period:
+(to compare with tcalibration period)
+```{r}
+era_summer_modern <- read.csv(file.path(predictions_root, "predictions_2002_2011.csv"))
+#climate drivers for lightning strike rate modern training gperiod:
+#lightning <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv"))
+```
+
+Read in era5 calibration
+```{r}
+era_summer_calib <- read_parquet(file.path(era5_data_root,"bias_correction/processed_parquet/era5_lightning_model_1946_1990.parquet"))
+era_summer_calib <-  era_summer_calib %>% filter(year >=1949)
+
+#clip ERA5 grid to Alaska:
+era_alaska_grid <- read.csv(file.path(paleoclimate_data_root, "era5_grid_area.csv")) 
+
+era_alaska_grid <- era_alaska_grid %>%
+  dplyr::select(lat, lon) %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4))
+
+era_summer_calib <- era_summer_calib %>%
+  inner_join(
+    era_alaska_grid %>% dplyr::select(lat, lon),
+    by = c("lat", "lon")
+  )
+
+# #save unaggregated ERA5 data:
+# era_summer_pre_aggregation <- era_summer_calib
+# # Match each ERA5 point to nearest TraCE grid cell
+# 
+trace_cells <- readRDS(file.path(rds_root, "trace_cells.rds"))
+# 
+# nn <- get.knnx(data = trace_cells[, c("lon", "lat")],
+#                query = era_summer_calib[, c("lon", "lat")], k = 1)
+# 
+# era_summer_calib$trace_lon <- trace_cells$lon[nn$nn.index]
+# era_summer_calib$trace_lat <- trace_cells$lat[nn$nn.index]
+# 
+# # Aggregate ERA5 to TraCE grid cells, by year
+# era_summer_calib <- era_summer_calib %>%
+#   dplyr::select(-lat, -lon) %>%
+#   rename(lat = trace_lat, lon = trace_lon)
+# 
+# # calculate mean for any raw ERA5 points that snapped to the same TraCE cell
+# era_summer_calib <- era_summer_calib %>%
+#   group_by(lat, lon, year) %>%
+#   summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+# 
+# # Confirm the duplication is gone before re-running the join
+# era_summer_calib %>% count(lat, lon, year) %>% filter(n > 1) %>% nrow()   # should now be 0
+# 
+ggplot(filter(era_summer_calib, year==1950), aes(x=lon, y=lat)) + geom_point()
+```
+
+Predict lightning strike rate for all gridcells and years: TRACE calibration period
+```{r}
+#standardize:
+lightning_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_lightning_predictors.csv"))
+
+# Helper function: look up mu and sigma by variable name
+get_mu    <- function(var) lightning_mu_sigma$mu[lightning_mu_sigma$var == var]
+get_sigma <- function(var) lightning_mu_sigma$sigma[lightning_mu_sigma$var == var]
+
+trace_summer_calib_scaled <- trace_summer_calib |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    #wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    swr    = (swr    - get_mu("swr"))    / get_sigma("swr"),
+    sp     = (sp     - get_mu("sp"))     / get_sigma("sp"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh")
+  )
+
+
+# ── Load B12 Bayesian lightning model ─────────────────────────────────────────
+B12 <- readRDS(file.path(rds_root, "Lightning/B12_gamma_bayes.rds"))
+
+# ── Extract posterior samples ─────────────────────────────────────────────────
+posterior_samples <- as.data.frame(B12)
+
+# Generate predictions using posterior mean coefficients
+# B12 excludes wind — predictors: swr, tair, rh, precip, sp
+
+a_alpha_mean <- mean(posterior_samples$a_alpha)
+b_alpha_mean <- mean(posterior_samples$b_alpha)
+c_alpha_mean <- mean(posterior_samples$c_alpha)
+d_alpha_mean <- mean(posterior_samples$d_alpha)
+e_alpha_mean <- mean(posterior_samples$e_alpha)
+f_alpha_mean <- mean(posterior_samples$f_alpha)
+
+a_beta_mean  <- mean(posterior_samples$a_beta)
+b_beta_mean  <- mean(posterior_samples$b_beta)
+c_beta_mean  <- mean(posterior_samples$c_beta)
+d_beta_mean  <- mean(posterior_samples$d_beta)
+e_beta_mean  <- mean(posterior_samples$e_beta)
+f_beta_mean  <- mean(posterior_samples$f_beta)
+
+# Compute alpha and beta per observation using posterior means
+# Using vectorised operations rather than a loop for speed
+
+lp_alpha <- a_alpha_mean +
+            b_alpha_mean * trace_summer_calib_scaled$swr   +
+            c_alpha_mean * trace_summer_calib_scaled$tair  +
+            d_alpha_mean * trace_summer_calib_scaled$rh    +
+            e_alpha_mean * trace_summer_calib_scaled$precip +
+            f_alpha_mean * trace_summer_calib_scaled$sp
+
+lp_beta  <- a_beta_mean  +
+            b_beta_mean  * trace_summer_calib_scaled$swr   +
+            c_beta_mean  * trace_summer_calib_scaled$tair  +
+            d_beta_mean  * trace_summer_calib_scaled$rh    +
+            e_beta_mean  * trace_summer_calib_scaled$precip +
+            f_beta_mean  * trace_summer_calib_scaled$sp
+
+alpha_pred <- exp(lp_alpha)
+beta_pred  <- exp(lp_beta)
+
+set.seed(123)
+
+# Gamma alpha and beta
+# if you want the mean: alpha / beta
+trace_summer_calib_scaled <- trace_summer_calib_scaled |>
+  mutate(
+    gamma_alpha   = alpha_pred,
+    gamma_beta    = beta_pred,
+    r_strike_mean  = alpha_pred / beta_pred,   # posterior mean prediction
+    r_strike = rgamma(n(), shape = gamma_alpha, rate = gamma_beta)
+  )
+
+hist(trace_summer_calib_scaled$r_strike)
+hist(trace_summer_calib_scaled$r_strike_mean)
+
+summary(trace_summer_calib_scaled$r_strike)
+summary(trace_summer_calib_scaled$r_strike_mean)
+```
+
+Predict lightning strike rate for all gridcells and years: ERA5 calibration period
+```{r}
+era_summer_calib_scaled <- era_summer_calib |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    #wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    swr    = (swr    - get_mu("swr"))    / get_sigma("swr"),
+    sp     = (sp     - get_mu("sp"))     / get_sigma("sp"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh")
+  )
+
+
+lp_alpha <- a_alpha_mean +
+            b_alpha_mean * era_summer_calib_scaled$swr   +
+            c_alpha_mean * era_summer_calib_scaled$tair  +
+            d_alpha_mean * era_summer_calib_scaled$rh    +
+            e_alpha_mean * era_summer_calib_scaled$precip +
+            f_alpha_mean * era_summer_calib_scaled$sp
+
+lp_beta  <- a_beta_mean  +
+            b_beta_mean  * era_summer_calib_scaled$swr   +
+            c_beta_mean  * era_summer_calib_scaled$tair  +
+            d_beta_mean  * era_summer_calib_scaled$rh    +
+            e_beta_mean  * era_summer_calib_scaled$precip +
+            f_beta_mean  * era_summer_calib_scaled$sp
+
+alpha_pred <- exp(lp_alpha)
+beta_pred  <- exp(lp_beta)
+
+set.seed(123)
+
+# Gamma alpha and beta
+# if you want the mean: alpha / beta
+era_summer_calib_scaled <- era_summer_calib_scaled |>
+  mutate(
+    gamma_alpha   = alpha_pred,
+    gamma_beta    = beta_pred,
+    r_strike_mean  = alpha_pred / beta_pred,   # posterior mean prediction
+    r_strike = rgamma(n(), shape = gamma_alpha, rate = gamma_beta)
+  )
+
+hist(era_summer_calib_scaled$r_strike)
+hist(era_summer_calib_scaled$r_strike_mean)
+
+summary(era_summer_calib_scaled$r_strike)
+summary(era_summer_calib_scaled$r_strike_mean)
+```
+
+
+Compare predictions:
+```{r}
+hist(era_summer_modern$r_strike_obs, main = "ERA5 training period observed r_strike")
+hist(era_summer_modern$r_strike, main = "ERA5 training period predicted r_strike")
+hist(era_summer_calib_scaled$r_strike, main = "ERA5 calibration period simulated r_strike")
+hist(trace_summer_calib_scaled$r_strike, main = "TRACE calibration period simulated r_strike")
+
+summary(era_summer_modern$r_strike_obs)
+summary(era_summer_modern$r_strike)
+summary(era_summer_calib_scaled$r_strike)
+summary(trace_summer_calib_scaled$r_strike)
+
+# ── Standardize each dataframe to year + r_strike + dataset label ────────────
+
+era_obs_modern_df <- era_summer_modern %>%
+  dplyr::select(year, r_strike = r_strike_obs) %>%
+  mutate(dataset = "ERA5 (observed, 2002-2011)")
+
+era_pred_modern_df <- era_summer_modern %>%
+  dplyr::select(year, r_strike) %>%
+  mutate(dataset = "ERA5 (predicted, 2002-2011)")
+
+era_calib_df <- era_summer_calib_scaled %>%
+  dplyr::select(year, r_strike) %>%
+  mutate(dataset = "ERA5 (calibration)")
+
+trace_calib_df <- trace_summer_calib_scaled %>%
+  dplyr::select(year, r_strike) %>%
+  mutate(dataset = "TraCE (calibration)")
+
+# ── Combine and drop the 1990-2001 gap between calibration and modern periods ─
+
+combined <- bind_rows(era_obs_modern_df, era_pred_modern_df, era_calib_df, trace_calib_df) %>%
+  filter(!(year >= 1990 & year <= 2001))
+
+# ── Annual mean and SD per dataset ────────────────────────────────────────────
+
+annual_summary <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    mean_r_strike = mean(r_strike, na.rm = TRUE),
+    ci_low        = quantile(r_strike, 0.05, na.rm = TRUE),
+    ci_high       = quantile(r_strike, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ── Plot ───────────────────────────────────────────────────────────────────────
+
+ggplot(annual_summary, aes(x = year, y = mean_r_strike, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = ci_low, ymax = ci_high),
+    width = 0.3, alpha = 0.5
+  ) +
+  labs(
+    x = "Year", y = "Mean r_strike (± SD)", color = NULL,
+    title = "Annual lightning strike rate: observed vs. bias-corrected calibration"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+#Predicted mean posterior dist - no samping from gamma:
+
+era_obs_modern_df <- era_summer_modern %>%
+  dplyr::select(year, r_strike = r_strike_obs) %>%
+  mutate(dataset = "ERA5 (observed, 2002-2011)")
+
+era_pred_modern_df <- era_summer_modern %>%
+  dplyr::select(year, r_strike) %>%
+  mutate(dataset = "ERA5 (predicted, 2002-2011)")
+
+era_calib_df <- era_summer_calib_scaled %>%
+  dplyr::select(year, r_strike =r_strike_mean) %>%
+  mutate(dataset = "ERA5 (calibration)")
+
+trace_calib_df <- trace_summer_calib_scaled %>%
+  dplyr::select(year, r_strike = r_strike_mean) %>%
+  mutate(dataset = "TraCE (calibration)")
+
+# ── Combine and drop the 1990-2001 gap between calibration and modern periods ─
+
+combined <- bind_rows(era_obs_modern_df, era_pred_modern_df, era_calib_df, trace_calib_df) %>%
+  filter(!(year >= 1990 & year <= 2001))
+
+# ── Annual mean and SD per dataset ────────────────────────────────────────────
+
+annual_summary <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    mean_r_strike = mean(r_strike, na.rm = TRUE),
+    ci_low        = quantile(r_strike, 0.05, na.rm = TRUE),
+    ci_high       = quantile(r_strike, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ── Plot ───────────────────────────────────────────────────────────────────────
+
+ggplot(annual_summary, aes(x = year, y = mean_r_strike, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = ci_low, ymax = ci_high),
+    width = 0.3, alpha = 0.5
+  ) +
+  labs(
+    x = "Year", y = "Mean r_strike (± SD)", color = NULL,
+    title = "Annual lightning strike rate: observed vs. bias-corrected calibration"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+Read in monhtly summer data for TRACE calibraiton period
+```{r}
+trace_month_calib <- read_parquet(file.path(paleoclimate_data_root, "trace21ka_processed/trace_monthly_with_lags_and_landcover.parquet"))
+trace_month_calib <- trace_month_calib %>% dplyr::select(-B, -C, -U, midpoint) #contain NA values
+  
+#only want calibration period:
+trace_month_calib <-  trace_month_calib %>% filter(month >= 6 & year >=1949)
+```
+
+Read in monhtly summer data for ERA5 calibraiton period
+```{r}
+era_month_calib <- read_parquet(file.path(era5_data_root,"bias_correction/processed_parquet/era_calib_period_monthly_with_lags.parquet"))
+#only need june, july, august:
+era_month_calib <-  era_month_calib %>% filter(month >= 6 & year >=1949)
+# #save unaggregated ERA5 data:
+# era_month_pre_aggregation <- era_month_calib
+# # Match each ERA5 point to nearest TraCE grid cell
+# 
+# trace_cells <- readRDS(file.path(rds_root, "trace_cells.rds"))
+# 
+# nn <- get.knnx(data = trace_cells[, c("lon", "lat")],
+#                query = era_month_calib[, c("lon", "lat")], k = 1)
+# 
+# era_month_calib$trace_lon <- trace_cells$lon[nn$nn.index]
+# era_month_calib$trace_lat <- trace_cells$lat[nn$nn.index]
+# 
+# # Aggregate ERA5 to TraCE grid cells, by year
+# era_month_calib <- era_month_calib %>%
+#   dplyr::select(-lat, -lon) %>%
+#   rename(lat = trace_lat, lon = trace_lon)
+# 
+# # aggregating within lat/lon/year/month
+# era_month_calib <- era_month_calib %>%
+#   group_by(lat, lon, year, month) %>%
+#   summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop")
+# 
+# era_month_calib  %>% count(lat, lon, year, month) %>% filter(n > 1) %>% nrow()   # should now be 0
+# 
+# 
+# ggplot(filter(era_month_calib, year==1950), aes(x=lon, y=lat)) + geom_point()
+```
+
+##########################################
+##### STRIKE COUNT       (n_strikes) #####
+##########################################
+
+n_strikes ~ NegBinomial(mu, theta)
+
+mu = r_strike * area
+
+theta = exp(gamma_0 + gamma * X)
+
+Gamma_0 ~ Normal(2,2)
+Gamma ~ Normal(0, sigma2)
+Sigma = 1 
+
+r_strike: strikes/km2/month
+area: gridcell area, km2
+n_strikes: number of strikes in a gridcell-month
+X: monthly climate predictors, temperature, precipitation, wind, relative humidity, shortwave radiation, surface pressure
+theta: Precision/dispersion parameter of the Negative Binomial distribution predicted from climate. Theta > 0.
+mu: mean lightning strike rate, strikes/gridcell/month. This is predicted from the Gamma model above and is the same for all summer months (June, July, August) in a year. The summer mean was used to ensure that mu > 0, which is required by the negative binomial distribution. 
+
+Apply negative binomial to Trace calibration period
+```{r}
+#merge summer strike rate (strikes/km2/month) predictions, r_strike - months will be duplicated
+trace_month_calib <- trace_month_calib %>%
+  left_join(
+    trace_summer_calib_scaled %>% dplyr::select(lat, lon, year, r_strike, r_strike_mean),
+    by = c("lat", "lon", "year")
+  )
+
+
+#Scale strike rate from strikes/km2/month to strikes/gridcell/month
+area <- read.csv(file.path(paleoclimate_data_root, "TraCE_21ka_gridcell_area.csv")) 
+
+colnames(area)[colnames(area) == "area_clipped_km2"] <- "area"
+
+area <- area %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4))
+
+trace_month_calib <- trace_month_calib %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  left_join(
+    area %>% dplyr::select(lat, lon, area),
+    by = c("lat", "lon")
+  )
+
+##standardize using training period mu and sd:
+n_strike_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_lightning_count_predictors.csv"))
+
+# Helper function: look up mu and sigma by variable name
+get_mu    <- function(var) n_strike_mu_sigma$mu[n_strike_mu_sigma$var == var]
+get_sigma <- function(var) n_strike_mu_sigma$sigma[n_strike_mu_sigma$var == var]
+
+n_strike_trace_month_calib_scaled <- trace_month_calib |>
+  dplyr::select(lat, lon, year, month, r_strike, r_strike_mean, area, precip, tair, wind, rh, swr, sp) |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh"),
+    swr     = (swr     - get_mu("swr"))     / get_sigma("swr"),
+    sp     = (sp     - get_mu("sp"))     / get_sigma("sp")
+  )
+
+#caluclate mu for the negative binomial distribution: r_strike * area = strikes/month/gridcell
+# n_strike_trace_month_calib_scaled <- n_strike_trace_month_calib_scaled |>
+#   mutate(mu_r_strike_gridcell = r_strike * area)
+#or use mean of the posterior from strike rate model
+n_strike_trace_month_calib_scaled <- n_strike_trace_month_calib_scaled |>
+  mutate(mu_r_strike_gridcell = r_strike_mean * area)
+
+#Predictors for theta (negative binomial parameter we need to sample strike count)
+theta_predictors <- c("swr", "tair", "rh", "precip", "sp", "wind")
+
+#read in strike count model
+nb_model <- readRDS(file.path(rds_root, "Lightning/neg_bin_strike_count_small.rds"))
+
+#Posterior mean gamma coefficients
+gamma_0_mean <- nb_model$coef_means$gamma_0
+gamma_means  <- nb_model$coef_means$gamma
+
+#Build predictor matrix for full fire dataframe
+Z_fire <- model.matrix(
+  as.formula(paste("~", paste(theta_predictors, collapse = " + "), "- 1")),
+  data = n_strike_trace_month_calib_scaled   # must have same standardised predictors
+)
+
+#Compute posterior mean theta per gridcell-month
+log_theta_pred <- as.numeric(gamma_0_mean + Z_fire %*% gamma_means)
+theta_pred     <- exp(log_theta_pred)
+
+#sample strike count using mu=r_strike*area and theta
+n_strike_trace_month_calib_scaled <- n_strike_trace_month_calib_scaled |>
+  mutate(
+    nb_theta         = theta_pred,
+    log_mu_pred      = log(pmax(mu_r_strike_gridcell, 1e-8)),
+    n_strikes = rnbinom(n    = n(),
+                                 mu   = mu_r_strike_gridcell,
+                                 size = nb_theta)
+  )
+```
+
+Apply negative binomial to ERA5 calibration period
+```{r}
+#merge summer strike rate (strikes/km2/month) predictions, r_strike - months will be duplicated
+era_month_calib <- era_month_calib %>%
+  left_join(
+    era_summer_calib_scaled %>% dplyr::select(lat, lon, year, r_strike, r_strike_mean),
+    by = c("lat", "lon", "year")
+  )
+
+#Scale strike rate from strikes/km2/month to strikes/gridcell/month
+area <- read.csv(file.path(paleoclimate_data_root, "era5_grid_area.csv")) 
+
+area <- area %>%
+  dplyr::select(lat, lon, area) %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4))
+
+#inner join with area data will also clip to Alaska
+era_month_calib <- era_month_calib %>%
+  inner_join(
+    area %>% dplyr::select(lat, lon, area),
+    by = c("lat", "lon")
+  )
+
+#check grid
+ggplot(filter(era_month_calib, year==1950 & month==6), aes(x=lon, y=lat)) + geom_point()
+
+#standardize using training period mu and sd
+n_strike_era_month_calib_scaled <- era_month_calib |>
+  dplyr::select(lat, lon, year, month, r_strike, r_strike_mean, area, precip, tair, wind, rh, swr, sp) |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh"),
+    swr     = (swr     - get_mu("swr"))     / get_sigma("swr"),
+    sp     = (sp     - get_mu("sp"))     / get_sigma("sp")
+  )
+
+#caluclate mu for the negative binomial distribution: r_strike * area = strikes/month/gridcell
+# n_strike_era_month_calib_scaled <- n_strike_era_month_calib_scaled |>
+#   mutate(mu_r_strike_gridcell = r_strike * area)
+
+#or use posterior mean strike rate
+n_strike_era_month_calib_scaled <- n_strike_era_month_calib_scaled |>
+  mutate(mu_r_strike_gridcell = r_strike_mean * area)
+
+#Predictors for theta (negative binomial parameter we need to sample strike count)
+theta_predictors <- c("swr", "tair", "rh", "precip", "sp", "wind")
+
+#Build predictor matrix for full fire dataframe
+Z_fire <- model.matrix(
+  as.formula(paste("~", paste(theta_predictors, collapse = " + "), "- 1")),
+  data = n_strike_era_month_calib_scaled   # must have same standardised predictors
+)
+
+#Compute posterior mean theta per gridcell-month
+log_theta_pred <- as.numeric(gamma_0_mean + Z_fire %*% gamma_means)
+theta_pred     <- exp(log_theta_pred)
+
+#sample strike count using mu=r_strike*area and theta
+n_strike_era_month_calib_scaled <- n_strike_era_month_calib_scaled |>
+  mutate(
+    nb_theta         = theta_pred,
+    log_mu_pred      = log(pmax(mu_r_strike_gridcell, 1e-8)),
+    n_strikes = rnbinom(n    = n(),
+                                 mu   = mu_r_strike_gridcell,
+                                 size = nb_theta)
+  )
+
+```
+
+
+
+Compare predictions
+
+### Note: when plotting strike counts for calibration period (trace_month_calib and era_month_calib) training period (era_summer_modern), the gridcell areas area differnt - trace grid is coarser, which will result in much larger strike count estimates. 
+```{r}
+hist(era_summer_modern$n_strikes_obs, main = "ERA5 training period observed n_strikes")
+hist(era_summer_modern$n_strikes, main = "ERA5 training period predicted n_strikes")
+hist(n_strike_era_month_calib_scaled$n_strikes, main = "ERA5 calibration period simulated n_strikes")
+hist(n_strike_trace_month_calib_scaled$n_strikes, main = "TRACE calibration period simulated n_strikes")
+
+summary(era_summer_modern$n_strikes_obs)
+summary(era_summer_modern$n_strikes)
+summary(n_strike_era_month_calib_scaled$n_strikes)
+summary(n_strike_trace_month_calib_scaled$n_strikes)
+
+# ── Standardize each dataframe to year + r_strike + dataset label ────────────
+
+era_obs_modern_df <- era_summer_modern %>%
+  dplyr::select(year, n_strikes = n_strikes_obs) %>%
+  mutate(dataset = "ERA5 (observed, 2002-2011)")
+
+era_pred_modern_df <- era_summer_modern %>%
+  dplyr::select(year, n_strikes) %>%
+  mutate(dataset = "ERA5 (predicted, 2002-2011)")
+
+era_calib_df <- n_strike_era_month_calib_scaled %>%
+  dplyr::select(year, n_strikes) %>%
+  mutate(dataset = "ERA5 (calibration)")
+
+trace_calib_df <- n_strike_trace_month_calib_scaled %>%
+  dplyr::select(year, n_strikes) %>%
+  mutate(dataset = "TraCE (calibration)")
+
+# ── Combine and drop the 1990-2001 gap between calibration and modern periods ─
+
+combined <- bind_rows(era_obs_modern_df, era_pred_modern_df, era_calib_df, trace_calib_df) %>%
+  filter(!(year >= 1990 & year <= 2001))
+
+#must look at total strike count across alaska because era5 gridcell sizes differ from trace. 
+
+# ── Annual total per dataset ────────────────────────────────────────────
+
+annual_summary <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    sum_n_strikes = sum(n_strikes, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ── Plot ───────────────────────────────────────────────────────────────────────
+
+ggplot(annual_summary, aes(x = year, y = sum_n_strikes, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(
+    x = "Year", y = "Total n_strikes (± SD)", color = NULL,
+    title = "Annual total lightning strike count: observed vs. bias-corrected calibration"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+nrow(n_strike_trace_month_calib_scaled)
+n_strike_trace_month_calib_scaled <- na.omit(n_strike_trace_month_calib_scaled)
+nrow(n_strike_trace_month_calib_scaled)
+```
+
+
+
+#add urban and road proximity - all 0 for paleo period
+#use training period values for calibration period
+```{r}
+# # Add suppression predictors — all zero for paleoclimate (no roads/urban areas)
+era_month_calib$road_proximity_binary  <- 0L
+era_month_calib$urban_proximity_binary <- 0L
+
+trace_month_calib$road_proximity_binary  <- 0L
+trace_month_calib$urban_proximity_binary <- 0L
+
+#--- OR ---
+
+# #calculations baased on modern data, 2002-2011:
+# proximity_df <- read.csv(file.path(proximity_data_root, "era5_proximity_road_river_urban.csv"))
+# 
+# #Getting this to the trace grid will be a little weird. Get mean distance, then calculate binary outcome. 
+# nn <- get.knnx(data = trace_cells[, c("lon", "lat")],
+#                query = proximity_df[, c("lon", "lat")], k = 1)
+# 
+# proximity_df$trace_lon <- trace_cells$lon[nn$nn.index]
+# proximity_df$trace_lat <- trace_cells$lat[nn$nn.index]
+# 
+# # Aggregate ERA5 to TraCE grid cells, by year
+# proximity_df <- proximity_df %>%
+#   dplyr::select(-lat, -lon) %>%
+#   rename(lat = trace_lat, lon = trace_lon)
+# 
+# # aggregating within lat/lon/year/month
+# proximity_df <- proximity_df %>%
+#   dplyr::select(lon, lat, dist_road_km, dist_river_km, dist_urban_km) %>%
+#   group_by(lat, lon) %>%
+#   summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") %>%
+#   #Calef et al. (2008) - effects of fire suppression drop off after 40 km from a road and 30 km from an  urban area
+#   mutate(road_proximity_binary = ifelse(dist_road_km > 40, 0, 1),
+#            urban_proximity_binary = ifelse(dist_urban_km > 30, 0, 1))
+# 
+# proximity_df  %>% count(lat, lon) %>% filter(n > 1) %>% nrow()   # should now be 0
+# 
+# proximity_df <- proximity_df %>%
+#   mutate(lat = round(lat, 4), lon = round(lon, 4))
+# 
+# #bind with calib trace and era
+# trace_month_calib <- trace_month_calib %>%
+#   mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+#   left_join(
+#     proximity_df %>% dplyr::select(lat, lon, road_proximity_binary, urban_proximity_binary),
+#     by = c("lat", "lon")
+#   )
+# 
+# era_month_calib <- era_month_calib %>%
+#   mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+#   left_join(
+#     proximity_df %>% dplyr::select(lat, lon, road_proximity_binary, urban_proximity_binary),
+#     by = c("lat", "lon")
+#   )
+
+```
+
+Add broadleaf to ERA5
+```{r}
+broadleaf_df <- read.csv(file.path(drivers_root, "lightning_fires_burned_area_jja_2002_2011.csv"))
+
+broadleaf_df_era <- broadleaf_df %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  group_by(lat, lon) %>%
+  summarise(B = mean(B, na.rm = TRUE), .groups = "drop")
+
+# Confirm no duplicates remain before joining
+broadleaf_df_era %>% count(lat, lon) %>% filter(n > 1) %>% nrow()   # should be 0
+
+era_month_calib <- era_month_calib %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  left_join(
+    broadleaf_df_era,
+    by = c("lat", "lon")
+  )
+
+era_month_calib %>% count(lat, lon, year, month) %>% filter(n > 1) %>% nrow()   # should be 0
+nrow(era_month_calib)   # should drop back down to 543783
+```
+
+```{r}
+#---TRACE----
+
+#Getting this to the trace grid will be a little weird. Get mean distance, then calculate binary outcome. 
+nn <- get.knnx(data = trace_cells[, c("lon", "lat")],
+               query = broadleaf_df[, c("lon", "lat")], k = 1)
+
+broadleaf_df$trace_lon <- trace_cells$lon[nn$nn.index]
+broadleaf_df$trace_lat <- trace_cells$lat[nn$nn.index]
+
+#aggregate to Trace cells
+broadleaf_df <- broadleaf_df %>%
+  dplyr::select(-lat, -lon) %>%
+  rename(lat = trace_lat, lon = trace_lon)
+
+# aggregating within lat/lon/year/month
+broadleaf_df <- broadleaf_df %>%
+  group_by(lat, lon) %>%
+  summarise(across(where(is.numeric), mean, na.rm = TRUE), .groups = "drop") 
+
+broadleaf_df  %>% count(lat, lon) %>% filter(n > 1) %>% nrow()   # should now be 0
+
+broadleaf_df <- broadleaf_df %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4))
+
+#bind with calib trace and era
+trace_month_calib <- trace_month_calib %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  left_join(
+    broadleaf_df %>% dplyr::select(lat, lon, B),
+    by = c("lat", "lon")
+  )
+
+
+```
+
+
+##########################################
+##### IGNITION EFFICINCY (p_ignite) #####
+##########################################
+
+Y ~ Binomial(n, p_ignite) --> technically, this is applied in the next step, to estimate fire count.
+
+logit(p_ignite) = alpha + X * beta
+
+alpha ~ normal(mu_alpha, sigma_alpha)
+beta  ~ normal(0, sigma_beta)
+
+p_ignite_corrected = plogis(qlogis(pie) + cal_shift)
+
+p_ignite: probability of 1 strike resulting in an ignition in a given gridcell and month. 
+X: average precipitation rate, temperature, relative humidity, cumulative precipitation for the previous 1, 2, 3 months, and 5 years, mean temperature for the previous 1, 2, 3 months, and 5 years, and % broadleaf cover. 
+
+Ignition efficiency for TRACE calibration period:
+```{r}
+#standardize:
+ignition_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_ignition_predictors.csv"))
+
+# Helper function: look up mu and sigma by variable name
+get_mu    <- function(var) ignition_mu_sigma$mu[ignition_mu_sigma$var == var]
+get_sigma <- function(var) ignition_mu_sigma$sigma[ignition_mu_sigma$var == var]
+
+ignition_trace_month_calib_scaled <- trace_month_calib |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh"),
+    precip_1m = (precip_1m - get_mu("precip_1m")) / get_sigma("precip_1m"),
+    precip_2m   = (precip_2m   - get_mu("precip_2m"))   / get_sigma("precip_2m"),
+    precip_3m   = (precip_3m   - get_mu("precip_3m"))   / get_sigma("precip_3m"),
+    precip_5y     = (precip_5y     - get_mu("precip_5y"))     / get_sigma("precip_5y"),
+    tair_1m = (tair_1m - get_mu("tair_1m")) / get_sigma("tair_1m"),
+    tair_2m   = (tair_2m   - get_mu("tair_2m"))   / get_sigma("tair_2m"),
+    tair_3m   = (tair_3m   - get_mu("tair_3m"))   / get_sigma("tair_3m"),
+    tair_5y     = (tair_5y     - get_mu("tair_5y"))     / get_sigma("tair_5y"),
+    B     = (B     - get_mu("B"))     / get_sigma("B")
+  )
+
+#Bayes recalibrated
+# ── Load calibrated Bayesian model ────────────────────────────────────────────
+ignition_bayes_obj <- readRDS(file.path(rds_root, 
+                                    "Ignition_Efficiency/m2_bayes_calibrated.rds")) #comment out when rerunning - takes a while to load
+ignition_bayes_fit <- ignition_bayes_obj$fit        # stanfit object
+cal_shift_bayes    <- ignition_bayes_obj$cal_shift  # intercept shift
+coef_means         <- ignition_bayes_obj$coef_means # posterior mean alpha and beta
+
+cat("Bayesian calibration shift:", round(cal_shift_bayes, 3), "\n")
+
+# ── Build predictor matrix from standardised data ─────────────────────────────
+predictors_m2 <- c("rh", "tair", "precip",
+                    "precip_1m", "precip_2m", "precip_3m",
+                    "precip_5y", "tair_1m", "tair_2m",
+                    "tair_3m", "tair_5y", "B")
+
+X_new <- model.matrix(
+  as.formula(paste("~", paste(predictors_m2, collapse = " + "), "- 1")),
+  data = ignition_trace_month_calib_scaled
+)
+
+# ── Generate predictions using posterior mean ─────────────────────────────────
+alpha_mean <- coef_means$alpha
+beta_means <- coef_means$beta
+
+eps <- 1e-8
+
+linpred <- as.numeric(alpha_mean + X_new %*% beta_means)
+
+ignition_trace_month_calib_scaled <- ignition_trace_month_calib_scaled |>
+  mutate(
+    #inverse_logit of linear predictor, linpred
+    p_ignite_bayes     = plogis(linpred),
+    #add calibration shift 
+    p_ignite_bayes_cal = plogis(pmin(pmax(linpred + cal_shift_bayes,     #pmin and pmax make sure arguments in plogis from reaching infinity
+                                           log(eps / (1 - eps))),
+                                      log((1 - eps) / eps)))
+  )
+
+# Note: adding cal_shift directly to the linear predictor (before plogis)
+# is equivalent to plogis(qlogis(p) + cal_shift) but avoids the
+# double transformation and is numerically more stable
+
+ignition_trace_month_calib_scaled <- ignition_trace_month_calib_scaled[, c("lat", "lon", "year", "month", "p_ignite_bayes_cal")]
+
+ignition_trace_month_calib_scaled <- ignition_trace_month_calib_scaled %>% dplyr::rename(p_ignite = p_ignite_bayes_cal)
+
+#add monthly ignition probability, p_ignite, to fire df
+trace_month_calib <- trace_month_calib %>%
+  left_join(
+    ignition_trace_month_calib_scaled %>% dplyr::select(lat, lon, year, month, p_ignite),
+    by = c("lat", "lon", "year", "month"))
+
+```
+
+
+Ignition efficiency for ERA5 calibration period:
+```{r}
+#standardize:
+ignition_era_month_calib_scaled <- era_month_calib |>
+  mutate(
+    precip = (precip - get_mu("precip")) / get_sigma("precip"),
+    tair   = (tair   - get_mu("tair"))   / get_sigma("tair"),
+    wind   = (wind   - get_mu("wind"))   / get_sigma("wind"),
+    rh     = (rh     - get_mu("rh"))     / get_sigma("rh"),
+    precip_1m = (precip_1m - get_mu("precip_1m")) / get_sigma("precip_1m"),
+    precip_2m   = (precip_2m   - get_mu("precip_2m"))   / get_sigma("precip_2m"),
+    precip_3m   = (precip_3m   - get_mu("precip_3m"))   / get_sigma("precip_3m"),
+    precip_5y     = (precip_5y     - get_mu("precip_5y"))     / get_sigma("precip_5y"),
+    tair_1m = (tair_1m - get_mu("tair_1m")) / get_sigma("tair_1m"),
+    tair_2m   = (tair_2m   - get_mu("tair_2m"))   / get_sigma("tair_2m"),
+    tair_3m   = (tair_3m   - get_mu("tair_3m"))   / get_sigma("tair_3m"),
+    tair_5y     = (tair_5y     - get_mu("tair_5y"))     / get_sigma("tair_5y"),
+    B     = (B     - get_mu("B"))     / get_sigma("B")
+  )
+
+
+# ── Build predictor matrix from standardised data ─────────────────────────────
+predictors_m2 <- c("rh", "tair", "precip",
+                    "precip_1m", "precip_2m", "precip_3m",
+                    "precip_5y", "tair_1m", "tair_2m",
+                    "tair_3m", "tair_5y", "B")
+
+# X_new <- model.matrix(
+#   as.formula(paste("~", paste(predictors_m2, collapse = " + "), "- 1")),
+#   data = ignition_era_month_calib_scaled
+# )
+#faster
+X_new <- as.matrix(ignition_era_month_calib_scaled[, predictors_m2])
+
+# ── Generate predictions using posterior mean ─────────────────────────────────
+alpha_mean <- coef_means$alpha
+beta_means <- coef_means$beta
+
+eps <- 1e-8
+
+linpred <- as.numeric(alpha_mean + X_new %*% beta_means)
+
+ignition_era_month_calib_scaled <- ignition_era_month_calib_scaled |>
+  mutate(
+    #inverse_logit of linear predictor, linpred
+    p_ignite_bayes     = plogis(linpred),
+    #add calibration shift 
+    p_ignite_bayes_cal = plogis(pmin(pmax(linpred + cal_shift_bayes,
+                                          log(eps / (1 - eps))),
+                                     log((1 - eps) / eps)))
+  )
+
+# Note: adding cal_shift directly to the linear predictor (before plogis)
+# is equivalent to plogis(qlogis(p) + cal_shift) but avoids the
+# double transformation and is numerically more stable
+
+ignition_era_month_calib_scaled <- ignition_era_month_calib_scaled[, c("lat", "lon", "year", "month", "p_ignite_bayes_cal")]
+
+ignition_era_month_calib_scaled <- ignition_era_month_calib_scaled %>% dplyr::rename(p_ignite = p_ignite_bayes_cal)
+
+#add monthly ignition probability, p_ignite, to fire df
+era_month_calib <- era_month_calib %>%
+  left_join(
+    ignition_era_month_calib_scaled %>% dplyr::select(lat, lon, year, month, p_ignite),
+    by = c("lat", "lon", "year", "month"))
+
+```
+
+##### RATE CALIBRATION SHIFT FOR P_IGNITE ##### 
+
+TRACE calibration period:
+```{r}
+
+rate_cal_shift <- readRDS(file.path(rds_root, "Ignition_Efficiency/calibration_shifts.rds"))$rate_cal_shift
+
+eps <- 1e-8
+
+trace_month_calib <- trace_month_calib |>
+  mutate(
+    p_ignite_rate_cal = plogis(
+      qlogis(pmin(pmax(p_ignite, eps), 1 - eps)) + rate_cal_shift
+    )
+  )
+```
+
+ERA5 calibration period:
+```{r}
+era_month_calib <- era_month_calib |>
+  mutate(
+    p_ignite_rate_cal = plogis(
+      qlogis(pmin(pmax(p_ignite, eps), 1 - eps)) + rate_cal_shift
+    )
+  )
+```
+
+Compare predictions
+```{r}
+# era_summer_modern <- era_summer_modern %>%
+#   mutate(p_ignite_obs = ifelse(as.numeric(n_strikes_obs)==0, 0, as.numeric(fire_count)/as.numeric(n_strikes_obs)))
+
+#hist(era_summer_modern$p_ignite_obs, main = "ERA5 training period observed p_ignite") 
+hist(era_summer_modern$p_ignite_rate_cal, main = "ERA5 training period predicted p_ignite")
+hist(era_month_calib$p_ignite_rate_cal, main = "ERA5 calibration period simulated p_ignite")
+hist(trace_month_calib$p_ignite_rate_cal, main = "TRACE calibration period simulated p_ignite")
+
+#summary(era_summer_modern$p_ignite_obs)
+summary(era_summer_modern$p_ignite_rate_cal)
+summary(era_month_calib$p_ignite_rate_cal)
+summary(trace_month_calib$p_ignite_rate_cal)
+
+# ── Standardize each dataframe to year + r_strike + dataset label ────────────
+# 
+# era_obs_modern_df <- era_summer_modern %>%
+#   dplyr::select(year, p_ignite_obs) %>%
+#   mutate(dataset = "ERA5 (observed, 2002-2011)")
+
+era_pred_modern_df <- era_summer_modern %>%
+  dplyr::select(year, p_ignite_rate_cal) %>%
+  mutate(dataset = "ERA5 (predicted, 2002-2011)")
+
+era_calib_df <- era_month_calib %>%
+  dplyr::select(year, p_ignite_rate_cal) %>%
+  mutate(dataset = "ERA5 (calibration)")
+
+trace_calib_df <- trace_month_calib %>%
+  dplyr::select(year, p_ignite_rate_cal) %>%
+  mutate(dataset = "TraCE (calibration)")
+
+# ── Combine and drop the 1990-2001 gap between calibration and modern periods ─
+
+combined <- bind_rows(era_obs_modern_df, era_pred_modern_df, era_calib_df, trace_calib_df) %>%
+  filter(!(year >= 1990 & year <= 2001))
+
+# ── Annual mean and ci per dataset ────────────────────────────────────────────
+
+annual_summary <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    mean_p_ignite_rate_cal = mean(p_ignite_rate_cal, na.rm = TRUE),
+    ci_low        = quantile(p_ignite_rate_cal, 0.05, na.rm = TRUE),
+    ci_high       = quantile(p_ignite_rate_cal, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ── Plot ───────────────────────────────────────────────────────────────────────
+
+ggplot(annual_summary, aes(x = year, y = mean_p_ignite_rate_cal, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = ci_low, ymax = ci_high),
+    width = 0.3, alpha = 0.5
+  ) +
+  labs(
+    x = "Year", y = "Mean p_ignite (± SD)", color = NULL,
+    title = "Annual lightning ignition efficiency: observed vs. bias-corrected calibration"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+##########################################
+#####     BURNED AREA | 1 ignition  #####
+##########################################
+
+Burned_area ~ Gamma(theta, theta/mu)
+
+log(mu) = alpha + alpha_year + X * beta
+
+alpha ~ Normal(0, sigma^2_alpha)
+beta ~ Normal(0, sigma^2_beta)
+theta ~ Exponential(1)
+alpha_year ~ Normal(0, sigma^2_year)
+sigma^2_year ~ Exponential(1)
+
+
+Burned_area: area of 1 lightning-caused ignition (km2)
+X: Relative humidity, temperature, precipitation, wind, cumulative precipitation for the previous 1, 3 months, and 5 years, mean temperature for the previous 2 months and 5 years, proximity to urban area (binary; 1 = within 40 km of an urban area), proximity to road (binary; 1 = within 40 km of an major road)
+alpha_year: year random affect
+
+Apply burned area model to TRACE calibration period
+```{r}
+#standardize:
+burned_area_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_burned_area_predictors.csv"))
+
+# Helper function: look up mu and sigma by variable name
+get_mu    <- function(var) burned_area_mu_sigma$mu[burned_area_mu_sigma$var == var]
+get_sigma <- function(var) burned_area_mu_sigma$sigma[burned_area_mu_sigma$var == var]
+
+burned_area_trace_month_calib_scaled <- trace_month_calib |>
+  mutate(
+    rh        = (rh        - get_mu("rh"))        / get_sigma("rh"),
+    tair      = (tair      - get_mu("tair"))      / get_sigma("tair"),
+    precip    = (precip    - get_mu("precip"))    / get_sigma("precip"),
+    wind      = (wind      - get_mu("wind"))      / get_sigma("wind"),
+    precip_1m = (precip_1m - get_mu("precip_1m")) / get_sigma("precip_1m"),
+    precip_3m = (precip_3m - get_mu("precip_3m")) / get_sigma("precip_3m"),
+    precip_5y = (precip_5y - get_mu("precip_5y")) / get_sigma("precip_5y"),
+    tair_2m   = (tair_2m   - get_mu("tair_2m"))   / get_sigma("tair_2m"),
+    tair_5y   = (tair_5y   - get_mu("tair_5y"))   / get_sigma("tair_5y")
+  ) #no scaling for binary urban and road data.
+
+
+preds_final <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary")
+
+
+
+# ── Load model and extract posterior parameters ───────────────────────────────
+m6_obj     <- readRDS(file.path(rds_root, "Burned_Area/m6_bayes_gamma_re.rds"))
+m6_fit     <- m6_obj$fit           # stanfit object
+coef_means <- m6_obj$coef_means    # list: alpha, beta, alpha_year
+
+alpha_mean <- coef_means$alpha
+beta_means <- coef_means$beta
+
+cat("Global intercept (alpha):", round(alpha_mean, 3), "\n")
+cat("Year random effects:\n")
+print(round(coef_means$alpha_year, 3))
+
+# ── Build predictor matrix ────────────────────────────────────────────────────
+X_new <- model.matrix(
+  as.formula(paste("~", paste(preds_final, collapse = " + "), "- 1")),
+  data = burned_area_trace_month_calib_scaled
+)
+
+# ── Generate predictions ──────────────────────────────────────────────────────
+# Year random effects set to ZERO for new data (paleo or ERA5 application)
+# This represents "climatologically average year" — variation comes from
+# climate predictors only, not year-specific synoptic noise
+
+# ── Option A: posterior mean prediction (fast, point estimate) ────────────────
+linpred <- as.numeric(alpha_mean + X_new %*% beta_means)
+# alpha_year term is omitted — equivalent to setting it to 0
+
+burned_area_trace_month_calib_scaled <- burned_area_trace_month_calib_scaled |>
+  mutate(burned_area_pred = exp(linpred))
+
+# Extract posterior draws
+post <- rstan::extract(m6_fit)
+
+# ── Extract shape parameter (phi) from posterior ───────────────────────────────
+phi_mean <- mean(post$phi)
+phi_sd   <- sd(post$phi)
+
+cat("Gamma shape (phi) posterior mean:", round(phi_mean, 3), "\n")
+cat("Gamma shape (phi) posterior sd:  ", round(phi_sd, 3), "\n")
+
+# ── Add gamma_mean and gamma_shape columns to burned_area_scaled ──────────────
+burned_area_trace_month_calib_scaled <- burned_area_trace_month_calib_scaled |>
+  mutate(
+    gamma_mean  = burned_area_pred,   # mean (mu) per gridcell-month
+    gamma_shape = phi_mean             # shape (phi) — constant across rows
+  )
+
+# rgamma requires rate, not the mean. calculate this as:
+# rgamma(n, shape, rate) where rate = shape / mean
+burned_area_trace_month_calib_scaled$gamma_rate <- burned_area_trace_month_calib_scaled$gamma_shape / burned_area_trace_month_calib_scaled$gamma_mean
+
+```
+
+
+Apply burned area model to ERA5 calibration period
+```{r}
+
+burned_area_era_month_calib_scaled <- era_month_calib |>
+  mutate(
+    rh        = (rh        - get_mu("rh"))        / get_sigma("rh"),
+    tair      = (tair      - get_mu("tair"))      / get_sigma("tair"),
+    precip    = (precip    - get_mu("precip"))    / get_sigma("precip"),
+    wind      = (wind      - get_mu("wind"))      / get_sigma("wind"),
+    precip_1m = (precip_1m - get_mu("precip_1m")) / get_sigma("precip_1m"),
+    precip_3m = (precip_3m - get_mu("precip_3m")) / get_sigma("precip_3m"),
+    precip_5y = (precip_5y - get_mu("precip_5y")) / get_sigma("precip_5y"),
+    tair_2m   = (tair_2m   - get_mu("tair_2m"))   / get_sigma("tair_2m"),
+    tair_5y   = (tair_5y   - get_mu("tair_5y"))   / get_sigma("tair_5y")
+  ) #no scaling for binary urban and road data.
+
+
+preds_final <- c("rh", "tair", "precip", "wind",
+                 "precip_1m", "precip_3m", "precip_5y",
+                 "tair_2m", "tair_5y",
+                 "road_proximity_binary",
+                 "urban_proximity_binary")
+
+
+# ── Build predictor matrix ────────────────────────────────────────────────────
+# X_new <- model.matrix(
+#   as.formula(paste("~", paste(preds_final, collapse = " + "), "- 1")),
+#   data = burned_area_era_month_calib_scaled
+# )
+#faster:
+X_new <- as.matrix(burned_area_era_month_calib_scaled[, preds_final])
+
+# ── Generate predictions ──────────────────────────────────────────────────────
+# Year random effects set to ZERO for new data (paleo or ERA5 application)
+# This represents "climatologically average year" — variation comes from
+# climate predictors only, not year-specific synoptic noise
+
+# ── Option A: posterior mean prediction (fast, point estimate) ────────────────
+linpred <- as.numeric(alpha_mean + X_new %*% beta_means)
+# alpha_year term is omitted — equivalent to setting it to 0
+
+burned_area_era_month_calib_scaled <- burned_area_era_month_calib_scaled |>
+  mutate(burned_area_pred = exp(linpred))
+
+# Extract posterior draws
+post <- rstan::extract(m6_fit)
+
+# ── Extract shape parameter (phi) from posterior ───────────────────────────────
+phi_mean <- mean(post$phi)
+phi_sd   <- sd(post$phi)
+
+cat("Gamma shape (phi) posterior mean:", round(phi_mean, 3), "\n")
+cat("Gamma shape (phi) posterior sd:  ", round(phi_sd, 3), "\n")
+
+# ── Add gamma_mean and gamma_shape columns to burned_area_scaled ──────────────
+burned_area_era_month_calib_scaled <- burned_area_era_month_calib_scaled |>
+  mutate(
+    gamma_mean  = burned_area_pred,   # mean (mu) per gridcell-month
+    gamma_shape = phi_mean             # shape (phi) — constant across rows
+  )
+
+# rgamma requires rate, not the mean. calculate this as:
+# rgamma(n, shape, rate) where rate = shape / mean
+burned_area_era_month_calib_scaled$gamma_rate <- burned_area_era_month_calib_scaled$gamma_shape / burned_area_era_month_calib_scaled$gamma_mean
+
+```
+
+Compare predictions
+```{r}
+era_summer_modern <- era_summer_modern  |> mutate(gamma_mean = gamma_shape/gamma_rate)
+
+hist(era_summer_modern$burned_area_km2, main = "ERA5 training period observed burned area | 1 ignition") 
+hist(era_summer_modern$gamma_mean, main = "ERA5 training period predicted mean burned area | 1 ignition")
+hist(burned_area_era_month_calib_scaled$gamma_mean, main = "ERA5 calibration period simulated mean burned area | 1 ignition")
+hist(burned_area_trace_month_calib_scaled$gamma_mean, main = "TRACE calibration period simulated mean burned area | 1 ignition")
+
+summary(era_summer_modern$burned_area_km2)
+summary(era_summer_modern$gamma_mean)
+summary(burned_area_era_month_calib_scaled$gamma_mean)
+summary(burned_area_trace_month_calib_scaled$gamma_mean)
+
+# ── Standardize each dataframe to year + r_strike + dataset label ────────────
+
+era_obs_modern_df <- era_summer_modern %>%
+  filter(single_lightning_ignition==1) %>%
+  dplyr::select(year, gamma_mean = burned_area_km2) %>%
+  mutate(dataset = "ERA5 (observed, 2002-2011)")
+
+era_pred_modern_df <- era_summer_modern %>%
+  dplyr::select(year, gamma_mean) %>%
+  mutate(dataset = "ERA5 (predicted, 2002-2011)")
+
+era_calib_df <- burned_area_era_month_calib_scaled %>%
+  dplyr::select(year, gamma_mean) %>%
+  mutate(dataset = "ERA5 (calibration)")
+
+trace_calib_df <- burned_area_trace_month_calib_scaled %>%
+  dplyr::select(year, gamma_mean) %>%
+  mutate(dataset = "TraCE (calibration)")
+
+# ── Combine and drop the 1990-2001 gap between calibration and modern periods ─
+
+combined <- bind_rows(era_obs_modern_df, era_pred_modern_df, era_calib_df, trace_calib_df) %>%
+  filter(!(year >= 1990 & year <= 2001))
+
+# ── Annual mean per dataset ────────────────────────────────────────────
+
+annual_summary <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    mean_gamma_mean = mean(gamma_mean, na.rm = TRUE),
+    ci_low        = quantile(gamma_mean, 0.05, na.rm = TRUE),
+    ci_high       = quantile(gamma_mean, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ── Plot ───────────────────────────────────────────────────────────────────────
+
+ggplot(annual_summary, aes(x = year, y = mean_gamma_mean, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = ci_low, ymax = ci_high),
+    width = 0.3, alpha = 0.5
+  ) +
+  labs(
+    x = "Year", y = "Mean burned area | 1 ignition (± CI)", color = NULL,
+    title = "Annual burned area | 1 ignition: observed vs. bias-corrected calibration (mean predicted)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+##########################################
+#####         FIRE COUNT         #########
+##########################################
+
+fire_count | lightning = Binomial(n_strikes, p_ignite)
+
+For TRACE calibration period:
+```{r}
+#add monthly strike count, n_strikes, to fire df
+trace_month_calib <- trace_month_calib %>%
+  left_join(
+    n_strike_trace_month_calib_scaled %>% dplyr::select(lat, lon, year, month, n_strikes),
+    by = c("lat", "lon", "year", "month"))
+
+#Use strike_count and p_ingite to sample fire count from a binomial distribution
+trace_month_calib$fire_count_pred <- mapply(
+  function(n, p) rbinom(1, size = n, prob = p),
+  trace_month_calib$n_strikes,
+  trace_month_calib$p_ignite_rate_cal
+)   
+```
+
+For ERA5 calibration period:
+```{r}
+#add monthly strike count, n_strikes, to fire df
+era_month_calib <- era_month_calib %>%
+  left_join(
+    n_strike_era_month_calib_scaled %>% dplyr::select(lat, lon, year, month, n_strikes),
+    by = c("lat", "lon", "year", "month"))
+
+#Use strike_count and p_ingite to sample fire count from a binomial distribution
+valid <- !is.na(era_month_calib$n_strikes) & !is.na(era_month_calib$p_ignite_rate_cal)
+
+era_month_calib$fire_count_pred <- NA_real_
+
+era_month_calib$fire_count_pred[valid] <- rbinom(
+  n    = sum(valid),
+  size = era_month_calib$n_strikes[valid],
+  prob = era_month_calib$p_ignite_rate_cal[valid]
+)
+```
+
+Compare predictions
+```{r}
+hist(era_summer_modern$fire_count, main = "ERA5 training period observed fire count") 
+hist(era_summer_modern$fire_count_pred, main = "ERA5 training period predicted fire count")
+hist(era_month_calib$fire_count_pred, main = "ERA5 calibration period simulated fire count")
+hist(trace_month_calib$fire_count_pred, main = "TRACE calibration period simulated fire count")
+
+summary(era_summer_modern$fire_count)
+summary(era_summer_modern$fire_count_pred)
+summary(era_month_calib$fire_count_pred)
+summary(trace_month_calib$fire_count_pred)
+
+```
+
+Plot annual total fire count
+```{r}
+
+# ── Standardize each dataframe to year + outcome + dataset label ────────────
+
+era_obs_modern_df <- era_summer_modern %>%
+  dplyr::select(year, fire_count) %>%
+  mutate(dataset = "ERA5 (observed, 2002-2011)")
+
+era_pred_modern_df <- era_summer_modern %>%
+  dplyr::select(year, fire_count = fire_count_pred) %>%
+  mutate(dataset = "ERA5 (predicted, 2002-2011)")
+
+era_calib_df <- era_month_calib %>%
+  dplyr::select(year, fire_count = fire_count_pred) %>%
+  mutate(dataset = "ERA5 (calibration)")
+
+trace_calib_df <- trace_month_calib %>%
+  dplyr::select(year, fire_count = fire_count_pred) %>%
+  mutate(dataset = "TraCE (calibration)")
+
+# ── Combine and drop the 1990-2001 gap between calibration and modern periods ─
+
+combined <- bind_rows(era_obs_modern_df, era_pred_modern_df, era_calib_df, trace_calib_df) %>%
+  filter(!(year >= 1990 & year <= 2001))
+
+# ── Annual mean and ci per dataset ────────────────────────────────────────────
+
+annual_summary <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    annual_sum_fire_count = sum(fire_count),
+    .groups = "drop"
+  )
+
+
+ggplot(annual_summary, aes(x = year, y = annual_sum_fire_count, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_hline(
+    yintercept = 17,
+    linetype = "dashed",
+    linewidth = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = max(annual_summary$year) + 5,   # push past the right edge of the data
+    y = 17,
+    label = "1950-2024 NPS\naverage: 17 fires",  # \n wraps to a second line
+    hjust = 0,                           # left-align text starting at x
+    vjust = 0.5,
+    size = 3,
+    color = "black",
+    fontface = "italic"
+  ) +
+  labs(
+    x = "Year", y = "Fire count", color = NULL,
+    title = "Annual total fire count (across Alaska): observed vs. bias-corrected calibration"
+  ) +
+  #scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) +
+  scale_x_continuous(breaks = scales::breaks_pretty(n = 20)) +
+  coord_cartesian(clip = "off") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.margin = margin(t = 5.5, r = 80, b = 5.5, l = 5.5)  # extra right margin for the label
+  )
+
+#Does the NPS average count come close to simulations from ERA5 data over simiar period
+era_sim_fire_count <- sum(era_summer_modern$fire_count_pred) + sum(era_month_calib$fire_count_pred)
+n_years <- length(unique(era_summer_modern$year)) + length(unique(era_month_calib$year))
+
+avg_sim_fire_count <- era_sim_fire_count/n_years
+
+avg_sim_fire_count
+
+#add missing years for 1950-2024 period calculation:
+(20 + 25 + 30 + 40 + 10 + 25 + 25 + 30 + 10 + 15 + 20 + 10 + 20 + era_sim_fire_count) / (13 + n_years)
+
+#what about NPS average count compared with fire count simulated from Trace data?
+trace_sim_fire_count <- sum(as.numeric(na.omit(trace_month_calib$fire_count_pred)))
+n_years <- length(unique(trace_month_calib$year))
+
+avg_sim_trace_fire_count <- trace_sim_fire_count / n_years
+
+avg_sim_trace_fire_count
+```
+
+
+#####################################
+######### TOTAL BURNED AREA #########
+#####################################
+
+total_burned = rgamma(fire_count, burned_area_shape, burned_area_rate)
+
+Total burned area for TRACE calibration period:
+```{r}
+#add monthly burned area gamma parameters to fire df
+trace_month_calib <- trace_month_calib %>%
+  left_join(
+    burned_area_trace_month_calib_scaled %>% dplyr::select(lat, lon, year, month, gamma_shape, gamma_rate),
+    by = c("lat", "lon", "year", "month")
+  )
+
+#Use fire_count and burned area shape and rate estimates to simulate total burned area from the gamma distribution
+trace_month_calib$total_burned_area <- mapply(
+  function(fire_count, BA_shape, BA_rate) {
+    if (fire_count == 0 || is.na(fire_count)) return(0)
+    sum(rgamma(n = fire_count, shape = BA_shape, rate = BA_rate))
+  },
+  trace_month_calib$fire_count_pred,
+  trace_month_calib$gamma_shape,
+  trace_month_calib$gamma_rate
+)
+```
+
+Total burned area for ERA5 calibration period:
+```{r}
+#add monthly burned area gamma parameters to fire df
+era_month_calib <- era_month_calib %>%
+  left_join(
+    burned_area_era_month_calib_scaled %>% dplyr::select(lat, lon, year, month, gamma_shape, gamma_rate),
+    by = c("lat", "lon", "year", "month")
+  )
+
+#Use fire_count and burned area shape and rate estimates to simulate total burned area from the gamma distribution
+# era_month_calib$total_burned_area <- mapply(
+#   function(fire_count, BA_shape, BA_rate) {
+#     if (fire_count == 0 || is.na(fire_count)) return(0)
+#     sum(rgamma(n = fire_count, shape = BA_shape, rate = BA_rate))
+#   },
+#   era_month_calib$fire_count_pred,
+#   era_month_calib$gamma_shape,
+#   era_month_calib$gamma_rate
+# )
+#faster:
+n_rows <- nrow(era_month_calib)
+fc     <- era_month_calib$fire_count_pred
+shape  <- era_month_calib$gamma_shape
+rate   <- era_month_calib$gamma_rate
+
+# Only rows with a positive, non-NA fire count actually need any gamma draws
+valid_idx <- which(!is.na(fc) & fc > 0)
+
+# Repeat each valid row's index/shape/rate according to its fire_count,
+# so row i with fire_count = 3 contributes 3 entries to the expanded vectors
+rep_idx   <- rep(valid_idx, times = fc[valid_idx])
+rep_shape <- rep(shape[valid_idx], times = fc[valid_idx])
+rep_rate  <- rep(rate[valid_idx],  times = fc[valid_idx])
+
+# One single vectorized rgamma call for ALL fires across ALL rows at once
+samples <- rgamma(length(rep_idx), shape = rep_shape, rate = rep_rate)
+
+# Sum samples back up per original row (tapply groups by rep_idx)
+row_sums <- tapply(samples, rep_idx, sum)
+
+total_burned_area <- rep(0, n_rows)
+total_burned_area[as.integer(names(row_sums))] <- row_sums
+
+era_month_calib$total_burned_area <- total_burned_area
+```
+
+
+Compare predictions
+```{r}
+hist(era_summer_modern$burned_area_km2_total, main = "ERA5 training period observed total burned area") 
+hist(era_summer_modern$total_burned_area, main = "ERA5 training period predicted total burned area")
+hist(era_month_calib$total_burned_area, main = "ERA5 calibration period simulated total burned area")
+hist(trace_month_calib$total_burned_area, main = "TRACE calibration period simulated total burned area")
+
+summary(era_summer_modern$burned_area_km2_total)
+summary(era_summer_modern$total_burned_area)
+summary(era_month_calib$total_burned_area)
+summary(trace_month_calib$total_burned_area)
+
+# ── Standardize each dataframe to year + outcome + dataset label ────────────
+
+era_obs_modern_df <- era_summer_modern %>%
+  dplyr::select(year, total_burned_area = burned_area_km2_total) %>%
+  mutate(dataset = "ERA5 (observed, 2002-2011)")
+
+era_pred_modern_df <- era_summer_modern %>%
+  dplyr::select(year, total_burned_area) %>%
+  mutate(dataset = "ERA5 (predicted, 2002-2011)")
+
+era_calib_df <- era_month_calib %>%
+  dplyr::select(year, total_burned_area) %>%
+  mutate(dataset = "ERA5 (calibration)")
+
+trace_calib_df <- trace_month_calib %>%
+  dplyr::select(year, total_burned_area) %>%
+  mutate(dataset = "TraCE (calibration)")
+
+# ── Combine and drop the 1990-2001 gap between calibration and modern periods ─
+
+combined <- bind_rows(era_obs_modern_df, era_pred_modern_df, era_calib_df, trace_calib_df) %>%
+  filter(!(year >= 1990 & year <= 2001))
+
+# ── Annual total by dataset ────────────────────────────────────────────
+
+annual_summary <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    annual_sum_total_burned_area = sum(total_burned_area, na.rm = TRUE),
+  )
+
+# ── Plot ───────────────────────────────────────────────────────────────────────
+
+ggplot(annual_summary, aes(x = year, y = annual_sum_total_burned_area, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(
+    x = "Year", y = "Annual total burned area (across Alaska)", color = NULL,
+    title = "Annual total burned area (across Alaska): observed vs. bias-corrected calibration"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+# ggplot(era_summer_modern, aes(x=year, y=burned_area_km2_total, col=as.factor(month))) + geom_point()
+# ggplot(era_summer_modern, aes(x=year, y=total_burned_area, col=as.factor(month))) + geom_point()
+# ggplot(era_month_calib, aes(x=year, y=total_burned_area, col=as.factor(month))) + geom_point()
+# ggplot(trace_month_calib, aes(x=year, y=total_burned_area, col=as.factor(month))) + geom_point()
+```
+
+
+Plot annual total acres burned
+```{r}
+era_summer_modern <- era_summer_modern %>%
+  mutate(total_obs_burned_area_acres = burned_area_km2_total * 247.105,
+         total_pred_burned_area_acres = total_burned_area * 247.105)
+
+era_month_calib <- era_month_calib %>%
+  mutate(total_burned_area_acres = total_burned_area * 247.105)
+
+trace_month_calib <- trace_month_calib %>%
+  mutate(total_burned_area_acres = total_burned_area * 247.105)
+
+
+# ── Standardize each dataframe to year + outcome + dataset label ────────────
+
+era_obs_modern_df <- era_summer_modern %>%
+  filter(lightning_ignition==1) %>%
+  dplyr::select(year, total_burned_area = total_obs_burned_area_acres) %>%
+  mutate(dataset = "ERA5 (observed, 2002-2011)")
+
+era_pred_modern_df <- era_summer_modern %>%
+  dplyr::select(year, total_burned_area = total_pred_burned_area_acres) %>%
+  mutate(dataset = "ERA5 (predicted, 2002-2011)")
+
+era_calib_df <- era_month_calib %>%
+  dplyr::select(year, total_burned_area = total_burned_area_acres) %>%
+  mutate(dataset = "ERA5 (calibration)")
+
+trace_calib_df <- trace_month_calib %>%
+  dplyr::select(year, total_burned_area = total_burned_area_acres) %>%
+  mutate(dataset = "TraCE (calibration)")
+
+# ── Combine and drop the 1990-2001 gap between calibration and modern periods ─
+
+combined <- bind_rows(era_obs_modern_df, era_pred_modern_df, era_calib_df, trace_calib_df) %>%
+  filter(!(year >= 1990 & year <= 2001))
+
+
+annual_summary <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    annual_sum_total_burned_area = sum(total_burned_area),
+    .groups = "drop"
+  )
+
+obs_train_total    <- sum(era_summer_modern$total_obs_burned_area_acres, na.rm = TRUE)
+pred_train_total   <- sum(era_summer_modern$total_pred_burned_area_acres, na.rm = TRUE)
+era_calib_total    <- sum(era_month_calib$total_burned_area_acres, na.rm = TRUE)
+trace_calib_total  <- sum(trace_month_calib$total_burned_area_acres, na.rm = TRUE)
+
+totals_df <- tibble(
+  dataset = c(
+    "ERA5 (observed, 2002-2011)",
+    "ERA5 (predicted, 2002-2011)",
+    "ERA5 (calibration)",
+    "TraCE (calibration)"
+  ),
+  total_acres = c(obs_train_total, pred_train_total, era_calib_total, trace_calib_total)) %>%
+  mutate(
+    label = paste0(dataset, ": ", comma(round(total_acres)), " acres"),
+    # Stack labels vertically so they don't overlap - adjust y_rank spacing as needed
+    y_pos = 10^(7 - 0.4 * (row_number() - 1))
+  )
+
+ggplot(annual_summary, aes(x = year, y = annual_sum_total_burned_area, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_hline(
+    yintercept = 42790,
+    linetype = "dashed",
+    linewidth = 1,
+    color = "black"
+  ) +
+  annotate(
+    "text",
+    x = max(annual_summary$year) + 5,   # push past the right edge of the data
+    y = 42790,
+    label = "1950-2024 NPS\naverage: 42,790 acres",  # \n wraps to a second line
+    hjust = 0,                           # left-align text starting at x
+    vjust = 0.5,
+    size = 3,
+    color = "black",
+    fontface = "italic"
+  ) +
+  labs(
+    x = "Year", y = "Burned area (acres)", color = NULL,
+    title = "Annual total burned area (across Alaska): observed vs. bias-corrected calibration"
+  ) +
+  scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) +
+  scale_x_continuous(breaks = scales::breaks_pretty(n = 20)) +
+  coord_cartesian(clip = "off") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    plot.margin = margin(t = 5.5, r = 80, b = 5.5, l = 5.5)  # extra right margin for the label
+  )
+```
+
+
+Compare with plot from: https://www.nps.gov/locations/alaska/alaska-wildfire-summary.htm
+"yearly average of 17 fires and ... yearly average of 42,790 NPS acres burned. Yearly averages are calculated using data from 1950-2024"
+
+```{r}
+trace_month_calib <- trace_month_calib %>% dplyr::select(-midpoint)
+colnames(trace_month_calib)[colSums(is.na(trace_month_calib)) > 0]
+trace_month_calib %>%
+  filter(is.na(r_strike))
+
+trace_month_calib <- trace_month_calib %>% filter(year<1990)
+
+#make era_month_calib match year range:
+era_month_calib <- era_month_calib %>% filter(year<1990)
+```
+
+Compare calibration period predicitons with observations of lightning-caused fire:
+```{r}
+calib_obs <- read.csv(file.path(modern_fire_stats_root, "alaska_lightning_fires_1950_1989.csv"))
+#for percents, 0.12 = 12%
+str(calib_obs)
+
+
+```
+
+Summaries for each dataset
+```{r}
+
+# ── Standardize each dataframe to year + outcome + dataset label ────────────
+
+#make sure the modern observed data consists of only lightning-casued burned area, then convert to acres:
+era_summer_modern <- era_summer_modern %>%
+  mutate(
+    lightning_burned_area_km2_total   = ifelse(lightning_ignition == 1, burned_area_km2_total, 0),
+    lightning_burned_area_acres_total = ifelse(lightning_ignition == 1, total_obs_burned_area_acres, 0)
+  )
+
+obs_modern_df <- era_summer_modern %>%
+  dplyr::select(year, 
+                r_strike = r_strike_obs,
+                n_strikes = n_strikes_obs,
+                fire_count,
+                total_burned_km2 = lightning_burned_area_km2_total, 
+                total_burned_acres = lightning_burned_area_acres_total) %>%
+  mutate(dataset = "Observed, 2002-2011")
+
+era_pred_modern_df <- era_summer_modern %>%
+  dplyr::select(year, 
+                r_strike,
+                n_strikes,
+                fire_count = fire_count_pred,
+                total_burned_km2 = total_burned_area,
+                total_burned_acres = total_pred_burned_area_acres) %>%
+  mutate(dataset = "ERA5 predicted, 2002-2011")
+
+obs_calib_df <- calib_obs %>%
+  mutate(r_strike = NA, n_strikes = NA, total_burned_km2 = burned_acres/247.105) %>%
+  dplyr::select(year, 
+                r_strike, 
+                n_strikes,
+                fire_count,
+                total_burned_km2,
+                total_burned_acres = burned_acres) %>%
+  mutate(dataset = "Observed, 1949-1989")
+
+trace_calib_df <- trace_month_calib %>%
+  dplyr::select(year, 
+                r_strike,
+                n_strikes,
+                fire_count = fire_count_pred,
+                total_burned_km2 = total_burned_area,
+                total_burned_acres = total_burned_area_acres) %>%
+  mutate(dataset = "TraCE predicted, 1949-1989")
+
+era_calib_df <- era_month_calib %>%
+  dplyr::select(year, 
+                r_strike,
+                n_strikes,
+                fire_count = fire_count_pred,
+                total_burned_km2 = total_burned_area,
+                total_burned_acres = total_burned_area_acres) %>%
+  mutate(dataset = "ERA5 predicted, 1949-1989")
+
+era_calib_df <- na.omit(era_calib_df)
+
+# ── Combine and drop the 1990-2001 gap between calibration and modern periods ─
+
+combined <- bind_rows(obs_modern_df, era_pred_modern_df, obs_calib_df, era_calib_df, trace_calib_df) %>%
+  filter(!(year >= 1990 & year <= 2001))
+
+#calculate summaries
+annual_summary <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    annual_sum_n_strikes = sum(n_strikes),
+    annual_sum_fire_count = sum(fire_count),
+    annual_sum_total_burned_km2 = sum(total_burned_km2),
+    annual_sum_total_burned_acres = sum(total_burned_acres),
+    .groups = "drop"
+  )
+
+ggplot(annual_summary, aes(x = year, y = annual_sum_fire_count, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(
+    x = "Year", y = "Fire count", color = NULL,
+    title = "Annual total fire count (across Alaska): training vs correction period"
+  ) +
+  #scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) +
+  scale_x_continuous(breaks = scales::breaks_pretty(n = 20)) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggplot(annual_summary, aes(x = year, y = annual_sum_total_burned_acres, color = dataset)) +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(
+    x = "Year", y = "Burned acres", color = NULL,
+    title = "Annual total burned acres (across Alaska): training vs correction period"
+  ) +
+  scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) +
+  scale_x_continuous(breaks = scales::breaks_pretty(n = 20)) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+#-----period mean annual total-----
+
+#n years in each dataset
+n_years_train <- length(unique(era_summer_modern$year))
+n_years_calib_era <- length(unique(era_month_calib$year))
+n_years_calib_trace <- length(unique(trace_month_calib$year))
+n_years_calib_obs <- length(unique(calib_obs$year))
+
+combined_train <- bind_rows(obs_modern_df, era_pred_modern_df)
+
+avg_count_train <- combined_train %>%
+  group_by(dataset) %>%
+  summarise(
+    avg_annual_n_strikes = sum(n_strikes)/n_years_train,
+    avg_annual_fire_count = sum(fire_count)/n_years_train,
+    avg_annual_total_burned_km2 = sum(total_burned_km2)/n_years_train,
+    avg_annual_total_burned_acres = sum(total_burned_acres)/n_years_train,
+    .groups = "drop"
+  )
+
+avg_count_calib_era <- era_calib_df %>%
+  group_by(dataset) %>%
+  summarise(
+    avg_annual_n_strikes = sum(n_strikes)/n_years_calib_era,
+    avg_annual_fire_count = sum(fire_count)/n_years_calib_era,
+    avg_annual_total_burned_km2 = sum(total_burned_km2)/n_years_calib_era,
+    avg_annual_total_burned_acres = sum(total_burned_acres)/n_years_calib_era,
+    .groups = "drop"
+  )
+
+avg_count_calib_trace <- trace_calib_df %>%
+  group_by(dataset) %>%
+  summarise(
+    avg_annual_n_strikes = sum(n_strikes)/n_years_calib_trace,
+    avg_annual_fire_count = sum(fire_count)/n_years_calib_trace,
+    avg_annual_total_burned_km2 = sum(total_burned_km2)/n_years_calib_trace,
+    avg_annual_total_burned_acres = sum(total_burned_acres)/n_years_calib_trace,
+    .groups = "drop"
+  )
+
+avg_count_calib_obs <- obs_calib_df %>%
+  group_by(dataset) %>%
+  summarise(
+    avg_annual_n_strikes = sum(n_strikes)/n_years_calib_obs,
+    avg_annual_fire_count = sum(fire_count)/n_years_calib_obs,
+    avg_annual_total_burned_km2 = sum(total_burned_km2)/n_years_calib_obs,
+    avg_annual_total_burned_acres = sum(total_burned_acres)/n_years_calib_obs,
+    .groups = "drop"
+  )
+
+rbind(avg_count_train, avg_count_calib, avg_count_calib_obs)
+
+#--------------
+#compare spreads
+#--------------
+
+#remove rows with 0 observations - the 1949-1989 observational data does not include days with no fire. So, so sum across each year and dataset:
+
+combined <- combined %>%
+  group_by(dataset, year) %>%
+  summarise(
+    strike_rate = sum(r_strike),
+    strike_count = sum(n_strikes), 
+    fire_count = sum(fire_count),
+    total_burned_acres = sum(total_burned_acres),
+    .groups = "drop"
+  )
+
+ggplot(data=combined, aes(x=dataset, y=fire_count)) + geom_boxplot() +theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) 
+ggplot(data=combined, aes(x=dataset, y=total_burned_acres)) + geom_boxplot() +theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) 
+
+combined <- combined %>%
+  mutate(
+    decade = case_when(
+      year >= 1950 & year <= 1959 ~ "1950-1959",
+      year >= 1960 & year <= 1969 ~ "1960-1969",
+      year >= 1970 & year <= 1979 ~ "1970-1979",
+      year >= 1980 & year <= 1989 ~ "1980-1989",
+      year >= 2002 & year <= 2011 ~ "2002-2011",
+      TRUE ~ NA_character_
+    ),
+    decade = factor(decade, levels = c("1950-1959", "1960-1969", "1970-1979",
+                                        "1980-1989", "2002-2011"))
+  )
+
+# Drop any rows that didn't fall into one of the five decade bins
+# (e.g. stray years outside your two labeled periods)
+combined_decades <- combined %>% filter(!is.na(decade))
+
+# ── Strike rate ─────────────────────────────────────────────────────────────
+ggplot(combined_decades, aes(x = decade, y = strike_rate, fill = dataset)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+  scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) +
+  labs(x = "Decade", y = "Strike rate", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom")
+
+# ── Strike count ─────────────────────────────────────────────────────────────
+ggplot(combined_decades, aes(x = decade, y = strike_count, fill = dataset)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+  scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) +
+  labs(x = "Decade", y = "Strike count", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom")
+
+# ── Fire count ─────────────────────────────────────────────────────────────
+ggplot(combined_decades, aes(x = decade, y = fire_count, fill = dataset)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+  scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) +
+  labs(x = "Decade", y = "Fire count", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom")
+
+# ── Burned acres ───────────────────────────────────────────────────────────
+ggplot(combined_decades, aes(x = decade, y = total_burned_acres, fill = dataset)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.alpha = 0.3) +
+  scale_y_log10(breaks = scales::breaks_log(n = 10), labels = scales::label_number()) +
+  labs(x = "Decade", y = "Total burned acres", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+        legend.position = "bottom")
+```
+
+
+
+
+```{r}
+#write.csv(combined_decades, file.path(predictions_root, "calibration_period_TRACE_ERA5_prediction_summary.csv"))
+#write_parquet(df, file.path(predictions_root, "paleo_fire_lightning_predictions.parquet"))
+```
+
+

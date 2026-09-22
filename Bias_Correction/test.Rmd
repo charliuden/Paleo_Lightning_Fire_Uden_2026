@@ -1,0 +1,159 @@
+---
+title: "Untitled"
+author: "Charlotte Uden"
+date: "2026-08-10"
+output: html_document
+---
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(rstan)
+library(pROC)
+library(loo)
+library(cowplot)
+library(stats)
+library(caret)
+library(arrow)
+library(geodata)
+library(terra)
+library(rnaturalearth)
+library(sf)
+library(patchwork)
+library(purrr)
+library(qmap)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+
+#setwd("~/raid/cuden/Paleo_Lightning_Fire_Uden_2026/Bias_Correction")
+
+
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+```
+
+Read in elvation and trace points:
+```{r}
+trace_elev_lookup <- readRDS(file.path(rds_root, "trace_elev_lookup.rds"))
+trace_cells <- readRDS(file.path(rds_root, "trace_cells.rds"))
+```
+
+From python file that converted netcdf to parquet:
+Note: TraCE model years are offset from BP/CE. Year 0 in the model = 22000 BP.
+    We convert to approximate CE year: ce_year = model_year - 21950
+    (where 1950 CE = 0 BP = model year 21950)
+
+```{r}
+# Read the TRACE parquet file
+trace_monthly_full <- read_parquet(file.path(paleocliamte_data_root,"trace21ka_processed/trace_ignition_burnedarea_model_monthly_no_lags.parquet"))
+names(trace_monthly_full)
+range(trace_monthly_full$ce_year)
+
+trace_monthly <- trace_monthly_full %>% filter(ce_year >= 46, ce_year <= 89)
+
+#make year match conventional dating
+trace_monthly <- trace_monthly %>%
+  mutate(year = ce_year + 1900)
+
+trace_monthly_full <- trace_monthly_full %>%
+  mutate(year = ce_year + 1900)
+
+# Sanity check
+range(trace_monthly$year)
+range(trace_monthly_full$year)
+```
+
+Spatial clip to Alaska
+```{r}
+trace_monthly_full <- trace_monthly_full %>%
+  mutate(lon = ifelse(lon > 180, lon - 360, lon)) %>%   # match trace_cells' -180/180 convention
+  semi_join(trace_cells, by = c("lat", "lon")) %>%
+  left_join(trace_elev_lookup, by = c("lat", "lon"))
+
+trace_monthly <- trace_monthly %>%
+  mutate(lon = ifelse(lon > 180, lon - 360, lon)) %>%   # match trace_cells' -180/180 convention
+  semi_join(trace_cells, by = c("lat", "lon")) %>%
+  left_join(trace_elev_lookup, by = c("lat", "lon"))
+
+# Sanity checks
+nrow(trace_monthly_full)
+n_distinct(trace_monthly_full$lat, trace_monthly_full$lon)   # should be 23
+sum(is.na(trace_monthly_full$elevation))                      # should be 0
+names(trace_monthly_full)
+# Sanity checks
+nrow(trace_monthly)
+n_distinct(trace_monthly$lat, trace_monthly$lon)   # should be 23
+sum(is.na(trace_monthly$elevation))                      # should be 0
+names(trace_monthly)
+```
+
+
+
+Read in ERA5 monthly data for correction period:
+```{r}
+era_monthly <- read_parquet(file.path(era5_data_root,"bias_correction/processed_parquet/era5_ignition_burnedarea_model_MAM_JJA_1946_1990.parquet"))
+range(era_monthly$year)
+names(era_monthly)
+```
+
+A spatial mis match: Aggregate ERA5 up to TraCE's grid by veraging all ERA5 points that fall within each TraCE grid cell. This maintains TraCE's actual physical resolution and avoids inventing false precision (interpolating trace down to era5 grid). 
+
+```{r}
+#save unaggregated ERA5 data:
+era_monthly_pre_aggregation <- era_monthly
+# Match each ERA5 point to nearest TraCE grid cell
+nn <- get.knnx(data = trace_cells[, c("lon", "lat")],
+               query = era_monthly[, c("lon", "lat")], k = 1)
+
+era_monthly$trace_lon <- trace_cells$lon[nn$nn.index]
+era_monthly$trace_lat <- trace_cells$lat[nn$nn.index]
+
+# Aggregate ERA5 to TraCE grid cells, by year, month
+era_monthly<- era_monthly %>%
+  group_by(trace_lat, trace_lon, year, month) %>%
+  summarise(across(c(tair), mean, na.rm = TRUE),
+            .groups = "drop") %>%
+  rename(lat = trace_lat, lon = trace_lon)
+
+ggplot(filter(era_monthly, year==1946 & month==6), aes(x=lon, y=lat)) + geom_point()
+ggplot(filter(trace_monthly, year==1946 & month==6), aes(x=lon, y=lat)) + geom_point()
+```
+
+```{r}
+unique(era_monthly$month)
+unique(trace_monthly$month)
+unique(trace_monthly_full$month)
+```
+

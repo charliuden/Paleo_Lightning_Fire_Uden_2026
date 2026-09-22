@@ -1,0 +1,224 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(gt)
+```
+
+
+
+# =============================================================================
+# Reads the same model objects the unified pipeline loads, extracts posterior
+# mean + 95% CI for every regression coefficient in every sub-model, and
+# assembles one wide table: rows = predictors, columns = outcome/parameter.
+#
+# NAMING NOTES (see chat for full explanation):
+# - Lightning Gamma model: `alpha` is the SHAPE parameter, `beta` is the RATE
+#   parameter (rgamma(shape = alpha, rate = beta) in predict_lightning_rate()) --
+#   labeled here by true statistical role, not the a/b naming in the pipeline.
+# - Typical/extreme fire "Gamma" models are mean-dispersion parameterized:
+#   alpha/beta are coefficients on log(mean); phi is a separate, non-regression
+#   dispersion parameter (not in the user's original list, added here since it
+#   is a real fitted quantity with no predictor to report against).
+# =============================================================================
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]
+  key_vals <- strsplit(lines, "=")
+  setNames(trimws(sapply(key_vals, `[`, 2)), trimws(sapply(key_vals, `[`, 1)))
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config <- read_properties(file.path(base_path, "paleo_config.properties"))
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+modern_fire_stats_root <- config[["modern_fire_stats_root"]]
+calibration_thunderstorm <- config[["calibration_thunderstorm"]]
+```
+
+```{r}
+# ---- Helper: mean + 95% CI as a formatted string, or "--" if absent --------
+fmt_param <- function(draws) {
+  if (is.null(draws)) return("--")
+  sprintf("%.3f [%.3f, %.3f]", mean(draws), quantile(draws, 0.025), quantile(draws, 0.975))
+}
+```
+
+```{r}
+# =============================================================================
+# 1. LIGHTNING STRIKE RATE (Gamma): alpha = shape, beta = rate
+#    Posterior columns: a_alpha..f_alpha (intercept, swr, tair, rh, precip, sp)
+#                        a_beta..f_beta  (same order)
+# =============================================================================
+B12 <- readRDS(file.path(rds_root, "Lightning/B12_gamma_bayes.rds"))
+lightning_posterior <- as.data.frame(B12)
+
+lightning_predictors <- c("swr", "tair", "rh", "precip", "sp")
+alpha_cols <- c("a_alpha", "b_alpha", "c_alpha", "d_alpha", "e_alpha", "f_alpha")
+beta_cols  <- c("a_beta",  "b_beta",  "c_beta",  "d_beta",  "e_beta",  "f_beta")
+
+strike_rate_shape <- setNames(
+  c(fmt_param(lightning_posterior[[alpha_cols[1]]]),
+    sapply(2:6, function(i) fmt_param(lightning_posterior[[alpha_cols[i]]]))),
+  c("Intercept", lightning_predictors)
+)
+strike_rate_rate <- setNames(
+  c(fmt_param(lightning_posterior[[beta_cols[1]]]),
+    sapply(2:6, function(i) fmt_param(lightning_posterior[[beta_cols[i]]]))),
+  c("Intercept", lightning_predictors)
+)
+
+# =============================================================================
+# 2. STRIKE COUNT DISPERSION (theta): NegBinomial, linear predictor on
+#    log(theta). Posterior: gamma_0 (intercept) + gamma[,1:6] matching
+#    theta_predictors <- c("swr","tair","rh","precip","sp","wind")
+# =============================================================================
+nb_model_obj  <- readRDS(file.path(rds_root, "Lightning/neg_bin_strike_count_no_outliers.rds"))
+theta_predictors <- c("swr", "tair", "rh", "precip", "sp", "wind")
+nb_posterior  <- rstan::extract(nb_model_obj$fit, pars = c("gamma_0", "gamma"))
+
+strike_count_theta <- setNames(
+  c(fmt_param(nb_posterior$gamma_0),
+    sapply(seq_along(theta_predictors), function(i) fmt_param(nb_posterior$gamma[, i]))),
+  c("Intercept", theta_predictors)
+)
+
+# =============================================================================
+# 3. IGNITION EFFICIENCY (pi | 1 strike): Beta-Binomial, linear predictor on
+#    logit(pi). Posterior: alpha (intercept) + beta[,1:k] matching
+#    ignition_bayes_obj$predictors (order as saved with the model)
+# =============================================================================
+ignition_bayes_obj <- readRDS(file.path(rds_root, "Ignition_Efficiency/redo/beta_binomial_ignition_bayes.rds"))
+ignition_posterior <- rstan::extract(ignition_bayes_obj$fit, pars = c("alpha", "beta"))
+predictors_ignition <- ignition_bayes_obj$predictors
+
+ignition_pi <- setNames(
+  c(fmt_param(ignition_posterior$alpha),
+    sapply(seq_along(predictors_ignition), function(i) fmt_param(ignition_posterior$beta[, i]))),
+  c("Intercept", predictors_ignition)
+)
+
+# =============================================================================
+# 4-7. BURNED AREA MIXTURE MODEL: classifier (P) + typical Gamma + extreme
+#       Gamma, each with its own predictor set
+# =============================================================================
+mixture_obj <- readRDS(file.path(rds_root, "Burned_Area/redo/m3_bayes_mixture_custom.rds"))
+
+logit_posterior   <- rstan::extract(mixture_obj$fit_logit,   pars = c("alpha", "beta"))
+extreme_posterior <- rstan::extract(mixture_obj$fit_extreme, pars = c("alpha", "beta", "phi"))
+normal_posterior  <- rstan::extract(mixture_obj$fit_normal,  pars = c("alpha", "beta", "phi"))
+
+preds_classifier <- c("urban_proximity_binary", "rh", "tair", "precip", "tair_5y")
+preds_extreme    <- c("U", "tair")
+preds_typical    <- c("urban_proximity_binary", "tair_2m", "tair")
+
+extreme_classifier_P <- setNames(
+  c(fmt_param(logit_posterior$alpha),
+    sapply(seq_along(preds_classifier), function(i) fmt_param(logit_posterior$beta[, i]))),
+  c("Intercept", preds_classifier)
+)
+
+typical_fire_logmu <- setNames(
+  c(fmt_param(normal_posterior$alpha),
+    sapply(seq_along(preds_typical), function(i) fmt_param(normal_posterior$beta[, i]))),
+  c("Intercept", preds_typical)
+)
+typical_fire_phi <- fmt_param(normal_posterior$phi)   # scalar, no predictor
+
+extreme_fire_logmu <- setNames(
+  c(fmt_param(extreme_posterior$alpha),
+    sapply(seq_along(preds_extreme), function(i) fmt_param(extreme_posterior$beta[, i]))),
+  c("Intercept", preds_extreme)
+)
+extreme_fire_phi <- fmt_param(extreme_posterior$phi)   # scalar, no predictor
+```
+
+
+# =============================================================================
+# ASSEMBLE: union of every predictor name across all models, in a sensible
+# fixed order (Intercept first, then alphabetical), one row per predictor,
+# one column per model/parameter, "--" where a predictor isn't in that model
+# =============================================================================
+```{r}
+all_predictors <- union(
+  names(strike_rate_shape),
+  union(names(strike_count_theta),
+        union(names(ignition_pi),
+              union(names(extreme_classifier_P),
+                    union(names(typical_fire_logmu), names(extreme_fire_logmu)))))
+)
+all_predictors <- c("Intercept", sort(setdiff(all_predictors, "Intercept")))
+
+lookup_or_dash <- function(named_vec, predictor) {
+  if (predictor %in% names(named_vec)) named_vec[[predictor]] else "--"
+}
+
+param_table <- tibble(
+  Predictor = all_predictors,
+  `r_strike: shape` = sapply(all_predictors, lookup_or_dash, named_vec = strike_rate_shape),
+  `r_strike: rate`  = sapply(all_predictors, lookup_or_dash, named_vec = strike_rate_rate),
+  `n_strikes: dispersion` = sapply(all_predictors, lookup_or_dash, named_vec = strike_count_theta),
+  `P_ignite` = sapply(all_predictors, lookup_or_dash, named_vec = ignition_pi),
+  `P_extreme` = sapply(all_predictors, lookup_or_dash, named_vec = extreme_classifier_P),
+  `B_typical: log(mean)` = sapply(all_predictors, lookup_or_dash, named_vec = typical_fire_logmu),
+  `B_extreme: log(mean)` = sapply(all_predictors, lookup_or_dash, named_vec = extreme_fire_logmu)
+)
+
+# Add the two dispersion (phi) rows separately -- scalars, no predictor row
+# to attach to, so they get their own labeled rows at the bottom
+phi_row <- tibble(
+  Predictor = "Dispersion (\u03c6)",
+  `r_strike: shape` = "--", `r_strike: rate` = "--",
+  `n_strikes: dispersion` = "--", `P_ignite` = "--",
+  `P_extreme` = "--",
+  `B_typical: log(mean)` = typical_fire_phi,
+  `B_extreme: log(mean)` = extreme_fire_phi
+)
+param_table <- bind_rows(param_table, phi_row)
+
+param_table
+```
+
+
+
+# =============================================================================
+# EXPORT: gt table -> LaTeX body only (booktabs, no float wrapper), matching
+# the export convention already used for the metrics table
+# =============================================================================
+```{r}
+export_table_body_only <- function(gt_tbl, path) {
+  full_tex <- as_latex(gt_tbl) %>% as.character()
+  body <- sub(".*(\\\\begin\\{tabular\\*\\}.*\\\\end\\{tabular\\*\\})[\\s\\S]*", "\\1", full_tex, perl = TRUE)
+  writeLines(body, path)
+}
+
+gt_param_tbl <- param_table %>%
+  gt(rowname_col = "Predictor") %>%
+  tab_header(title = "Posterior parameter estimates (mean [95% CI]) by sub-model")
+
+export_table_body_only(gt_param_tbl, "parameter_table.tex")
+
+print(param_table, n = Inf)
+```
+

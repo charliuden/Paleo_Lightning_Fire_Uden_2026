@@ -4,5 +4,9 @@ paleo_config.properties
 *.jpeg
 *.gif
 *.rds
+*.txt
+*.tex
+*.csv
+*.log
 **/__pycache__/
 *.RData

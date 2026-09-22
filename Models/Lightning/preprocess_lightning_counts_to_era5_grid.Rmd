@@ -1,0 +1,222 @@
+#------------------------------
+#RASTER METHOD
+#------------------------------
+#July 26th 2024
+
+#Script to aggregate Vaisala lightning strike data to PalEON data
+
+# Lightning data are downloaded from:
+#   https://fire.ak.blm.gov/predsvcs/maps.php
+
+#2.1.1 Lightning 
+# Lightning strike data, including location and time, were obtained from the Alaska Lightning 
+# Detection Network (ALDN), maintained by the Alaska Fire Service (AFS) (U.S. Department of 
+# the Interior, Bureau of Land Management (BLM), 2024, 2025). We used two datasets, the second 
+# reflecting a major upgrade, to the detection network: an earlier dataset (2002-2011) and a newer 
+# dataset (2012-2018). From 2002-2011, lightning was detected using an impact-based system 
+# that reported cloud-to-ground lightning primarily as flashes. During this period, changes 
+# in sensor technology, processing software, and network configuration resulted in variable 
+# detection efficiency and relatively coarse spatial accuracy, particularly in remote regions 
+# of Alaska. As a result, this dataset is characterized by lower positional accuracy. 
+# Beginning in 2012, the ALDN transitioned to a time-of-arrival (TOA)-based system. 
+# The TOA system records individual strokes and includes cloud-to-ground. 
+# Due to differences in stroke versus flash reporting, expanded sensor coverage, and improved 
+# detection range, the AFS reports detecting ~2.25 times more lightning events relative to the 
+# earlier systems; there are 1,882,857 strikes in the earlier dataset and 1,784,663 strikes 
+# in the later dataset. Due to these differences in detection methods and accuracy, 
+# we train and test our models on each time period separately. 
+
+# RASTER METHOD: turn the point grid into a raster and find number of lightning strikes (points) that fall into 
+#each raster cell each day. 
+```{r}
+library(raster)
+library(dplyr)
+library(tidyr)
+
+library(sp)
+library(ggplot2)
+library(patchwork)
+```
+# Load configuration files
+# - location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+config <- read_properties("~/raid/cuden/config_files/lightning_fire_config.properties")  # path to your config file
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+figure_root <- config[["figure_root"]]
+data_root <- config[["data_root"]]
+netcdf_root <- config[["netcdf_root"]]
+
+#output directory - comment out based on 2002-2011 vs 2012-2018 
+data_file_path <- file.path("~/raid/cuden/data/paleo_fire/training_data")
+```
+
+#----------------------
+#lightning data for Alaska 2002 - 2011
+#----------------------
+```{r}
+df <- read.table(file.path(data_root,"Historical_Lightning_1986_2012_ImpactSystem_NAD83.txt"), sep=",")
+
+#tidy data
+colnames(df) <- df[1,] #apply column names, which are in the first row
+df <- df[-1,] #remove first row
+df <- df[c("STRIKETIME", "LAT", "LON")] #only need time and location of each strike
+df$STRIKETIME <- as.POSIXct(df$STRIKETIME, format = "%Y/%m/%d %H:%M", tx="UTC")
+df$STRIKETIME <- as.Date(df$STRIKETIME) #only want day month year for the for loop
+df$LAT <- as.numeric(df$LAT)
+df$LON <- as.numeric(df$LON)
+head(df)
+
+#only need 2002 - 2011
+df$year <- as.integer(format(df$STRIKETIME, "%Y"))
+df <- filter(df, year<=2011)
+df <- filter(df, year>=2002)
+# Filter for June, July, August
+df$month <- as.integer(format(df$STRIKETIME, "%m"))
+df <- filter(df, month %in% c(6, 7, 8))
+
+df <- df %>% dplyr::select(LAT, LON, year, month)
+head(df)
+str(df)
+```
+
+#----------------------
+#get era5 grid and grid area
+#----------------------
+
+```{r}
+area <- read.csv("~/raid/cuden/data/paleo_fire/TraCE-21ka/era5_grid_area.csv")
+ggplot(area, aes(lon, lat)) + geom_point(size = 0.3) + coord_quickmap()
+```
+
+#----------------------
+# Build an ERA5 grid raster from the cell-center points in `area`, assign
+# each strike to the raster cell it falls within (cellFromXY guarantees a
+# 1:1 point-to-cell assignment -- no strike can land in two cells), then
+# aggregate to counts per gridcell-year-month, flag outlier gridcell-months
+# (strike_count > 1000) as NA, and compute mean summer strike rate.
+#----------------------
+
+
+# ---- 1. Build an empty raster matching the ERA5 grid's own resolution ----
+```{r}
+lon_vals <- sort(unique(area$lon))
+lat_vals <- sort(unique(area$lat))
+lon_res  <- min(diff(lon_vals))
+lat_res  <- min(diff(lat_vals))
+
+r <- raster(
+  xmn = min(lon_vals) - lon_res / 2, xmx = max(lon_vals) + lon_res / 2,
+  ymn = min(lat_vals) - lat_res / 2, ymx = max(lat_vals) + lat_res / 2,
+  res = c(lon_res, lat_res),
+  crs = "+proj=longlat +datum=WGS84"
+)
+```
+
+```{r}
+# Map each ERA5 grid center to its own raster cell ID -- confirms the
+# raster's resolution/extent actually reproduces the ERA5 grid 1:1
+area$raster_cell <- cellFromXY(r, cbind(area$lon, area$lat))
+stopifnot("Two ERA5 grid centers mapped to the same raster cell -- check resolution" =
+            anyDuplicated(area$raster_cell) == 0)
+```
+
+# ---- 2. Assign each strike to the raster cell it falls within ----
+```{r}
+df$raster_cell <- cellFromXY(r, cbind(df$LON, df$LAT))
+
+n_before <- nrow(df)
+df <- df %>% filter(!is.na(raster_cell))   # strikes outside the ERA5 extent
+cat(sprintf("Dropped %d strikes outside the ERA5 grid extent (%.3f%%)\n",
+            n_before - nrow(df), 100 * (n_before - nrow(df)) / n_before))
+```
+
+# ---- 3. Attach (lat, lon, area) via the shared raster_cell ID ----
+```{r}
+df <- df %>%
+  left_join(area %>% dplyr::select(raster_cell, lat, lon, area), by = "raster_cell")
+
+# Explicitly drop strikes whose raster_cell has no match in `area` -- these
+# fell inside the raster's rectangular extent but outside Alaska's clipped
+# land grid (ocean, or land in a neighboring territory within the bbox).
+n_before_land_filter <- nrow(df)
+df <- df %>% filter(!is.na(lat))
+cat(sprintf("Dropped %d strikes over non-land cells (%.3f%%)\n",
+            n_before_land_filter - nrow(df),
+            100 * (n_before_land_filter - nrow(df)) / n_before_land_filter))
+```
+
+# ---- 4. Strike COUNTS per gridcell-year-month ----
+```{r}
+strike_counts <- df %>%
+  group_by(lat, lon, area, year, month) %>%
+  summarise(strike_count = n(), .groups = "drop")
+```
+
+# Fill in every gridcell x year x month combination explicitly, so a
+# genuine zero-strike month is distinguishable from a row that's simply
+# absent (rather than silently missing from the output)
+```{r}
+full_grid <- area %>%
+  dplyr::select(lat, lon, area) %>%
+  tidyr::crossing(year = 2002:2011, month = c(6, 7, 8))
+
+strike_counts <- full_grid %>%
+  left_join(strike_counts, by = c("lat", "lon", "area", "year", "month")) %>%
+  mutate(strike_count = ifelse(is.na(strike_count), 0, strike_count))
+```
+
+
+```{r}
+# ---- 5. Flag outlier gridcell-months: strike_count > 1000 -> NA ----
+strike_counts <- strike_counts %>%
+  mutate(strike_count = ifelse(strike_count > 1000, NA_integer_, strike_count))
+
+cat(sprintf("Flagged %d of %d gridcell-months as outliers (%.3f%%)\n",
+            sum(is.na(strike_counts$strike_count)), nrow(strike_counts),
+            100 * mean(is.na(strike_counts$strike_count))))
+```
+```{r}
+summary(strike_counts)
+hist(strike_counts$strike_count)
+```
+
+```{r}
+# ---- 6. Strike RATE: mean summer strikes/km2/month, per gridcell-year ----
+# (only lat, lon, year remain -- month and area are collapsed out here)
+strike_rate <- strike_counts %>%
+  mutate(monthly_rate = strike_count / area) %>%   # strikes per km2, per month
+  group_by(lat, lon, year) %>%
+  summarise(r_strike = mean(monthly_rate, na.rm = TRUE), .groups = "drop")
+```
+
+```{r}
+hist(strike_rate$r_strike)
+```
+
+
+```{r}
+# ---- 7. Export: counts and rate as SEPARATE files ----
+write.csv(strike_counts,
+          file.path(dirname(data_file_path), "strike_counts_no_outliers_2002_2011.csv"),
+          row.names = FALSE)
+write.csv(strike_rate,
+          file.path(dirname(data_file_path), "strike_rate_no_outliers_2002_2011.csv"),
+          row.names = FALSE)
+```
+
