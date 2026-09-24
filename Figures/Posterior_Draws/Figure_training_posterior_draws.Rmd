@@ -63,7 +63,7 @@ figure_root <- file.path(figure_root, "Posterior_Draws")
 
 Read in output from 500 draws of the posterior distribution for all parameters in pipeline:
 ```{r}
-df <- fread(file.path(base_path, "Models/Pipeline/predictions_training_posterior_bb_no_outliers_cap.csv"))
+df <- fread(file.path(base_path, "Models/Pipeline/predictions_training_posterior_bb_no_outliers_cap_baInteractions.csv"))
 summary(df$n_strikes)
 ```
 
@@ -73,31 +73,34 @@ strike_rates <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_
 strike_counts <- read.csv(file.path(drivers_root, "lightning_strike_count_climate_jja_2002_2011_no_outliers.csv"))
 fire_counts <- read.csv(file.path(drivers_root, "lightning_ignition_jja_2002_2011_new_no_outliers.csv"))
 burned_areas <- read.csv(file.path(drivers_root, "burned_area_jja_2002_2011_new.csv"))
+```
 
+
+```{r}
 #need total burned area per gridcell-month. Though the model was trained on fire size per single fire, pipeline simulations sum sampled burned area per fire, so we need to compare the same aggregation in the training data. 
 burned_areas_agg <- burned_areas %>%
-  group_by(lat, lon, year, month) %>%
-  summarise(burned_area_km2_total = sum(burned_area_km2_total, na.rm = TRUE), .groups = "drop")
+  dplyr::group_by(lat, lon, year, month) %>%
+  dplyr::summarise(burned_area_km2_total = sum(burned_area_km2_total, na.rm = TRUE), .groups = "drop")
 
 strike_rates_join <- strike_rates %>%
   dplyr::select(lat, lon, year, r_strike_obs = strikes) %>%
-  mutate(lat = round(lat, 2), lon = round(lon, 2))
+  dplyr::mutate(lat = round(lat, 2), lon = round(lon, 2))
 
 fire_counts <- fire_counts %>%
   dplyr::select(lat, lon, year, month, fire_count) %>%
-  mutate(lat = round(lat, 2), lon = round(lon, 2))
+  dplyr::mutate(lat = round(lat, 2), lon = round(lon, 2))
 
 strike_counts <- strike_counts %>%
   dplyr::select(lat, lon, year, month, n_strikes_obs = strike_count) %>%
-  mutate(lat = round(lat, 2), lon = round(lon, 2))
+  dplyr::mutate(lat = round(lat, 2), lon = round(lon, 2))
 
 obs <- fire_counts %>% left_join(strike_counts, by = c("lat", "lon", "year", "month")) 
 
 obs <- obs %>%
   left_join(strike_rates_join, by = c("lat", "lon", "year")) %>%
   left_join(burned_areas_agg, by = c("lat", "lon", "year", "month")) %>%
-  mutate(r_strike_obs = ifelse(is.na(r_strike_obs), 0, r_strike_obs)) %>%
-  mutate(burned_area_km2_total = ifelse(is.na(burned_area_km2_total), 0, burned_area_km2_total)) %>%
+  dplyr::mutate(r_strike_obs = ifelse(is.na(r_strike_obs), 0, r_strike_obs)) %>%
+  dplyr::mutate(burned_area_km2_total = ifelse(is.na(burned_area_km2_total), 0, burned_area_km2_total)) %>%
   dplyr::select(lat, lon, year, month, r_strike_obs, n_strikes_obs, fire_count, burned_area_km2_total)
 
 #check
@@ -105,14 +108,130 @@ nrow(obs) == nrow(fire_counts) #should be true
 sum(obs$burned_area_km2_total > 0)   # should be n_distinct(burned_areas gridcell-months), not raw fire count
 sum(is.na(obs$r_strike_obs))            # should be 0 if strike_rates covers the same lat/lon/year set
 
-summary(obs)
-
-#Remove rows where fire_count exceeds strike_count 
-obs <- obs %>%
-  filter(!(n_strikes_obs > 0 & fire_count > n_strikes_obs))
   
 summary(obs)
 ```
+
+Remove observations excluded from training because fire count exceeded strike count
+```{r}
+
+null_rows <- read.csv(file.path(drivers_root, "null_ignition_rows_training_data_2002-2011.csv")) %>%
+  dplyr::select(-X) %>%
+  dplyr::select(year, lat, lon, month, fire_count) %>%
+  dplyr::rename(fire_count_null = fire_count) %>%
+  dplyr::mutate(null_row = 1)
+
+nrow(obs)
+
+obs <- obs %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  full_join(null_rows, by = c("lon", "lat", "year", "month")) %>%
+  mutate(null_row = replace_na(null_row, 0)) %>%
+  filter(null_row == 0) %>%             
+  dplyr::select(-fire_count_null, -null_row)
+  
+nrow(obs)
+
+
+#Remove rows where fire_count exceeds strike_count - this does the same as above. 
+# obs_new <- obs_new %>%
+#  dplyr::filter(!(n_strikes_obs > 0 & fire_count > n_strikes_obs))
+# nrow(obs_new)
+```
+
+quick burned area check
+```{r}
+hist(filter(obs, burned_area_km2_total>0)$burned_area_km2_total, main="Observed burned area", xlab="km2")
+hist(filter(df, total_burned_area_capped>0)$total_burned_area_capped, main="Simulated burned area", xlab="km2")
+hist(filter(df, total_burned_area_capped>0 & draw_id==1)$total_burned_area_capped, main="Simulated burned area (capped by grid area)", xlab="km2")
+hist(filter(df, total_burned_area>0)$total_burned_area, main="Simulated burned area (no grid area cap)", xlab="km2")
+
+#how often do cumulative fires exceed the gridcell size?
+ba_check <- df %>% 
+  filter(total_burned_area > 0) %>%
+  mutate(cap_applied = total_burned_area > total_burned_area_capped) %>%
+  filter(cap_applied==TRUE)
+
+nrow(ba_check)/nrow(df)*100
+
+#distribution beyond gridcell cap
+hist(ba_check$total_burned_area, main="Simulated burned area no grid area cap", xlab="km2")
+hist(ba_check$total_burned_area_capped, main="Simulated burned area with grid area cap", xlab="km2")
+
+#with the truncation applied to extreme fire draws (gamma), 0.1109704% of draws exceed the gridcell size
+#the truncation means that the extreme gamma model resample draws below 254.28 km2 until this threshold is exceeded. 
+
+# 1. What fraction of rows have fire_count_pred > 0 at all? Should be
+# small -- fire occurrence in any given gridcell-month is rare.
+mean(df$fire_count_pred > 0)
+
+# 2. Among rows with fire_count_pred == 0, is total_burned_area really 0?
+summary(df$total_burned_area[df$fire_count_pred == 0])
+
+# 3. Among rows with EXACTLY 1 fire, does total_burned_area (now directly
+# comparable to a single fire's magnitude) look reasonable relative to
+# the GPD-implied max?
+summary(df$total_burned_area[df$fire_count_pred == 1])
+
+# 4. What does fire_count_pred's distribution look like overall -- is it
+# frequently >1, or even implausibly large?
+summary(df$fire_count_pred)
+table(df$fire_count_pred > 0, useNA = "always")
+```
+
+# 1. What fraction of rows have fire_count_pred > 0 at all? Should be
+> # small -- fire occurrence in any given gridcell-month is rare.
+> mean(df$fire_count_pred > 0)
+[1] 0.008414265
+> 
+> # 2. Among rows with fire_count_pred == 0, is total_burned_area really 0?
+> summary(df$total_burned_area[df$fire_count_pred == 0])
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+      0       0       0       0       0       0 
+> 
+> # 3. Among rows with EXACTLY 1 fire, does total_burned_area (now directly
+> # comparable to a single fire's magnitude) look reasonable relative to
+> # the GPD-implied max?
+> summary(df$total_burned_area[df$fire_count_pred == 1])
+     Min.   1st Qu.    Median      Mean   3rd Qu.      Max. 
+      0.0       0.1       5.7     140.3      76.8 2174214.4 
+> 
+> # 4. What does fire_count_pred's distribution look like overall -- is it
+> # frequently >1, or even implausibly large?
+> summary(df$fire_count_pred)
+    Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+0.000000 0.000000 0.000000 0.008926 0.000000 6.000000 
+> table(df$fire_count_pred > 0, useNA = "always")
+
+   FALSE     TRUE     <NA> 
+65757008   557992        0 
+
+
+quick strike count check
+```{r}
+hist(filter(obs, n_strikes_obs>0)$n_strikes_obs, main="Observed strike count", xlab="strike count")
+hist(filter(df, n_strikes_raw>0)$n_strikes_raw, main="Simulated raw strike count", xlab="strike count")
+hist(filter(df, n_strikes>0)$n_strikes, main="Simulated strike count GDP tail corrected", xlab="strike count")
+hist(filter(df, n_strikes>0 & draw_id==1)$n_strikes, main="Simulated strike count GDP tail corrected (single draw)", xlab="strike count")
+
+#how often do strike counts get corrected?
+strikes_check <- df %>% 
+  filter(n_strikes_raw > 0) %>%
+  mutate(gpd_tail_applied = n_strikes_raw > n_strikes) %>%
+  filter(gpd_tail_applied==TRUE)
+
+#distribution of corrected tail
+hist(strikes_check$n_strikes_raw, main="Simulated raw strikes above GDP threshold", xlab="strike count")
+hist(strikes_check$n_strikes, main="Simulated strike count GDP tail", xlab="strike count")
+
+nrow(strikes_check)/nrow(df)*100
+#how often to simulated strike count exteed the GDP implied max of 279?
+nrow(filter(df, n_strikes_raw>270))/nrow(df)*100
+nrow(filter(df, n_strikes>270))/nrow(df)*100
+
+# gdp is applied is applied to the strike count tail for 0.329638% of draws. Theoretical max according to GDP is 279 strikes. 
+```
+
 
 Split 500 draws into test and train for calculating metrics:
 ```{r}
@@ -149,7 +268,7 @@ setDT(obs)
 #calculate observed ignition rate (fires/strikes)
 
 obs <- obs %>%
-  mutate(
+  dplyr::mutate(
     ignition_efficiency = case_when(
       n_strikes_obs == 0          ~ 0,
       fire_count > n_strikes_obs  ~ 0,
@@ -168,8 +287,8 @@ summary(obs$r_strike_obs)
 obs_label <- sprintf("Observed mean: %.4f", mean(obs$r_strike_obs))
 
 draw_totals <- df %>%
-  group_by(draw_id) %>%
-  summarise(r_strike = mean(r_strike, na.rm = TRUE))
+  dplyr::group_by(draw_id) %>%
+  dplyr::summarise(r_strike = mean(r_strike, na.rm = TRUE))
 
 p1 <- ggplot(draw_totals, aes(x = r_strike)) +
   geom_histogram(bins = 40, fill = "grey", color = "white") +
@@ -184,13 +303,13 @@ p1 <- ggplot(draw_totals, aes(x = r_strike)) +
 p1
 
 # pick one gridcell-month - month with larges r_strike in observed data:
-max_row <- filter(obs, r_strike_obs == max(r_strike_obs))[1,]
+max_row <-dplyr::filter(obs, r_strike_obs == max(r_strike_obs))[1,]
 
 gridcell_month_draws <- df %>%
-  filter(lat == max_row$lat, lon == max_row$lon, year == max_row$year, month == max_row$month) 
+ dplyr::filter(lat == max_row$lat, lon == max_row$lon, year == max_row$year, month == max_row$month) 
 
 obs_value <- obs %>%
-  filter(lat == max_row$lat, lon == max_row$lon, year == max_row$year, month == max_row$month)
+ dplyr::filter(lat == max_row$lat, lon == max_row$lon, year == max_row$year, month == max_row$month)
 
 ggplot(gridcell_month_draws, aes(x = r_strike)) +
   geom_histogram(bins = 40, fill = "grey", color = "white") +
@@ -213,8 +332,8 @@ summary(obs$n_strikes_obs)
 obs_label <- sprintf("Observed total: %s", format(round(sum(obs$n_strikes_obs), 0), big.mark = ","))
 
 draw_totals <- df %>%
-  group_by(draw_id) %>%
-  summarise(n_strikes = sum(n_strikes, na.rm = TRUE))
+  dplyr::group_by(draw_id) %>%
+  dplyr::summarise(n_strikes = sum(n_strikes, na.rm = TRUE))
 
 p2 <- ggplot(draw_totals, aes(x = n_strikes)) +
   geom_histogram(bins = 40, fill = "grey", color = "white") +
@@ -235,14 +354,14 @@ hist(df$n_strikes)
 summary(df$p_ignite_rate_cal)
 summary(obs$fire_count/filter(obs, n_strikes_obs>0)$n_strikes_obs)
 
-ig_rate <- obs %>% filter(n_strikes_obs > 0 & fire_count <= n_strikes_obs) %>% mutate(ig_rate = fire_count/n_strikes_obs) 
+ig_rate <- obs %>% dplyr::filter(n_strikes_obs > 0 & fire_count <= n_strikes_obs) %>% dplyr::mutate(ig_rate = fire_count/n_strikes_obs) 
 
 obs_label <- sprintf("Observed mean: %.4f", sum(ig_rate$ig_rate)/nrow(obs))
                                                    
 
 draw_totals <- df %>%
-  group_by(draw_id) %>%
-  summarise(p_ignite_rate_cal = mean(p_ignite_rate_cal, na.rm = TRUE))
+  dplyr::group_by(draw_id) %>%
+  dplyr::summarise(p_ignite_rate_cal = mean(p_ignite_rate_cal, na.rm = TRUE))
 
 p3 <- ggplot(draw_totals, aes(x = p_ignite_rate_cal)) +
   geom_histogram(bins = 40, fill = "grey", color = "white") +
@@ -267,8 +386,8 @@ summary(obs$fire_count)
 obs_label <- sprintf("Observed total: %s", format(round(sum(obs$fire_count), 0), big.mark = ","))
 
 draw_totals <- df %>%
-  group_by(draw_id) %>%
-  summarise(fire_count_pred = sum(fire_count_pred, na.rm = TRUE))
+  dplyr::group_by(draw_id) %>%
+  dplyr::summarise(fire_count_pred = sum(fire_count_pred, na.rm = TRUE))
 
 p4 <- ggplot(draw_totals, aes(x = fire_count_pred)) +
   geom_histogram(bins = 40, fill = "grey", color = "white") +
@@ -299,8 +418,8 @@ summary(obs$burned_area_km2_total)
 obs_label <- sprintf("Observed total: %s", format(round(sum(obs$burned_area_km2_total), 0), big.mark = ","))
 
 draw_totals <- df %>%
-  group_by(draw_id) %>%
-  summarise(total_burned_area = sum(total_burned_area_capped, na.rm = TRUE))
+  dplyr::group_by(draw_id) %>%
+  dplyr::summarise(total_burned_area = sum(total_burned_area_capped, na.rm = TRUE))
 
 p5 <- ggplot(draw_totals, aes(x = total_burned_area)) +
   geom_histogram(bins = 40, fill = "grey", color = "white") +
@@ -545,7 +664,7 @@ ggsave(file.path(figure_root, "Figure_training_histograms_metrics_no_outliers.pn
 ```
 observed ignition_efficiency and predicted p_ignite_rate_cal aren't estimating the same statistical object at the row level, so comparing their marginal distributions directly will never produce a meaningful score, regardless of how the bins are constructed.
 
-Here's the issue: summary() output shows the observed ratio is dominated by tiny-n cases — a great many gridcell-months have n_strikes_obs in the single digits, so fire_count/n_strikes_obs can only take values like 0, 1, 0.5, 0.33, 1/7, etc. — the raw outcome of a Bernoulli-ish process with very few trials. A 1-strike/1-fire month producing efficiency = 1.0 isn't evidence of a location with 100% ignition probability — it's what a low-probability event occasionally does when it only get one roll of the dice. Meanwhile, p_ignite_rate_cal is a smooth, continuous expected-value estimate, and a well-behaved model correctly should almost never predict anything near 1.0 — if it did, that would itself be a red flag. So comparing a noisy small-sample empirical ratio against a smooth expectation, and no amount of rebinning fixes that: the observed distribution has real mass out at values the model is correctly never supposed to reach, and S-score will always penalize that mismatch as if it were a modeling failure rather than irreducible sampling noise.
+summary() output shows the observed ratio is dominated by tiny-n cases — a great many gridcell-months have n_strikes_obs in the single digits, so fire_count/n_strikes_obs can only take values like 0, 1, 0.5, 0.33, 1/7, etc. — the raw outcome of a Bernoulli-ish process with very few trials. A 1-strike/1-fire month producing efficiency = 1.0 isn't evidence of a location with 100% ignition probability — it's what a low-probability event occasionally does when it only get one roll of the dice. Meanwhile, p_ignite_rate_cal is a smooth, continuous expected-value estimate, and a well-behaved model correctly should almost never predict anything near 1.0 — if it did, that would itself be a red flag. So comparing a noisy small-sample empirical ratio against a smooth expectation, and no amount of rebinning fixes that: the observed distribution has real mass out at values the model is correctly never supposed to reach, and S-score will always penalize that mismatch as if it were a modeling failure rather than irreducible sampling noise.
 
 The standard fix in probabilistic forecast verification for exactly this situation is a reliability (calibration) diagram, not a marginal-distribution comparison. Instead of comparing individual rows' noisy ratios, bin gridcell-months by predicted probability, then within each bin pool strikes and fires together and compute the true aggregate rate — this is the move that structurally cancels out the small-n noise, since its now dividing a sum of fires by a sum of strikes across many gridcell-months, not a single risky ratio.
 
@@ -642,8 +761,8 @@ compare_scatter <- function(pred_col, obs_col, var_label, title = NULL,
                              ci_lower = 0.025, ci_upper = 0.975, log_scale = FALSE) {
 
   pred_summary <- df %>%
-    group_by(lat, lon, year, month) %>%
-    summarise(
+    dplyr::group_by(lat, lon, year, month) %>%
+    dplyr::summarise(
       pred_mean  = mean(.data[[pred_col]], na.rm = TRUE),
       pred_lower = quantile(.data[[pred_col]], ci_lower, na.rm = TRUE),
       pred_upper = quantile(.data[[pred_col]], ci_upper, na.rm = TRUE),
@@ -700,18 +819,18 @@ time_series_plot <- function(pred_col, obs_col, var_label, title = NULL,
 
   summary_type <- match.arg(summary_type)
 
-  df_filtered  <- if (remove_zeros) df  %>% filter(.data[[pred_col]] != 0) else df
-  obs_filtered <- if (remove_zeros) obs %>% filter(.data[[obs_col]]  != 0) else obs
+  df_filtered  <- if (remove_zeros) df  %>% dplyr::filter(.data[[pred_col]] != 0) else df
+  obs_filtered <- if (remove_zeros) obs %>% dplyr::filter(.data[[obs_col]]  != 0) else obs
 
   # ---- Bars ----
   if (summary_type == "total") {
     pred_draw_totals <- df_filtered %>%
-      group_by(draw_id, year) %>%
-      summarise(annual_total = sum(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
+      dplyr::group_by(draw_id, year) %>%
+      dplyr::summarise(annual_total = sum(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
 
     pred_summary <- pred_draw_totals %>%
-      group_by(year) %>%
-      summarise(
+      dplyr::group_by(year) %>%
+      dplyr::summarise(
         value_mean  = mean(annual_total),
         value_lower = quantile(annual_total, ci_lower),
         value_upper = quantile(annual_total, ci_upper),
@@ -719,12 +838,12 @@ time_series_plot <- function(pred_col, obs_col, var_label, title = NULL,
         value_max   = max(annual_total),
         .groups = "drop"
       ) %>%
-      mutate(source = "Predicted")
+      dplyr::mutate(source = "Predicted")
 
     obs_summary <- obs_filtered %>%
-      group_by(year) %>%
-      summarise(value_mean = sum(.data[[obs_col]], na.rm = TRUE), .groups = "drop") %>%
-      mutate(value_lower = NA_real_, value_upper = NA_real_,
+      dplyr::group_by(year) %>%
+      dplyr::summarise(value_mean = sum(.data[[obs_col]], na.rm = TRUE), .groups = "drop") %>%
+      dplyr::mutate(value_lower = NA_real_, value_upper = NA_real_,
              value_min = NA_real_, value_max = NA_real_,
              source = "Observed")
 
@@ -735,8 +854,8 @@ time_series_plot <- function(pred_col, obs_col, var_label, title = NULL,
 
     if (pool_across_gridcells) {
       pred_summary <- df_filtered %>%
-        group_by(across(all_of(group_vars))) %>%
-        summarise(
+        dplyr::group_by(across(all_of(group_vars))) %>%
+        dplyr::summarise(
           value_mean  = mean(.data[[pred_col]], na.rm = TRUE),
           value_lower = quantile(.data[[pred_col]], ci_lower, na.rm = TRUE),
           value_upper = quantile(.data[[pred_col]], ci_upper, na.rm = TRUE),
@@ -744,15 +863,15 @@ time_series_plot <- function(pred_col, obs_col, var_label, title = NULL,
           value_max   = max(.data[[pred_col]], na.rm = TRUE),
           .groups = "drop"
         ) %>%
-        mutate(source = "Predicted")
+        dplyr::mutate(source = "Predicted")
     } else {
       pred_draw_means <- df_filtered %>%
-        group_by(across(all_of(c("draw_id", group_vars)))) %>%
-        summarise(spatial_mean = mean(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
+        dplyr::group_by(across(all_of(c("draw_id", group_vars)))) %>%
+        dplyr::summarise(spatial_mean = mean(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
 
       pred_summary <- pred_draw_means %>%
-        group_by(across(all_of(group_vars))) %>%
-        summarise(
+        dplyr::group_by(across(all_of(group_vars))) %>%
+        dplyr::summarise(
           value_mean  = mean(spatial_mean),
           value_lower = quantile(spatial_mean, ci_lower),
           value_upper = quantile(spatial_mean, ci_upper),
@@ -760,7 +879,7 @@ time_series_plot <- function(pred_col, obs_col, var_label, title = NULL,
           value_max   = max(spatial_mean),
           .groups = "drop"
         ) %>%
-        mutate(source = "Predicted")
+        dplyr::mutate(source = "Predicted")
     }
 
     # Observed: bootstrap the spatial mean, matching how predicted's interval
@@ -774,12 +893,12 @@ time_series_plot <- function(pred_col, obs_col, var_label, title = NULL,
     }
 
     obs_summary <- obs_filtered %>%
-      group_by(across(all_of(group_vars))) %>%
-      summarise(
+      dplyr::group_by(across(all_of(group_vars))) %>%
+      dplyr::summarise(
         boot_means = list(boot_obs_mean(.data[[obs_col]], n_boot)),
         .groups = "drop"
       ) %>%
-      mutate(
+      dplyr::mutate(
         value_mean  = map_dbl(boot_means, mean),
         value_lower = map_dbl(boot_means, ~ quantile(.x, ci_lower)),
         value_upper = map_dbl(boot_means, ~ quantile(.x, ci_upper)),
@@ -793,26 +912,26 @@ time_series_plot <- function(pred_col, obs_col, var_label, title = NULL,
   # ---- ACC / RMSE / reference line ----
   if (summary_type == "total") {
     pred_draw_annual <- df_filtered %>%
-      group_by(draw_id, year) %>%
-      summarise(value = sum(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
+      dplyr::group_by(draw_id, year) %>%
+      dplyr::summarise(value = sum(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
     obs_annual <- obs_filtered %>%
-      group_by(year) %>%
-      summarise(obs_value = sum(.data[[obs_col]], na.rm = TRUE), .groups = "drop")
+      dplyr::group_by(year) %>%
+      dplyr::summarise(obs_value = sum(.data[[obs_col]], na.rm = TRUE), .groups = "drop")
   } else {
     pred_draw_annual <- df_filtered %>%
-      group_by(draw_id, year) %>%
-      summarise(value = mean(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
+      dplyr::group_by(draw_id, year) %>%
+      dplyr::summarise(value = mean(.data[[pred_col]], na.rm = TRUE), .groups = "drop")
     obs_annual <- obs_filtered %>%
-      group_by(year) %>%
-      summarise(obs_value = mean(.data[[obs_col]], na.rm = TRUE), .groups = "drop")
+      dplyr::group_by(year) %>%
+      dplyr::summarise(obs_value = mean(.data[[obs_col]], na.rm = TRUE), .groups = "drop")
   }
 
   obs_mean_all_years <- mean(obs_annual$obs_value, na.rm = TRUE)
 
   skill_by_draw <- pred_draw_annual %>%
     left_join(obs_annual, by = "year") %>%
-    group_by(draw_id) %>%
-    summarise(
+    dplyr::group_by(draw_id) %>%
+    dplyr::summarise(
       acc  = cor(value - mean(value), obs_value - mean(obs_value)),
       rmse = sqrt(mean(((value - mean(value)) - (obs_value - mean(obs_value)))^2)),
       .groups = "drop"
@@ -908,7 +1027,7 @@ elev_masked <- terra::mask(elev_alaska, alaska_vect)
 # 3. Convert to data frame — use elev_masked instead of elev_alaska
 elev_df <- as.data.frame(elev_masked, xy = TRUE)
 names(elev_df) <- c("lon", "lat", "elevation")
-elev_df <- elev_df %>% filter(!is.na(elevation), elevation >= 0)
+elev_df <- elev_df %>%dplyr::filter(!is.na(elevation), elevation >= 0)
 
 p_elevation <- ggplot() +
   geom_contour(data = elev_df,
@@ -949,7 +1068,7 @@ library(sf)
 # =============================================================================
 weighted_kde_grid <- function(data, fill_var, bandwidth = NULL, n_grid = 100,
                                xlim = c(-170, -130), ylim = c(51, 72)) {
-  data <- data %>% filter(.data[[fill_var]] > 0)
+  data <- data %>%dplyr::filter(.data[[fill_var]] > 0)
   coords <- as.matrix(data[, c("lon", "lat")])
   w <- data[[fill_var]]
   w <- w / sum(w) * nrow(data)   # ks::kde expects weights summing to n
@@ -1000,7 +1119,7 @@ plot_obs_pred_bias <- function(pred_agg, obs_agg, var_label, title_prefix = NULL
     obs_agg  %>% rename(obs  = value),
     by = c("lat", "lon")
   ) %>%
-    mutate(across(c(pred, obs), ~ ifelse(is.na(.x), 0, .x)),
+    dplyr::mutate(across(c(pred, obs), ~ ifelse(is.na(.x), 0, .x)),
            bias = pred - obs)
 
   bias_limit <- max(abs(merged$bias), na.rm = TRUE)

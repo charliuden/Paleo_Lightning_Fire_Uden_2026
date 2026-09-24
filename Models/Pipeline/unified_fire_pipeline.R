@@ -48,10 +48,10 @@ PERIOD <- "training"
 CLIMATE_SOURCE <- "era5"
 
 ## ---- Output ---------------------------------------------------------------
-OUTPUT_FILE <- "predictions_training_posterior_bb_no_outliers_cap.csv"
-
+#OUTPUT_FILE <- "predictions_training_posterior_bb_no_outliers_cap_BAinteractions_noTruncation.csv"
+OUTPUT_FILE <- "remove_me.csv"
 ## ---- Posterior sampling ----------------------------------------------------
-N_DRAWS <- 500      # number of full-pipeline posterior replicates
+N_DRAWS <- 1      # number of full-pipeline posterior replicates
 SEED    <- 123
 
 ## ---- Gridcell-area cap: years before a burned-out cell can burn again -----
@@ -63,6 +63,20 @@ CAP_RECOVERY_YEARS <- switch(PERIOD,
                              paleo       = 12,
                              stop("PERIOD must be 'training', 'calibration', or 'paleo'")
 )
+
+## ---- Extreme-fire threshold during Gamma sampling -------------------------
+## TRUE (default): the extreme component's Gamma draws are truncated below
+## at burned_area_threshold (m20's 95th-percentile classification cutoff),
+## via rejection sampling -- see rgamma_truncated() below. This keeps a
+## fire classified "extreme" from ever sampling an implausibly small
+## magnitude, correcting the mismatch between the extreme Gamma's training
+## data (fires already >= threshold) and its otherwise-unbounded support.
+## FALSE: the extreme component samples an ordinary, UNTRUNCATED rgamma()
+## -- set this to see how the pipeline's output responds without the
+## threshold constraint (e.g. to check how much the truncation correction
+## itself is driving total predicted burned area).
+APPLY_EXTREME_TRUNCATION <- FALSE
+
 
 ## ---- Strike-count extreme-tail correction (GPD replacement) --------------
 ## Rather than hard-capping n_strikes at a fixed ceiling, draws exceeding
@@ -209,7 +223,12 @@ rate_cal_shift <- readRDS(file.path(rds_root, "Ignition_Efficiency/redo/beta_bin
 
 
 # --- Burned area: mixture model (classifier + extreme Gamma + typical Gamma) -
-mixture_obj  <- readRDS(file.path(rds_root, "Burned_Area/redo/m3_bayes_mixture_custom.rds"))
+# Using m20 (formula-based, with interaction terms + VPD), fit via
+# fit_mixture_gamma_formula() -- NOT m3. Unlike m3, m20's predictor sets
+# are stored as FORMULA OBJECTS (to preserve interaction terms), not plain
+# predictor-name vectors, so downstream prediction code uses model.matrix()
+# against these formulas rather than simple column subsetting.
+mixture_obj  <- readRDS(file.path(rds_root, "Burned_Area/redo/m20_mixture_interactions.rds"))
 fit_logit    <- mixture_obj$fit_logit
 fit_extreme  <- mixture_obj$fit_extreme
 fit_normal   <- mixture_obj$fit_normal
@@ -220,14 +239,22 @@ normal_posterior  <- rstan::extract(fit_normal,  pars = c("alpha", "beta", "phi"
 
 n_mixture_draws <- length(logit_posterior$alpha)
 
-preds_classifier <- c("urban_proximity_binary", "rh", "tair", "precip", "tair_5y")
-preds_extreme     <- c("U", "tair")
-preds_typical     <- c("urban_proximity_binary", "tair_2m", "tair")
+# m20's predictor formulas (with interactions), suppressing the intercept
+# column since alpha is estimated separately in Stan -- matches exactly
+# how fit_mixture_gamma_formula() built these at fitting time.
+formula_classifier <- update(mixture_obj$formula_classifier, ~ . - 1)
+formula_extreme     <- update(mixture_obj$formula_extreme,     ~ . - 1)
+formula_typical      <- update(mixture_obj$formula_typical,      ~ . - 1)
 
-# Fixed calibration shift for p_extreme (fitted once on the training period,
-# reused unchanged for calibration/paleo -- matches the original scripts)
-extreme_cal_params <- readRDS(file.path(rds_root, "Burned_Area/extreme_cal_shift.rds"))
-extreme_cal_shift  <- extreme_cal_params$extreme_cal_shift
+# m20's extreme-fire classification threshold, needed for truncated sampling
+burned_area_threshold <- mixture_obj$threshold
+
+# NOTE: the p_extreme calibration shift is deliberately NOT applied here.
+# Diagnostic work comparing several shift-derivation methods (compositional
+# drift correction, direct frequency matching, and a numerically-solved
+# target-matching shift) produced inconsistent estimates (ranging ~0.09 to
+# ~0.91) that did not converge on a single trustworthy value. m20's raw,
+# uncalibrated p_extreme is used directly instead.
 eps <- 1e-8
 
 cat("Model objects loaded.\n")
@@ -336,9 +363,9 @@ area_lookup <- read.csv(area_path)
 names(area_lookup)[names(area_lookup) == area_col] <- "area"
 area_lookup <- area_lookup %>% dplyr::select(lat, lon, area)
 
-cat(sprintf("PERIOD = %s | CLIMATE_SOURCE = %s | CAP_RECOVERY_YEARS = %s\n",
+cat(sprintf("PERIOD = %s | CLIMATE_SOURCE = %s | CAP_RECOVERY_YEARS = %s | APPLY_EXTREME_TRUNCATION = %s\n",
             PERIOD, if (PERIOD == "calibration") CLIMATE_SOURCE else "n/a",
-            as.character(CAP_RECOVERY_YEARS)))
+            as.character(CAP_RECOVERY_YEARS), as.character(APPLY_EXTREME_TRUNCATION)))
 
 # =============================================================================
 # 4. LOAD + PREPROCESS DRIVER DATA FOR THE SELECTED PERIOD
@@ -525,20 +552,43 @@ predict_ignition <- function(fire_df, draw_idx) {
 }
 
 ## ---- 5d. Burned area (mixture: classifier + extreme Gamma + typical Gamma) -
+# Vapor pressure deficit (VPD), computed from RAW (unstandardized) tair
+# (Kelvin) and rh (%), using the Tetens saturation-vapor-pressure formula --
+# matches EXACTLY how VPD was computed in the burned-area training script,
+# BEFORE standardization was applied there. Must be computed here from raw
+# driver values for the same reason: era5/bias-corrected TraCE drivers
+# never carry a VPD column natively.
+compute_vpd <- function(tair_kelvin, rh_percent) {
+  tair_C <- tair_kelvin - 273.15
+  es <- 0.6108 * exp((17.27 * tair_C) / (tair_C + 237.3))
+  ea <- es * (rh_percent / 100)
+  es - ea
+}
+
 predict_burned_area <- function(fire_df, draw_idx) {
   scaled <- fire_df %>%
+    mutate(vpd = compute_vpd(tair, rh)) %>%   # compute VPD from RAW tair/rh, BEFORE standardizing either
     mutate(
       rh        = (rh        - get_mu(burned_area_mu_sigma, "rh"))        / get_sigma(burned_area_mu_sigma, "rh"),
       tair      = (tair      - get_mu(burned_area_mu_sigma, "tair"))      / get_sigma(burned_area_mu_sigma, "tair"),
       precip    = (precip    - get_mu(burned_area_mu_sigma, "precip"))    / get_sigma(burned_area_mu_sigma, "precip"),
       tair_2m   = (tair_2m   - get_mu(burned_area_mu_sigma, "tair_2m"))   / get_sigma(burned_area_mu_sigma, "tair_2m"),
       tair_5y   = (tair_5y   - get_mu(burned_area_mu_sigma, "tair_5y"))   / get_sigma(burned_area_mu_sigma, "tair_5y"),
-      U         = (U         - get_mu(burned_area_mu_sigma, "U"))        / get_sigma(burned_area_mu_sigma, "U")
+      U         = (U         - get_mu(burned_area_mu_sigma, "U"))        / get_sigma(burned_area_mu_sigma, "U"),
+      wind       = (wind       - get_mu(burned_area_mu_sigma, "wind"))       / get_sigma(burned_area_mu_sigma, "wind"),
+      C          = (C          - get_mu(burned_area_mu_sigma, "C"))          / get_sigma(burned_area_mu_sigma, "C"),
+      precip_5y  = (precip_5y  - get_mu(burned_area_mu_sigma, "precip_5y"))  / get_sigma(burned_area_mu_sigma, "precip_5y"),
+      precip_3m  = (precip_3m  - get_mu(burned_area_mu_sigma, "precip_3m")) / get_sigma(burned_area_mu_sigma, "precip_3m"),
+      vpd        = (vpd        - get_mu(burned_area_mu_sigma, "vpd"))        / get_sigma(burned_area_mu_sigma, "vpd")
     )
   
-  X_classifier <- as.matrix(scaled[, preds_classifier])
-  X_extreme    <- as.matrix(scaled[, preds_extreme])
-  X_typical    <- as.matrix(scaled[, preds_typical])
+  # model.matrix() against the stored FORMULAS -- necessary (rather than
+  # plain column subsetting) so interaction terms (rh:urban_proximity_binary,
+  # rh:U, rh:vpd, wind:rh) get correctly expanded into their own columns,
+  # matching exactly what these models were fit against.
+  X_classifier <- model.matrix(formula_classifier, data = scaled)
+  X_extreme    <- model.matrix(formula_extreme,    data = scaled)
+  X_typical    <- model.matrix(formula_typical,    data = scaled)
   
   a_logit <- logit_posterior$alpha[draw_idx];   b_logit <- logit_posterior$beta[draw_idx, ]
   a_ext   <- extreme_posterior$alpha[draw_idx]; b_ext   <- extreme_posterior$beta[draw_idx, ]; phi_ext <- extreme_posterior$phi[draw_idx]
@@ -548,41 +598,72 @@ predict_burned_area <- function(fire_df, draw_idx) {
   mu_extreme <- as.numeric(exp(a_ext + X_extreme %*% b_ext))
   mu_typical <- as.numeric(exp(a_typ + X_typical %*% b_typ))
   
-  p_extreme_cal <- plogis(pmin(pmax(
-    qlogis(pmin(pmax(p_extreme, eps), 1 - eps)) + extreme_cal_shift,
-    qlogis(eps)), qlogis(1 - eps)))
-  
   scaled %>%
     mutate(
-      p_extreme_cal = p_extreme_cal,
-      mu_extreme    = mu_extreme,
-      mu_typical    = mu_typical,
-      rate_extreme  = phi_ext / mu_extreme,
-      rate_typical  = phi_typ / mu_typical,
-      phi_extreme   = phi_ext,
-      phi_typical   = phi_typ
+      p_extreme    = p_extreme,   # raw, uncalibrated classifier probability -- no shift applied
+      mu_extreme   = mu_extreme,
+      mu_typical   = mu_typical,
+      rate_extreme = phi_ext / mu_extreme,
+      rate_typical = phi_typ / mu_typical,
+      phi_extreme  = phi_ext,
+      phi_typical  = phi_typ
     ) %>%
-    dplyr::select(lat, lon, year, month, p_extreme_cal, rate_extreme, rate_typical, phi_extreme, phi_typical)
+    dplyr::select(lat, lon, year, month, p_extreme, rate_extreme, rate_typical, phi_extreme, phi_typical)
 }
 
 ## ---- 5e. Sample total burned area given fire_count -------------------------
-sample_total_burned_area <- function(fire_count, p_extreme_cal, rate_extreme, rate_typical,
-                                     phi_extreme, phi_typical) {
+# Extreme-component sampling is TRUNCATED at burned_area_threshold, via
+# rejection sampling (draw ordinary rgamma(), keep only values above
+# threshold, repeat) -- numerically stable regardless of how far into the
+# tail the threshold sits, unlike inverse-CDF truncation. This corrects
+# the mismatch between the extreme Gamma's training data (fires already
+# >= threshold) and its otherwise-unbounded sampling support; the typical
+# component is deliberately left untruncated (see prior discussion: its
+# training data spans the full sub-threshold range, so no equivalent
+# correction is needed or justified there).
+rgamma_truncated <- function(n, shape, rate, lower, max_attempts = 10000) {
+  out <- numeric(n)
+  needed <- rep(TRUE, n)
+  attempts <- 0
+  while (any(needed) && attempts < max_attempts) {
+    candidates <- rgamma(sum(needed), shape = shape, rate = rate)
+    accepted <- candidates > lower
+    out[which(needed)[accepted]] <- candidates[accepted]
+    needed[which(needed)[accepted]] <- FALSE
+    attempts <- attempts + 1
+  }
+  if (any(needed)) out[needed] <- lower  # bounded fallback, never an outlier
+  out
+}
+
+sample_total_burned_area <- function(fire_count, p_extreme, rate_extreme, rate_typical,
+                                     phi_extreme, phi_typical, threshold = burned_area_threshold,
+                                     apply_truncation = APPLY_EXTREME_TRUNCATION) {
   n_rows <- length(fire_count)
   valid_idx <- which(!is.na(fire_count) & fire_count > 0)
   if (length(valid_idx) == 0) return(rep(0, n_rows))
   
   rep_idx      <- rep(valid_idx, times = fire_count[valid_idx])
-  rep_p_ext    <- rep(p_extreme_cal[valid_idx], times = fire_count[valid_idx])
+  rep_p_ext    <- rep(p_extreme[valid_idx], times = fire_count[valid_idx])
   rep_rate_ext <- rep(rate_extreme[valid_idx], times = fire_count[valid_idx])
   rep_rate_typ <- rep(rate_typical[valid_idx], times = fire_count[valid_idx])
   
   is_extreme <- rbinom(length(rep_idx), size = 1, prob = rep_p_ext)
-  samples <- ifelse(
-    is_extreme == 1,
-    rgamma(length(rep_idx), shape = phi_extreme[1], rate = rep_rate_ext),
-    rgamma(length(rep_idx), shape = phi_typical[1], rate = rep_rate_typ)
-  )
+  
+  n_ext <- sum(is_extreme == 1)
+  ext_samples <- if (n_ext > 0) {
+    if (apply_truncation) {
+      rgamma_truncated(n_ext, shape = phi_extreme[1], rate = rep_rate_ext[is_extreme == 1], lower = threshold)
+    } else {
+      rgamma(n_ext, shape = phi_extreme[1], rate = rep_rate_ext[is_extreme == 1])
+    }
+  } else {
+    numeric(0)
+  }
+  
+  samples <- numeric(length(rep_idx))
+  samples[is_extreme == 1]  <- ext_samples
+  samples[is_extreme == 0] <- rgamma(sum(is_extreme == 0), shape = phi_typical[1], rate = rep_rate_typ[is_extreme == 0])
   
   row_sums <- tapply(samples, rep_idx, sum)
   out <- rep(0, n_rows)
@@ -591,7 +672,8 @@ sample_total_burned_area <- function(fire_count, p_extreme_cal, rate_extreme, ra
 }
 
 ## ---- 5f. Gridcell-area cap (unchanged core logic from original scripts) ---
-apply_area_cap <- function(df, raw_col = "total_burned_area", recovery_years = Inf) {
+apply_area_cap <- function(df, raw_col = "total_burned_area", output_col = "total_burned_area_capped",
+                           recovery_years = Inf) {
   n <- nrow(df)
   area <- df$area[1]
   capped <- numeric(n)
@@ -616,11 +698,12 @@ apply_area_cap <- function(df, raw_col = "total_burned_area", recovery_years = I
       recovery_until_year <- this_year + recovery_years
     }
   }
-  df$total_burned_area_capped <- capped
+  df[[output_col]] <- capped
   df
 }
 
-apply_cap_to_dataset <- function(data, area_lookup, recovery_years = Inf) {
+apply_cap_to_dataset <- function(data, area_lookup, raw_col = "total_burned_area",
+                                 output_col = "total_burned_area_capped", recovery_years = Inf) {
   data <- data %>% mutate(lat = round(lat, 4), lon = round(lon, 4))
   area_lookup <- area_lookup %>%
     mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
@@ -632,7 +715,7 @@ apply_cap_to_dataset <- function(data, area_lookup, recovery_years = Inf) {
     filter(!is.na(area)) %>%
     arrange(lat, lon, year, month) %>%
     group_by(lat, lon) %>%
-    group_modify(~ apply_area_cap(.x, recovery_years = recovery_years)) %>%
+    group_modify(~ apply_area_cap(.x, raw_col = raw_col, output_col = output_col, recovery_years = recovery_years)) %>%
     ungroup()
 }
 
@@ -685,13 +768,18 @@ for (d in seq_len(N_DRAWS)) {
   
   fire_rep <- fire_rep %>%
     left_join(ba_df, by = c("lat", "lon", "year", "month")) %>%
-    mutate(total_burned_area = sample_total_burned_area(
-      fire_count_pred, p_extreme_cal, rate_extreme, rate_typical, phi_extreme, phi_typical
-    ))
+    mutate(
+      total_burned_area = sample_total_burned_area(
+        fire_count_pred, p_extreme, rate_extreme, rate_typical, phi_extreme, phi_typical
+      )
+    )
   t4 <- Sys.time()
   
   # -- 5. gridcell-area cap --
-  fire_rep <- apply_cap_to_dataset(fire_rep, area_lookup, recovery_years = CAP_RECOVERY_YEARS)
+  fire_rep <- apply_cap_to_dataset(fire_rep, area_lookup,
+                                   raw_col = "total_burned_area",
+                                   output_col = "total_burned_area_capped",
+                                   recovery_years = CAP_RECOVERY_YEARS)
   t5 <- Sys.time()
   
   # Per-stage timing, printed for the first 3 draws so a bottleneck shows up
@@ -714,8 +802,8 @@ for (d in seq_len(N_DRAWS)) {
   draw_result <- fire_rep %>%
     mutate(draw_id = d) %>%
     dplyr::select(draw_id, lat, lon, year, month, r_strike, n_strikes_raw, n_strikes,
-                  p_ignite_rate_cal, fire_count_pred, total_burned_area,
-                  total_burned_area_capped)
+                  p_ignite_rate_cal, fire_count_pred,
+                  total_burned_area, total_burned_area_capped)
   
   write.table(draw_result, OUTPUT_FILE, sep = ",", row.names = FALSE,
               col.names = first_write, append = !first_write)

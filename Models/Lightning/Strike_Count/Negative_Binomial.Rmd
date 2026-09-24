@@ -42,6 +42,8 @@ base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
 #open 
 config_file_path <- file.path(base_path, "paleo_config.properties")
 
+config <- read_properties(config_file_path)
+
 # Extract values from config
 drivers_root <- config[["drivers_root"]]
 rds_root <- config[["rds_root"]]
@@ -51,7 +53,7 @@ mu_sigma_root <- config[["mu_sigma_root"]]
 performance_root <- config[["performance_root"]]
 figure_root <- config[["figure_root"]]
 fire_data_root <- config[["fire_data_root"]]
-paleocliamte_data_root <- config[["paleocliamte_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
 era5_data_root <- config[["era5_data_root"]]
 ```
 

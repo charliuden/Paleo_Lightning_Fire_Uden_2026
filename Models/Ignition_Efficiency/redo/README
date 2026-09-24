@@ -1,0 +1,18 @@
+Beta_Binomial_Rate_Calibration.Rmd contains the final fitting approach. 
+It uses updated fire location and correctly aggregated striek counts: 
+"lightning_ignition_jja_2002_2011_new_no_outliers.csv"
+It tests a rate calibration shift on glm fit models to check that the shift is 
+necessayr. It then fits a bayes version of the beta binomial and applies the final 
+rate shift. 
+
+beta_binomial_ignition.stan contains the stan code for this beta binomial model
+
+Beta_Binomial_vs_Binomial_Logistic_Regression_Rate_Calibration.Rmd:
+compares previsously used binomial logistic regression with a beta binomial model
+beta bnomial outperforms
+
+Random_Forest.Rmd: checks for predictor imortance from the updated drivers, 
+"lightning_ignition_jja_2002_2011_new_no_outliers.csv"
+
+revalibration.Rmd is a relic from previous approaches. With the updated drivers, 
+the model does not need a secondary rate calibration. 

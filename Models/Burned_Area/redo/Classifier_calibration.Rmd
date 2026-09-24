@@ -1,0 +1,531 @@
+---
+title: "Classifier_calibration"
+output: html_document
+---
+
+P(extreme) classifer for burned area over estimates the probability of an extreme fire. This script estimates a calibration shift to be applied to each P(extreme) draw. 
+
+A logit-space calibration shift was applied to $p_i$ prior to prediction, 
+
+\begin{equation}\label{eq:p_extreme_cal}
+    \text{logit}(p_i^{\text{cal}}) = \text{logit}(p_i) + \delta_{\text{ext}}
+\end{equation}
+
+to correct overestimates of extreme-fire outcome probability relative tothe training data. Overestimates resulted from the co-occurrence of conditions driving both fire count and fire size, amplifying predicted total burned area. The shift $\delta_{\text{ext}}$ was estimated by aligning the average predicted $p_i$ between the simulated, fire-occurring gridcell-months and the historically observed, fire-occurring gridcell-month population, and was applied uniformly across all out-of-sample and palaeoclimate predictions, analogous to the ignition rate calibration shift applied earlier in the pipeline. As with the previous model, human proximity indicators were set to zero for the palaeoclimate application, representing a pre suppression fire regime.
+
+
+The reason the original design compares simulated fire-occurring gridcell-months against real ones (rather than just checking whether p_extreme's mean matches the true observed extreme-fire rate directly) is to correct for compositional drift: if the strike-count and ignition sub-models systematically select a different mix of conditions into "a fire happened here" than reality does, then p_extreme — even if it's a perfectly well-specified classifier — would show a different average simply because it's being evaluated on a differently-composed population. That's a real, legitimate thing to want to correct for, if the upstream simulation is trustworthy.
+
+```{r}
+library(dplyr)
+library(rstan)
+library(evd)
+```
+
+Load configuration files
+- location of model drivers, rds files (containing models), tables of parameter estimates and performance metrics, and figures. 
+```{r}
+read_properties <- function(file_path) {
+  lines <- readLines(file_path)
+  lines <- lines[grepl("=", lines)]  # only keep lines with key-value pairs
+  key_vals <- strsplit(lines, "=")
+  props <- setNames(
+    trimws(sapply(key_vals, `[`, 2)),
+    trimws(sapply(key_vals, `[`, 1))
+  )
+  return(props)
+}
+
+# *** paleo_config.properties must be in Paleo_Lightning_Fire_Uden_2026
+#location of this script:
+current_path <- dirname(rstudioapi::getActiveDocumentContext()$path)
+#get path to this project
+base_path <- sub("(.*Paleo_Lightning_Fire_Uden_2026).*", "\\1", current_path)
+#open 
+config_file_path <- file.path(base_path, "paleo_config.properties")
+
+config <- read_properties(config_file_path)
+
+# Extract values from config
+drivers_root <- config[["drivers_root"]]
+rds_root <- config[["rds_root"]]
+table_root <- config[["table_root"]]
+predictions_root <- config[["predictions_root"]]
+mu_sigma_root <- config[["mu_sigma_root"]]
+performance_root <- config[["performance_root"]]
+figure_root <- config[["figure_root"]]
+fire_data_root <- config[["fire_data_root"]]
+paleoclimate_data_root <- config[["paleoclimate_data_root"]]
+proximity_data_root <- config[["proximity_data_root"]]
+era5_data_root <- config[["era5_data_root"]]
+
+```
+
+```{r}
+
+# =============================================================================
+# Standalone p_extreme calibration-shift derivation for m20.
+#
+# This does NOT require the full 500-draw, spatially-capped simulation
+# pipeline. It needs three sub-models applied once, at their posterior
+# MEANS (deterministic), plus a small number of stochastic replicates of
+# the fire-count step (the only place randomness enters):
+#
+#   1. Lightning strike rate (Gamma, posterior mean) -> mu_r_strike_gridcell
+#   2. Strike count (NegBinomial, posterior mean theta) -> n_strikes (rnbinom)
+#   3. Ignition efficiency (Beta-Binomial, posterior mean) -> p_ignite_rate_cal
+#      -> fire_count_pred (rbinom)
+#   4. Burned-area classifier (m20, posterior mean) -> p_extreme
+#
+# The shift is the logit-space difference between p_extreme's mean among
+# REAL fires (burned_area_km2_total > 0) and p_extreme's mean among
+# SIMULATED fires (fire_count_pred > 0), averaged over R stochastic
+# replicates of steps 2-3 for stability (the original derivation used a
+# single, unseeded replicate).
+# =============================================================================
+
+eps <- 1e-8
+R_REPLICATES <- 50   # number of stochastic replicates of n_strikes/fire_count_pred to average over
+
+get_mu    <- function(tbl, var) tbl$mu[tbl$var == var]
+get_sigma <- function(tbl, var) tbl$sigma[tbl$var == var]
+
+compute_vpd <- function(tair_kelvin, rh_percent) {
+  tair_C <- tair_kelvin - 273.15
+  es <- 0.6108 * exp((17.27 * tair_C) / (tair_C + 237.3))
+  ea <- es * (rh_percent / 100)
+  es - ea
+}
+
+# =============================================================================
+# 1. LOAD MODEL OBJECTS
+# =============================================================================
+B12          <- readRDS(file.path(rds_root, "Lightning/B12_gamma_bayes.rds"))
+nb_model     <- readRDS(file.path(rds_root, "Lightning/neg_bin_strike_count_no_outliers.rds"))
+ignition_obj <- readRDS(file.path(rds_root, "Ignition_Efficiency/redo/beta_binomial_ignition_bayes.rds"))
+rate_cal_shift <- readRDS(file.path(rds_root, "Ignition_Efficiency/redo/beta_binomial_calibration_shift.rds"))$rate_cal_shift
+mixture_obj  <- readRDS(file.path(rds_root, "Burned_Area/redo/m20_mixture_interactions.rds"))
+
+lightning_posterior <- as.data.frame(B12)
+nb_posterior        <- rstan::extract(nb_model$fit, pars = c("gamma_0", "gamma"))
+ignition_posterior  <- rstan::extract(ignition_obj$fit, pars = c("alpha", "beta"))
+
+summ_logit   <- rstan::summary(mixture_obj$fit_logit,   pars = c("alpha", "beta"))$summary
+alpha_logit_mean <- summ_logit["alpha", "mean"]
+beta_logit_mean  <- summ_logit[grep("^beta\\[", rownames(summ_logit)), "mean"]
+
+formula_classifier <- update(mixture_obj$formula_classifier, ~ . - 1)
+predictors_ignition <- ignition_obj$predictors
+
+# Posterior means for the lightning/strike-count/ignition sub-models
+alpha_lightning <- mean(lightning_posterior$a_alpha)
+beta_lightning  <- sapply(c("b_alpha", "c_alpha", "d_alpha", "e_alpha", "f_alpha"), function(v) mean(lightning_posterior[[v]]))
+beta_lightning_rate  <- mean(lightning_posterior$a_beta)
+beta_lightning_rateb <- sapply(c("b_beta", "c_beta", "d_beta", "e_beta", "f_beta"), function(v) mean(lightning_posterior[[v]]))
+
+gamma_0_mean  <- mean(nb_posterior$gamma_0)
+gamma_means   <- colMeans(nb_posterior$gamma)
+theta_predictors <- c("swr", "tair", "rh", "precip", "sp", "wind")
+
+alpha_ignite_mean <- mean(ignition_posterior$alpha)
+beta_ignite_mean  <- colMeans(ignition_posterior$beta)
+
+cat("Model objects loaded (posterior means computed).\n")
+```
+
+
+```{r}
+# =============================================================================
+# 2. LOAD DRIVER DATA -- the SAME training-period files used to fit these
+# models, so this reproduces the exact real-fire/predictor population.
+# =============================================================================
+lightning_mu_sigma   <- read.csv(file.path(mu_sigma_root, "mu_sigma_lightning_predictors.csv"))
+n_strike_mu_sigma    <- read.csv(file.path(mu_sigma_root, "mu_sigma_lightning_count_predictors.csv"))
+ignition_mu_sigma    <- read.csv(file.path(mu_sigma_root, "mu_sigma_ignition_predictors_redo.csv"))
+burned_area_mu_sigma <- read.csv(file.path(mu_sigma_root, "mu_sigma_burned_area_predictors.csv"))
+# NOTE: burned_area_mu_sigma must already include rows for wind, C,
+# precip_5y, precip_3m, and vpd (added for m20) -- see earlier pipeline edit.
+
+area <- read.csv(file.path(paleoclimate_data_root, "era5_grid_area.csv")) %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  distinct(lat, lon, .keep_all = TRUE)
+
+# Proximity/land-use data (urban_proximity_binary and related flags) --
+# not a raw climate driver, so it isn't in ignition_new/ba_new; needs joining separately,
+# matching the convention used in the full pipeline.
+proximity <- read.csv(file.path(proximity_data_root, "era5_proximity_road_river_urban.csv")) %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  distinct(lat, lon, .keep_all = TRUE)
+
+lightning <- read.csv(file.path(drivers_root, "lightning_strike_count_climate_jja_2002_2011_no_outliers.csv"))
+ignition_new <- read.csv(file.path(drivers_root, "lightning_ignition_jja_2002_2011_new_no_outliers.csv"))[, 2:26]
+ba_new       <- read.csv(file.path(drivers_root, "burned_area_jja_2002_2011_new.csv"))
+lightning_rate_driver <- read.csv(file.path(drivers_root, "lightning_strike_rate_climate_jja_2002_2011.csv")) %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4))
+
+```
+
+
+```{r}
+# =============================================================================
+# 3. STRIKE RATE + STRIKE COUNT (posterior-mean point estimates, single
+# stochastic realization of n_strikes per replicate)
+# =============================================================================
+
+lightning_rate_scaled <- lightning_rate_driver %>%
+  mutate(
+    swr_s    = (swr    - get_mu(lightning_mu_sigma, "swr"))    / get_sigma(lightning_mu_sigma, "swr"),
+    tair_s   = (tair   - get_mu(lightning_mu_sigma, "tair"))   / get_sigma(lightning_mu_sigma, "tair"),
+    rh_s     = (rh     - get_mu(lightning_mu_sigma, "rh"))     / get_sigma(lightning_mu_sigma, "rh"),
+    precip_s = (precip - get_mu(lightning_mu_sigma, "precip")) / get_sigma(lightning_mu_sigma, "precip"),
+    sp_s     = (sp     - get_mu(lightning_mu_sigma, "sp"))     / get_sigma(lightning_mu_sigma, "sp")
+  )
+
+lp_alpha <- alpha_lightning + as.matrix(lightning_rate_scaled[, c("swr_s","tair_s","rh_s","precip_s","sp_s")]) %*% beta_lightning
+lp_beta  <- beta_lightning_rate + as.matrix(lightning_rate_scaled[, c("swr_s","tair_s","rh_s","precip_s","sp_s")]) %*% beta_lightning_rateb
+r_strike_mean_summer <- exp(as.numeric(lp_alpha)) / exp(as.numeric(lp_beta))
+
+lightning_rate_scaled$r_strike_mean <- r_strike_mean_summer
+
+# GPD tail correction, matching the production pipeline exactly: replaces
+# NegBinomial draws exceeding STRIKE_GPD_THRESH with fresh draws from the
+# fitted GPD tail, rather than leaving the NB's occasionally-runaway raw
+# draws uncorrected.
+STRIKE_GPD_THRESH <- 100
+STRIKE_GPD_SIGMA  <- 25.5900251
+STRIKE_GPD_XI     <- -0.1429466
+
+apply_gpd_tail_correction <- function(raw_draws, u, sigma, xi) {
+  if (is.infinite(u)) return(raw_draws)
+  corrected <- raw_draws
+  exceed_idx <- which(raw_draws > u)
+  if (length(exceed_idx) > 0) {
+    corrected[exceed_idx] <- round(u + evd::rgpd(length(exceed_idx), loc = 0, scale = sigma, shape = xi))
+  }
+  corrected
+}
+
+n_strike_scaled <- lightning %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  mutate(
+    swr_s    = (swr    - get_mu(n_strike_mu_sigma, "swr"))    / get_sigma(n_strike_mu_sigma, "swr"),
+    tair_s   = (tair   - get_mu(n_strike_mu_sigma, "tair"))   / get_sigma(n_strike_mu_sigma, "tair"),
+    rh_s     = (rh     - get_mu(n_strike_mu_sigma, "rh"))     / get_sigma(n_strike_mu_sigma, "rh"),
+    precip_s = (precip - get_mu(n_strike_mu_sigma, "precip")) / get_sigma(n_strike_mu_sigma, "precip"),
+    sp_s     = (sp     - get_mu(n_strike_mu_sigma, "sp"))     / get_sigma(n_strike_mu_sigma, "sp"),
+    wind_s   = (wind   - get_mu(n_strike_mu_sigma, "wind"))   / get_sigma(n_strike_mu_sigma, "wind")
+  ) %>%
+  left_join(area, by = c("lat", "lon"))
+
+n_strike_scaled_n_before_filter <- nrow(n_strike_scaled)
+
+n_strike_scaled <- n_strike_scaled %>% filter(!is.na(area))
+
+cat(sprintf("n_strike_scaled: %d rows before domain filter, %d rows after (%.1f%% retained)\n",
+            n_strike_scaled_n_before_filter, nrow(n_strike_scaled),
+            100 * nrow(n_strike_scaled) / n_strike_scaled_n_before_filter))
+
+# Lightning strike rate (Gamma, posterior mean): alpha = shape, beta = rate
+n_strike_scaled <- n_strike_scaled %>%
+  left_join(lightning_rate_scaled %>% dplyr::select(lat, lon, year, r_strike_mean), by = c("lat", "lon", "year"))
+
+#get strikes per gridcell (rahter than km2)
+n_strike_scaled$mu_r_strike_gridcell <- n_strike_scaled$r_strike_mean * n_strike_scaled$area
+
+Z_fire <- as.matrix(n_strike_scaled[, c("swr_s","tair_s","rh_s","precip_s","sp_s","wind_s")])
+theta_pred <- exp(as.numeric(gamma_0_mean + Z_fire %*% gamma_means))
+```
+
+
+```{r}
+# =============================================================================
+# 4. IGNITION EFFICIENCY (posterior-mean point estimate)
+#
+# ignition_new/ignition_scaled is now the SOLE gridcell-month driver frame
+# going forward -- it already carries every predictor the burned-area
+# classifier needs (rh, tair, U, C, wind, precip_3m, tair_2m, tair_5y) plus
+# the TRUE observed fire_count, so there is no need to rebuild or join a
+# separate `fire` object at all.
+# =============================================================================
+ignition_scaled <- ignition_new %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  mutate(across(all_of(predictors_ignition), function(x) {
+    var_name <- cur_column()
+    (x - get_mu(ignition_mu_sigma, var_name)) / get_sigma(ignition_mu_sigma, var_name)
+  }))
+
+X_ignite <- as.matrix(ignition_scaled[, predictors_ignition])
+p_ignite_linpred <- alpha_ignite_mean + X_ignite %*% beta_ignite_mean
+ignition_scaled$p_ignite_rate_cal <- plogis(as.numeric(p_ignite_linpred) + rate_cal_shift)
+```
+
+
+```{r}
+# =============================================================================
+# 5a. BURNED-AREA CLASSIFIER -- SIMULATED population (every gridcell-month),
+# built entirely from ignition_new's own predictors -- no `fire` needed.
+# =============================================================================
+sim_pool <- ignition_new %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  left_join(proximity, by = c("lat", "lon")) %>%
+  mutate(vpd = compute_vpd(tair, rh)) %>%   # from RAW tair/rh, before standardizing either
+  mutate(
+    rh        = (rh        - get_mu(burned_area_mu_sigma, "rh"))        / get_sigma(burned_area_mu_sigma, "rh"),
+    tair      = (tair      - get_mu(burned_area_mu_sigma, "tair"))      / get_sigma(burned_area_mu_sigma, "tair"),
+    precip    = (precip    - get_mu(burned_area_mu_sigma, "precip"))    / get_sigma(burned_area_mu_sigma, "precip"),
+    tair_2m   = (tair_2m   - get_mu(burned_area_mu_sigma, "tair_2m"))   / get_sigma(burned_area_mu_sigma, "tair_2m"),
+    tair_5y   = (tair_5y   - get_mu(burned_area_mu_sigma, "tair_5y"))   / get_sigma(burned_area_mu_sigma, "tair_5y"),
+    U         = (U         - get_mu(burned_area_mu_sigma, "U"))        / get_sigma(burned_area_mu_sigma, "U"),
+    wind      = (wind      - get_mu(burned_area_mu_sigma, "wind"))      / get_sigma(burned_area_mu_sigma, "wind"),
+    C         = (C         - get_mu(burned_area_mu_sigma, "C"))         / get_sigma(burned_area_mu_sigma, "C"),
+    precip_5y = (precip_5y - get_mu(burned_area_mu_sigma, "precip_5y")) / get_sigma(burned_area_mu_sigma, "precip_5y"),
+    precip_3m = (precip_3m - get_mu(burned_area_mu_sigma, "precip_3m")) / get_sigma(burned_area_mu_sigma, "precip_3m"),
+    vpd       = (vpd       - get_mu(burned_area_mu_sigma, "vpd"))       / get_sigma(burned_area_mu_sigma, "vpd")
+  )
+
+if (anyNA(sim_pool$urban_proximity_binary)) {
+  warning(sprintf(
+    "%d rows in `ignition_new` had no matching coordinates in the proximity file -- check coverage/rounding.",
+    sum(is.na(sim_pool$urban_proximity_binary))
+  ))
+}
+
+X_classifier_sim <- model.matrix(formula_classifier, data = sim_pool)
+sim_pool$p_extreme <- plogis(as.numeric(alpha_logit_mean + X_classifier_sim %*% beta_logit_mean))
+
+# Attach TRUE observed fire_count and p_ignite_rate_cal (same row order,
+# both built from ignition_new/ignition_scaled directly) for use below.
+sim_pool$fire_count_obs   <- ignition_new$fire_count
+sim_pool$p_ignite_rate_cal <- ignition_scaled$p_ignite_rate_cal
+```
+
+
+```{r}
+# =============================================================================
+# 5b. BURNED-AREA CLASSIFIER -- REAL fires, built directly from ba_new.
+# Excludes the same "null" rows dropped during the original ignition/m20
+# fitting pipeline (fires with fire_count exceeding strike_count -- data
+# inconsistencies with no corresponding lightning strike), so this matches
+# EXACTLY the train+test population m20 was fit and evaluated on.
+# =============================================================================
+null_rows <- read.csv(file.path(drivers_root, "null_ignition_rows_training_data_2002-2011.csv")) %>%
+  dplyr::select(-X) %>%
+  dplyr::select(year, lat, lon, month, fire_count) %>%
+  dplyr::rename(fire_count_null = fire_count) %>%
+  dplyr::mutate(null_row = 1)
+
+real_fires_scaled <- ba_new %>%
+  filter(!is.na(burned_area_km2_total), burned_area_km2_total > 0) %>%
+  mutate(lat = round(lat, 4), lon = round(lon, 4)) %>%
+  full_join(null_rows, by = c("lon", "lat", "year", "month")) %>%
+  mutate(null_row = replace_na(null_row, 0)) %>%
+  filter(null_row == 0) %>%                       # <-- the actual fix: drop null rows
+  dplyr::select(-fire_count_null, -null_row) %>%
+  left_join(proximity, by = c("lat", "lon")) %>%
+  mutate(vpd = compute_vpd(tair, rh)) %>%
+  mutate(
+    rh        = (rh        - get_mu(burned_area_mu_sigma, "rh"))        / get_sigma(burned_area_mu_sigma, "rh"),
+    tair      = (tair      - get_mu(burned_area_mu_sigma, "tair"))      / get_sigma(burned_area_mu_sigma, "tair"),
+    precip    = (precip    - get_mu(burned_area_mu_sigma, "precip"))    / get_sigma(burned_area_mu_sigma, "precip"),
+    tair_2m   = (tair_2m   - get_mu(burned_area_mu_sigma, "tair_2m"))   / get_sigma(burned_area_mu_sigma, "tair_2m"),
+    tair_5y   = (tair_5y   - get_mu(burned_area_mu_sigma, "tair_5y"))   / get_sigma(burned_area_mu_sigma, "tair_5y"),
+    U         = (U         - get_mu(burned_area_mu_sigma, "U"))        / get_sigma(burned_area_mu_sigma, "U"),
+    wind      = (wind      - get_mu(burned_area_mu_sigma, "wind"))      / get_sigma(burned_area_mu_sigma, "wind"),
+    C         = (C         - get_mu(burned_area_mu_sigma, "C"))         / get_sigma(burned_area_mu_sigma, "C"),
+    precip_5y = (precip_5y - get_mu(burned_area_mu_sigma, "precip_5y")) / get_sigma(burned_area_mu_sigma, "precip_5y"),
+    precip_3m = (precip_3m - get_mu(burned_area_mu_sigma, "precip_3m")) / get_sigma(burned_area_mu_sigma, "precip_3m"),
+    vpd       = (vpd       - get_mu(burned_area_mu_sigma, "vpd"))       / get_sigma(burned_area_mu_sigma, "vpd")
+  )
+
+cat(sprintf("real_fires_scaled: %d rows (target: 1283, matching train+test)\n", nrow(real_fires_scaled)))
+
+if (anyNA(real_fires_scaled$urban_proximity_binary)) {
+  warning(sprintf(
+    "%d rows in `ba_new` had no matching coordinates in the proximity file -- check coverage/rounding.",
+    sum(is.na(real_fires_scaled$urban_proximity_binary))
+  ))
+}
+
+X_classifier_real <- model.matrix(formula_classifier, data = real_fires_scaled)
+p_extreme_real_fires <- plogis(as.numeric(alpha_logit_mean + X_classifier_real %*% beta_logit_mean))
+mean_logit_real <- mean(qlogis(pmin(pmax(p_extreme_real_fires, eps), 1 - eps)), na.rm = TRUE)
+
+cat(sprintf("Real-fire p_extreme mean: %.5f (n = %d)\n", mean(p_extreme_real_fires, na.rm = TRUE), length(p_extreme_real_fires)))
+```
+
+
+```{r}
+# =============================================================================
+# VALIDATION: compare simulated strike count / fire count against the TRUE
+# observed values -- n_strike_scaled already carries real strike_count
+# (from `lightning`), and ignition_new/sim_pool already carries real
+# fire_count -- no separate `fire` object needed.
+# =============================================================================
+set.seed(123)
+
+n_strikes_raw_check <- rnbinom(nrow(n_strike_scaled), mu = n_strike_scaled$mu_r_strike_gridcell, size = theta_pred)
+n_strikes_check     <- apply_gpd_tail_correction(n_strikes_raw_check, STRIKE_GPD_THRESH, STRIKE_GPD_SIGMA, STRIKE_GPD_XI)
+
+strikes_check <- n_strike_scaled %>%
+  dplyr::select(lat, lon, year, month, strike_count) %>%
+  mutate(n_strikes_sim = n_strikes_check)
+
+# Join strikes_check onto sim_pool BY KEY -- n_strike_scaled (from `lightning`)
+# and sim_pool (from `ignition_new`) are different source files, so row
+# alignment cannot be assumed even though both currently have 132,630 rows.
+comparison <- sim_pool %>%
+  dplyr::select(lat, lon, year, month, fire_count_obs, p_ignite_rate_cal) %>%
+  left_join(strikes_check, by = c("lat", "lon", "year", "month")) %>%
+  mutate(fire_count_sim = mapply(function(n, p) rbinom(1, size = n, prob = p), n_strikes_sim, p_ignite_rate_cal))
+
+cat(sprintf("Total OBSERVED strikes: %d | Total SIMULATED strikes: %d\n",
+            sum(comparison$strike_count, na.rm = TRUE), sum(comparison$n_strikes_sim, na.rm = TRUE)))
+cat(sprintf("Total OBSERVED fires:   %d | Total SIMULATED fires:   %d\n",
+            sum(comparison$fire_count_obs, na.rm = TRUE), sum(comparison$fire_count_sim, na.rm = TRUE)))
+cat(sprintf("Correlation (strikes):  %.3f\n", cor(comparison$strike_count, comparison$n_strikes_sim, use = "complete.obs")))
+cat(sprintf("Correlation (fires):    %.3f\n", cor(comparison$fire_count_obs, comparison$fire_count_sim, use = "complete.obs")))
+```
+Poor correlation for fire count is due to observations containing some gridcell months with just a few strikes but still seeing a fire, for example fire(1)/strike count (1) = 1. p_ignite never reaches 1, which shuold be the case. But this means their distributions will look different. Its going to to be very difficult for the model to get the exact gridcell month that a fire occurred in - low correlation. Instead, its better to compare binned probability predictions with observed rates:
+
+Compare p_ignite and ignition rate
+```{r}
+ig <- ignition_new %>%
+    dplyr::select(lat, lon, year, month, fire_count) %>%
+    left_join(lightning, by = c("lat", "lon", "year", "month"))
+ig$p_ignite_rate_cal <- ignition_scaled$p_ignite_rate_cal
+#calculate ignition rate
+ig <- ig  %>% mutate(ig_rate = ifelse(strike_count > 0, fire_count / strike_count, 0))
+#Bin by predicted probability, check whether OBSERVED ignition rate tracks PREDICTED rate once small-sample noise is averaged out
+ig_binned <- ig %>%
+    dplyr::filter(strike_count > 0) %>%
+    dplyr::mutate(prob_bin = ntile(p_ignite_rate_cal, 10)) %>%
+    dplyr::group_by(prob_bin) %>%
+    dplyr::summarise(
+        mean_predicted = mean(p_ignite_rate_cal),
+        observed_rate  = sum(fire_count) / sum(strike_count),
+        n_strikes_in_bin = sum(strike_count)
+    )
+
+print(ig_binned)
+```
+binned ignition probabilities compared with observed rates reveals close match!
+
+```{r}
+# =============================================================================
+# 6. STOCHASTIC REPLICATES: n_strikes -> fire_count_pred -> p_extreme
+# among SIMULATED fires, averaged over R_REPLICATES for a stable estimate
+# =============================================================================
+set.seed(123)
+
+mean_logit_simulated_by_rep <- numeric(R_REPLICATES)
+
+for (r in seq_len(R_REPLICATES)) {
+  n_strikes_raw_r <- rnbinom(nrow(n_strike_scaled), mu = n_strike_scaled$mu_r_strike_gridcell, size = theta_pred)
+  n_strikes_r     <- apply_gpd_tail_correction(n_strikes_raw_r, STRIKE_GPD_THRESH, STRIKE_GPD_SIGMA, STRIKE_GPD_XI)
+
+  # Join n_strikes onto sim_pool BY KEY -- same reasoning as the validation
+  # chunk above: n_strike_scaled and sim_pool come from different source
+  # files, so positional alignment cannot be assumed.
+  strikes_this_rep <- n_strike_scaled %>%
+    dplyr::select(lat, lon, year, month) %>%
+    mutate(n_strikes_r = n_strikes_r)
+
+  sim_pool_with_strikes_r <- sim_pool %>%
+    dplyr::select(lat, lon, year, month, p_ignite_rate_cal, p_extreme) %>%
+    left_join(strikes_this_rep, by = c("lat", "lon", "year", "month"))
+
+  if (anyNA(sim_pool_with_strikes_r$n_strikes_r)) {
+    warning(sprintf(
+      "Replicate %d: %d rows in `sim_pool` had no matching gridcell-month in `lightning` after the join -- check coverage/coordinate rounding between the two driver files.",
+      r, sum(is.na(sim_pool_with_strikes_r$n_strikes_r))
+    ))
+  }
+
+  fire_count_pred_r <- mapply(function(n, p) rbinom(1, size = n, prob = p),
+                               sim_pool_with_strikes_r$n_strikes_r, sim_pool_with_strikes_r$p_ignite_rate_cal)
+
+  p_extreme_simulated_r <- sim_pool_with_strikes_r$p_extreme[fire_count_pred_r > 0]
+  mean_logit_simulated_by_rep[r] <- mean(qlogis(pmin(pmax(p_extreme_simulated_r, eps), 1 - eps)), na.rm = TRUE)
+}
+
+mean_logit_simulated <- mean(mean_logit_simulated_by_rep)
+
+cat(sprintf("Simulated-fire p_extreme mean (avg over %d replicates): %.5f\n",
+            R_REPLICATES, plogis(mean_logit_simulated)))
+cat(sprintf("Replicate-to-replicate SD of logit-mean: %.5f (stability check -- should be small)\n",
+            sd(mean_logit_simulated_by_rep)))
+```
+
+
+```{r}
+# =============================================================================
+# 7. DERIVE + SAVE THE SHIFT
+# =============================================================================
+extreme_cal_shift <- mean_logit_real - mean_logit_simulated
+cat(sprintf("\nExtreme calibration shift (m20): %.4f\n", extreme_cal_shift))
+
+saveRDS(
+  list(
+    extreme_cal_shift = extreme_cal_shift,
+    mean_logit_real      = mean_logit_real,
+    mean_logit_simulated = mean_logit_simulated,
+    n_real_fires      = length(p_extreme_real_fires),
+    n_replicates      = R_REPLICATES,
+    replicate_sd       = sd(mean_logit_simulated_by_rep),
+    model              = "m20_mixture_interactions"
+  ),
+  file.path(rds_root, "Burned_Area/extreme_cal_shift_m20.rds")   # NEW filename -- does not overwrite the m3-derived shift
+)
+
+cat("Saved to Burned_Area/extreme_cal_shift_m20.rds\n")
+```
+
+does the classifier's average predicted probability match the true empirical rate?
+This does not take into consideration up stream gridecll-month selection by the lightning and fire count model (no dependence on the strike-count/ignition simulation at all).
+```{r}
+# Does p_extreme's mean match the TRUE observed extreme-fire rate among real fires?
+# (Every row in real_fires_scaled already IS a real fire with burned_area_km2_total > 0,
+# so no further filtering is needed here.)
+observed_extreme_rate <- mean(real_fires_scaled$burned_area_km2_total >= mixture_obj$threshold)
+predicted_mean_p_extreme <- mean(p_extreme_real_fires)
+
+cat(sprintf("Observed extreme-fire rate among real fires: %.4f\n", observed_extreme_rate))
+cat(sprintf("Mean predicted p_extreme among real fires:    %.4f\n", predicted_mean_p_extreme))
+
+simple_shift <- qlogis(observed_extreme_rate) - qlogis(predicted_mean_p_extreme)
+cat(sprintf("Simple shift (observed-frequency-based): %.4f\n", simple_shift))
+```
+
+Why is the calibration shift for method A (0.0911) so differnent from method B (-0.7085)?
+
+Method A compares the classifier's own predictions on real fires against its own predictions on the simulated fire-occurring population — both sides are model outputs; ground truth (actual extreme-fire frequency) never enters at all. This tests compositional drift: does the upstream strike-count/ignition simulation select a systematically different mix of conditions than reality does? Now that strike-count and ignition are both fixed and validated, A ≈ 0.026 is telling you compositional drift is now nearly resolved — a genuinely good outcome, and consistent with everything you've fixed over the last several messages.
+
+Method B compares the classifier's predicted probability against the true observed extreme-fire rate — a direct calibration check against ground truth, with no simulation involved at all. B ≈ −0.686 is telling you something different: the classifier itself overpredicts, on real fires, relative to reality
+
+
+Neither number alone is quite what you want for production, though — here's the synthesis. What actually matters for the pipeline is: when the shift gets applied to simulated predictions (which is what production actually samples from), does the result match true observed frequency? That requires combining both pieces — the classifier's own bias-correction (what B captures) applied to the simulated population (what A's structure correctly targets):
+
+
+
+```{r}
+# Solve directly: find delta such that mean(plogis(logit(p_sim) + delta))
+# equals the TRUE observed extreme-fire rate. this 
+# quantity  matches exactly what production actually does with the
+# shift, with no mean-of-logit-vs-logit-of-mean ambiguity at all.
+p_extreme_simulated_all <- sim_pool_with_strikes_r$p_extreme  # or however you're accessing the full simulated population's p_extreme
+
+target_fn <- function(delta) {
+  mean(plogis(qlogis(pmin(pmax(p_extreme_simulated_all, eps), 1 - eps)) + delta)) - observed_extreme_rate
+}
+
+delta_solution <- uniroot(target_fn, interval = c(-10, 10))$root
+cat(sprintf("Numerically-solved shift: %.4f\n", delta_solution))
+```
+
+
+sigh.... calibration correction this unstable across methods, with the shift value jumping around:
+method A, shift based on p(extremem) simulated from observed and predicted fires: 0.0911
+method B, shift based on simulated p(extreme) and observed extreme fire rate: -0.7085
+method C, a combination of both: 0.9083
+
+All are too different to trust. for now, no calibration shift on p(ignite). 

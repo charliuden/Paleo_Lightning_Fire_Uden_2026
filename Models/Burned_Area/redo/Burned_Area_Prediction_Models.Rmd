@@ -75,8 +75,8 @@ null_rows <- read.csv(file.path(drivers_root, "null_ignition_rows_training_data_
 
 null_rows <- null_rows %>%
   dplyr::select(year, lat, lon, month, fire_count) %>%
-  rename(fire_count_null = fire_count) %>%
-  mutate(null_row = 1)
+  dplyr::rename(fire_count_null = fire_count) %>%
+  dplyr::mutate(null_row = 1)
 
 df_nulls <- df %>%
   full_join(null_rows, by = c("lon", "lat", "year", "month")) %>%
@@ -99,6 +99,7 @@ Vapor pressure deficit (VPD), computed from tair (Kelvin) and rh (%),
 using the standard FAO-56 Penman-Monteith / Tetens saturation-vapor-
 pressure formula. Added directly to df, BEFORE the train/test split, so
 it's available to every model downstream exactly like any other predictor.
+**VPD and conifer fraction was used by Coffield et al. (2019) to predict fire size
 # =============================================================================
 ```{r}
 
@@ -337,9 +338,8 @@ within_typical_cor <- sapply(predictors_all, function(v) {
 
 sort(within_typical_cor, decreasing = TRUE)
 ```
-Highes correlation: "urban_proximity_binary", "tair_2m", "tair". RH might be worth including (-0.119), since its opposing negative correlation compared with lightning and ignition models will encourage contraditory outcomes between fire count and size (ie. many small fires)
+Highest correlation: "urban_proximity_binary", "tair_2m", "tair". RH might be worth including (-0.119), since its opposing negative correlation compared with lightning and ignition models will encourage contraditory outcomes between fire count and size (ie. many small fires)
 
-among typical (non-extreme) fires, monthly climate variables explain very little of the variation in burned area on their own.This is consistent with and helps explain the persistently negative R² I keep seeing across every model variant in this whole script (below) It's not that the models are poorly specified, it's that the typical-fire regime may genuinely be close to climate-independent at this temporal/spatial resolution, with size instead driven by factors you don't have in this dataset (fine-scale fuel continuity, suppression response timing, terrain).
 
 And now, extremem fires - what predictors are better fit to predict extreme fires?
 ```{r}
@@ -640,7 +640,7 @@ anova(glm_interact_4, glm_interact_6, test = "LRT")
 
 AIC(glm_cor, glm_rf, glm_interact, glm_interact_2, glm_interact_3, glm_interact_4, glm_interact_5, glm_interact_6)
 ```
-NOTE: rh and cpd correlate (-0.935) and tair and vpd correlate (0.85). 
+NOTE: rh and vpd correlate (-0.935) and tair and vpd correlate (0.85). 
 
 Use glm_interact_4 predictor set: preds_typical = c("urban_proximity_binary", "rh", "precip_3m", "tair_2m", "vpd"), with rh:urban_proximity_binary and rh:precip_3m as interaction terms
 -----------
@@ -826,7 +826,7 @@ cor(train[, preds_m1]) > 0.9
 
 ```
 
-What distribution should I choose for the extreme fires. At the 95% threhold, the extreme fires look gamma-distributied. But at a 175 km2 burned area cutoff, the shape of the data changes a little. 
+What distribution should I choose for the extreme fires? At the 95% threhold, the extreme fires look gamma-distributied. But at a 175 km2 burned area cutoff, the shape of the data changes a little. 
 
 1. Use a mean residual life (mean excess) plot, the first tool. For a true GPD tail, E[X − u | X > u] should be roughly linear in u once you're above the correct threshold. Below the correct threshold, the line will bend/curve.
 2. Parameter stability plot. Fit a GPD at many different candidate thresholds and plot how the estimated shape (ξ) and modified scale parameters change. If ξ is roughly stable (flat, within CI bands of each other) above some threshold but jumps around below it, that's strong, direct evidence for exactly where the tail "truly" begins — this is the most standard, defensible way to formally answer "where does the shape change" rather than eyeballing histograms.
@@ -3409,6 +3409,7 @@ fit_mixture_gamma_formula <- function(train,
 }
 ```
 
+burned_area_km2_total ~ rh * urban_proximity_binary + rh * precip_3m + tair_2m + vpd
 ```{r}
 m20_mixture_interactions <- run_or_load_model(
   file.path(rds_root, "m20_mixture_interactions.rds"),
@@ -3416,7 +3417,7 @@ m20_mixture_interactions <- run_or_load_model(
     train, test,
     formula_classifier = ~ rh * urban_proximity_binary + rh * U + rh * vpd + tair_5y,
     formula_extreme     = ~ wind * rh + C + U,
-    formula_typical      = ~ urban_proximity_binary + rh + precip_5y + precip_3m + vpd + tair_2m,
+    formula_typical      = ~ rh * urban_proximity_binary + rh * precip_3m + tair_2m + vpd , 
     chains = 4
 ))
 
@@ -4394,6 +4395,16 @@ plots_list[["m20_mixture_interactions"]] + xlim(0, 200)
 
 
 ```{r}
+
+attach_identifiers <- function(sample_result, test) {
+  stopifnot(nrow(sample_result$sampled_draws) == nrow(test))
+  sample_result$lat  <- test$lat
+  sample_result$lon  <- test$lon
+  sample_result$year <- test$year
+  sample_result
+}
+
+
 plot_observed_vs_predicted_gridcell_year <- function(sample_result, var_label, title = NULL,
                                                        remove_zeros = TRUE, log_scale = TRUE) {
 
@@ -4579,6 +4590,11 @@ build_classifier_diagnostic <- function(sample_result, threshold, test) {
 }
 
 clf_m20 <- build_classifier_diagnostic(samples_list[["m20_mixture_interactions"]], threshold = 254.2795, test = test)
+
+
+roc_obj <- pROC::roc(clf_m20$true_extreme, clf_m20$p_extreme, quiet = TRUE)
+cat(sprintf("Classifier AUC: %.3f\n", pROC::auc(roc_obj)))
+plot(roc_obj, main = sprintf("m20 classifier ROC (AUC = %.3f)", pROC::auc(roc_obj)))
 
 # ---- 1. ROC / AUC: overall classifier discrimination ----
 cat(sprintf("Classifier AUC: %.3f\n", pROC::auc(roc_obj)))
@@ -5056,7 +5072,7 @@ plot_burned_area_reliability <- function(model, test, n_bins = 10, n_draws = 500
     geom_errorbar(aes(ymin = observed_rate_lower, ymax = observed_rate_upper),
                   width = 0, alpha = 0.6, color = "firebrick", linewidth = 0.6) +
     geom_errorbarh(aes(xmin = mean_predicted_lower, xmax = mean_predicted_upper),
-                   height = 0, alpha = 0.6, color = "black", linewidth = 0.5) +
+                   height = 0, alpha = 0.6, color = "firebrick", linewidth = 0.5) +
     geom_line(color = "black", linewidth = 0.6) +
     geom_point(aes(size = n_fires_avg), color = "black", alpha = 0.75) +
     scale_size_continuous(name = "Mean fires\nin bin", range = c(2, 10)) +
@@ -5081,6 +5097,9 @@ p_reliability_m20 <- plot_burned_area_reliability(
 )
 p_reliability_m20
 ```
+REliability diagram interpretation:
+the lowest-probability bin (dominant, ~25.7 fires, sitting almost exactly on the diagonal) is well-calibrated, but the middle bins tell different story. at predicted ≈0.04, observed sits at ≈0.065; at predicted ≈0.065, observed jumps to ≈0.12, both meaningfully above the 1:1 line. Only the highest bin (≈0.195 predicted, ≈0.205 observed) sits close to the diagonal. So across most of the probability range, the classifier is predicting that a fire is less likely to be extreme than it actually turns out to be.
+
 
 How does classification and the resulting draws from m20 (includes interactions terms) compare with other models:
   m3_mixture_custom, "m3: Mixture (custom)"),
